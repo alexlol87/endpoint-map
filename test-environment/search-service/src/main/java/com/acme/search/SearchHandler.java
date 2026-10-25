@@ -1,6 +1,7 @@
 package com.acme.search;
 
 import com.acme.libs.reactive.ReactiveHttp;
+import com.acme.search.bundle.BundleService;
 import java.util.Map;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
@@ -14,9 +15,12 @@ public class SearchHandler {
 
     private final ReactiveHttp catalog;
     private final ReactiveHttp analytics;
+    private final BundleService bundleService;
 
     public SearchHandler(@Value("${search.catalog-url}") String catalogUrl,
-                         @Value("${search.analytics-url}") String analyticsUrl) {
+                         @Value("${search.analytics-url}") String analyticsUrl,
+                         BundleService bundleService) {
+        this.bundleService = bundleService;
         this.catalog = new ReactiveHttp(WebClient.create(catalogUrl));
         this.analytics = new ReactiveHttp(WebClient.create(analyticsUrl));
     }
@@ -41,6 +45,12 @@ public class SearchHandler {
     public Mono<ServerResponse> similar(ServerRequest request) {
         return analytics.get("/analytics/trending?sku=" + request.pathVariable("sku"), Map.class)
                 .flatMap(t -> ServerResponse.ok().bodyValue(t));
+    }
+
+    /** Functional handler -> BundleService -> RelatedProductsService -> SearchPathUtils + ReactiveHttp. */
+    public Mono<ServerResponse> bundle(ServerRequest request) {
+        return bundleService.bundle(request.pathVariable("sku"))
+                .flatMap(b -> ServerResponse.ok().bodyValue(b));
     }
 
     public Mono<ServerResponse> suggest(ServerRequest request) {

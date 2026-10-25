@@ -19,6 +19,9 @@
     },
     "/orders/{id}/invoice": {
       "get": { "operationId": "invoice", "description": "Documented but removed from code -> openapi-only", "responses": { "200": { "description": "OK" } } }
+    },
+    "/orders/{id}/checkout": {
+      "post": { "operationId": "checkout", "responses": { "200": { "description": "OK" } } }
     }
   }
 }

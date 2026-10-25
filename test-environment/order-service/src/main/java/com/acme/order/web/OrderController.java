@@ -2,6 +2,7 @@ package com.acme.order.web;
 
 import com.acme.order.data.OrderEntity;
 import com.acme.order.service.OrderService;
+import com.acme.order.web.handler.CheckoutHandler;
 import java.util.List;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
@@ -18,9 +19,11 @@ import org.springframework.web.bind.annotation.RestController;
 public class OrderController {
 
     private final OrderService orderService;
+    private final CheckoutHandler checkoutHandler;
 
-    public OrderController(OrderService orderService) {
+    public OrderController(OrderService orderService, CheckoutHandler checkoutHandler) {
         this.orderService = orderService;
+        this.checkoutHandler = checkoutHandler;
     }
 
     @GetMapping("/{id}")
@@ -42,6 +45,13 @@ public class OrderController {
     @PostMapping("/{id}/cancel")
     public void cancel(@PathVariable long id) {
         orderService.cancel(id);
+    }
+
+    /** Deep chain: handler -> CheckoutService -> pricing/tax/fulfilment services -> utils (tax call is 5 hops down). */
+    @PostMapping("/{id}/checkout")
+    public OrderEntity checkout(@PathVariable long id, @RequestParam String region,
+                                @RequestParam(defaultValue = "false") boolean express) {
+        return checkoutHandler.handle(id, region, express);
     }
 
     @DeleteMapping("/{id}")
