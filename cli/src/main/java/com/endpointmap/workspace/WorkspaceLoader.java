@@ -9,35 +9,52 @@ import com.github.javaparser.ParseResult;
 import com.github.javaparser.ParserConfiguration;
 import com.github.javaparser.ast.CompilationUnit;
 import com.github.javaparser.ast.body.TypeDeclaration;
+import com.github.javaparser.symbolsolver.JavaSymbolSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.CombinedTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.JavaParserTypeSolver;
+import com.github.javaparser.symbolsolver.resolution.typesolvers.ReflectionTypeSolver;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
+import java.util.TreeSet;
 import java.util.stream.Stream;
 
-/** Every sub-folder of the root is a repo; folders without Java sources (terraform, python) are skipped. */
+/**
+ * Every sub-folder of the root is a repo; folders without Java sources (terraform, python) are skipped.
+ * Sources are parsed with a symbol solver over the JDK plus every repo's {@code src/main/java} (see {@link Types}).
+ */
 public final class WorkspaceLoader {
+
+    private static final ParserConfiguration.LanguageLevel LANGUAGE_LEVEL = ParserConfiguration.LanguageLevel.JAVA_25;
 
     private WorkspaceLoader() {
     }
 
     public static Workspace load(Path root) {
-        ParserConfiguration config = new ParserConfiguration()
-                .setLanguageLevel(ParserConfiguration.LanguageLevel.JAVA_25);
-        JavaParser parser = new JavaParser(config);
+        Map<Path, List<Path>> javaFilesByRepo = new LinkedHashMap<>();
+        for (Path dir : list(root, Files::isDirectory)) {
+            List<Path> javaFiles = dir.getFileName().toString().startsWith(".") ? List.of() : javaFiles(dir);
+            if (!javaFiles.isEmpty()) {
+                javaFilesByRepo.put(dir, javaFiles);
+            }
+        }
+        CombinedTypeSolver solver = new CombinedTypeSolver(new ReflectionTypeSolver());
+        ParserConfiguration solverConfig = new ParserConfiguration().setLanguageLevel(LANGUAGE_LEVEL);
+        javaFilesByRepo.forEach((dir, files) -> sourceRoots(dir, files)
+                .forEach(r -> solver.add(new JavaParserTypeSolver(r, solverConfig))));
+        JavaParser parser = new JavaParser(new ParserConfiguration().setLanguageLevel(LANGUAGE_LEVEL)
+                .setSymbolResolver(new JavaSymbolSolver(solver)));
         List<Repo> repos = new ArrayList<>();
         List<ParseFailure> failures = new ArrayList<>();
-        for (Path dir : list(root, Files::isDirectory)) {
+        for (Map.Entry<Path, List<Path>> entry : javaFilesByRepo.entrySet()) {
+            Path dir = entry.getKey();
             String name = dir.getFileName().toString();
-            if (name.startsWith(".")) {
-                continue;
-            }
-            List<Path> javaFiles = javaFiles(dir);
-            if (javaFiles.isEmpty()) {
-                continue;
-            }
+            List<Path> javaFiles = entry.getValue();
             List<SourceFile> sources = new ArrayList<>();
             for (Path file : javaFiles) {
                 String rel = root.relativize(file).toString().replace('\\', '/');
@@ -63,6 +80,19 @@ public final class WorkspaceLoader {
         return sources.stream()
                 .flatMap(s -> s.cu().findAll(TypeDeclaration.class).stream())
                 .anyMatch(t -> Workspace.hasAnnotation(t, "SpringBootApplication"));
+    }
+
+    /** Each {@code .../src/main/java} that holds a file; the repo folder itself for files outside one. */
+    private static List<Path> sourceRoots(Path repoDir, List<Path> javaFiles) {
+        TreeSet<Path> roots = new TreeSet<>();
+        for (Path f : javaFiles) {
+            Path r = f.getParent();
+            while (r != null && r.startsWith(repoDir) && !r.endsWith(Path.of("src", "main", "java"))) {
+                r = r.getParent();
+            }
+            roots.add(r != null && r.startsWith(repoDir) ? r : repoDir);
+        }
+        return List.copyOf(roots);
     }
 
     private static List<Path> javaFiles(Path repoDir) {

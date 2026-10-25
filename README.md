@@ -25,8 +25,17 @@ open out/map.html
 ```
 
 - `--profile` selects `application-{profile}.yml/.properties` and `---` documents with `spring.config.activate.on-profile`. These are used for `server.servlet.context-path` and `spring.webflux.base-path`.
-- Files that fail to parse are listed on stdout, and the scan continues without them.
+- `${KEY:default}` placeholders in those values are expanded from the same config, then the default. A placeholder with neither (an environment variable) becomes `{*}`.
+- Class names (constants in mappings, implemented interfaces, superclasses) are resolved with the JavaParser symbol solver over the JDK and every repo's `src/main/java`, so two `ApiPaths` classes in different repos or packages don't mix. When the solver fails, the simple name is used, preferring the same repo.
+- Mappings inherited from superclasses and interfaces (also interfaces that extend interfaces) are detected. `file`/`line` point at the method that handles the call.
+- A mapping with no `method` (plain `@RequestMapping("/x")`) gets the verb `ANY`: it serves every verb, so call matching treats it as a wildcard. The viewer shows it grey.
+- When two handlers map the same `service METHOD path` (headers/params/produces versioning, or two unresolvable `{*}` paths), they share one node: the first handler is `handler`, the rest are listed in `alsoHandledBy` and printed as a warning.
+- Files that fail to parse, and config files that fail to load, are listed on stdout, and the scan continues without them.
 - `discover --root <dir> --profile <p>` exists but is not implemented yet.
+
+## Known limits
+
+- A controller in a library repo is attributed to the library, not to the services that include it.
 
 ## Layout
 

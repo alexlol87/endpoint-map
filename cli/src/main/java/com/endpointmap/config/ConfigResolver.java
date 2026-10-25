@@ -6,7 +6,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import java.io.IOException;
 import java.io.Reader;
-import java.io.UncheckedIOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
@@ -19,7 +18,7 @@ import java.util.TreeMap;
 /**
  * Flat Spring properties of one repo for one profile, from src/main/resources:
  * application.yml/.yaml/.properties, then documents activated for the profile, then
- * application-{profile}.*; later sources win. Placeholders are kept as written.
+ * application-{profile}.*; later sources win. Placeholders are kept as written; {@link #resolve} expands them.
  */
 public final class ConfigResolver {
 
@@ -28,12 +27,13 @@ public final class ConfigResolver {
     private ConfigResolver() {
     }
 
-    public static Map<String, String> load(Path repoDir, String profile) {
+    /** Files that could not be read are added to {@code problems} and skipped. */
+    public static Map<String, String> load(Path repoDir, String profile, List<String> problems) {
         Path res = repoDir.resolve("src/main/resources");
         Map<String, String> props = new TreeMap<>();
         List<Map<String, String>> profileDocs = new ArrayList<>();
         for (String ext : List.of("yml", "yaml", "properties")) {
-            for (Map<String, String> doc : read(res.resolve("application." + ext))) {
+            for (Map<String, String> doc : read(res.resolve("application." + ext), problems)) {
                 String onProfile = doc.getOrDefault("spring.config.activate.on-profile", doc.get("spring.profiles"));
                 if (onProfile == null) {
                     props.putAll(doc);
@@ -46,13 +46,13 @@ public final class ConfigResolver {
         profileDocs.forEach(props::putAll);
         if (profile != null) {
             for (String ext : List.of("yml", "yaml", "properties")) {
-                read(res.resolve("application-" + profile + "." + ext)).forEach(props::putAll);
+                read(res.resolve("application-" + profile + "." + ext), problems).forEach(props::putAll);
             }
         }
         return props;
     }
 
-    private static List<Map<String, String>> read(Path file) {
+    private static List<Map<String, String>> read(Path file, List<String> problems) {
         if (!Files.isRegularFile(file)) {
             return List.of();
         }
@@ -75,9 +75,44 @@ public final class ConfigResolver {
             }
             return docs;
         } catch (IOException | RuntimeException e) {
-            // shortcut: a broken config file is ignored silently, list it in discover-report.md once that exists
+            // shortcut: reported on stdout only, list it in discover-report.md once that exists
+            problems.add(file + ": " + String.valueOf(e.getMessage()).lines().findFirst().orElse(""));
             return List.of();
         }
+    }
+
+    /**
+     * Expands {@code ${key}} and {@code ${key:default}} from {@code props}, then the default; a placeholder with
+     * neither (an environment variable, say) becomes {@code {*}}.
+     */
+    public static String resolve(String value, Map<String, String> props) {
+        return resolve(value, props, 0);
+    }
+
+    private static String resolve(String value, Map<String, String> props, int depth) {
+        int start = value.indexOf("${");
+        if (start < 0 || depth > 10) {
+            return value;
+        }
+        int nested = 0;
+        int end = -1;
+        int colon = -1;
+        for (int i = start + 2; i < value.length() && end < 0; i++) {
+            char c = value.charAt(i);
+            if (c == '{') {
+                nested++;
+            } else if (c == '}' && nested-- == 0) {
+                end = i;
+            } else if (c == ':' && nested == 0 && colon < 0) {
+                colon = i;
+            }
+        }
+        if (end < 0) {
+            return value;
+        }
+        String key = value.substring(start + 2, colon < 0 ? end : colon);
+        String found = props.containsKey(key) ? props.get(key) : colon < 0 ? "{*}" : value.substring(colon + 1, end);
+        return value.substring(0, start) + resolve(found, props, depth + 1) + resolve(value.substring(end + 1), props, depth + 1);
     }
 
     private static void flatten(String prefix, JsonNode node, Map<String, String> out) {

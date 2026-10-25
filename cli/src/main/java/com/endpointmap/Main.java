@@ -70,7 +70,8 @@ public final class Main {
             return 2;
         }
         Workspace ws = WorkspaceLoader.load(Path.of(opts.get("--root")).toAbsolutePath().normalize());
-        List<Endpoint> endpoints = new AnnotationEndpointDetector(ws).detect(opts.get("--profile"));
+        AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
+        List<Endpoint> endpoints = detector.detect(opts.get("--profile"));
         Map<String, Object> graph = GraphWriter.build(ws, endpoints);
         Path dir = Files.createDirectories(Path.of(outDir));
         GraphWriter.write(graph, dir.resolve("graph.json"));
@@ -79,6 +80,15 @@ public final class Main {
         if (!ws.parseFailures().isEmpty()) {
             out.printf("%d file(s) could not be parsed and were skipped:%n", ws.parseFailures().size());
             ws.parseFailures().forEach(f -> out.println("  " + f.relPath() + ": " + f.error()));
+        }
+        detector.warnings().forEach(w -> out.println("warning: config file skipped: " + w));
+        // shortcut: printed only, list collisions in discover-report.md once that exists
+        for (Object n : (List<?>) graph.get("nodes")) {
+            Map<?, ?> node = (Map<?, ?>) n;
+            if (node.containsKey("alsoHandledBy")) {
+                out.println("warning: " + node.get("id") + " is mapped by more than one handler: " + node.get("handler")
+                        + ", " + node.get("alsoHandledBy"));
+            }
         }
         return 0;
     }

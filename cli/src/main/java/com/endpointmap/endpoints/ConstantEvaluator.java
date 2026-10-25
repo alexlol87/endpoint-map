@@ -1,6 +1,6 @@
 package com.endpointmap.endpoints;
 
-import com.endpointmap.workspace.Workspace;
+import com.endpointmap.workspace.Types;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
@@ -11,9 +11,7 @@ import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.expr.StringLiteralExpr;
-import java.util.HashMap;
 import java.util.List;
-import java.util.Map;
 import java.util.Optional;
 
 /** Evaluates compile-time String expressions: literals, concatenation and static final constants. */
@@ -21,21 +19,10 @@ final class ConstantEvaluator {
 
     private static final int MAX_DEPTH = 10;
 
-    // shortcut: classes are looked up by simple name across the workspace, first match wins; use the symbol solver when names collide
-    private final Map<String, TypeDeclaration<?>> typesBySimpleName = new HashMap<>();
+    private final Types types;
 
-    ConstantEvaluator(Workspace ws) {
-        for (Workspace.Repo repo : ws.repos()) {
-            for (Workspace.SourceFile sf : repo.sources()) {
-                for (TypeDeclaration<?> t : sf.cu().findAll(TypeDeclaration.class)) {
-                    typesBySimpleName.putIfAbsent(t.getNameAsString(), t);
-                }
-            }
-        }
-    }
-
-    Optional<TypeDeclaration<?>> type(String simpleName) {
-        return Optional.ofNullable(typesBySimpleName.get(simpleName));
+    ConstantEvaluator(Types types) {
+        this.types = types;
     }
 
     Optional<String> eval(Expression e, Node context) {
@@ -57,6 +44,11 @@ final class ConstantEvaluator {
             Optional<String> r = eval(b.getRight(), context, depth + 1);
             return l.isPresent() && r.isPresent() ? Optional.of(l.get() + r.get()) : Optional.empty();
         }
+        Optional<TypeDeclaration<?>> declaring = types.declaringTypeOfField(e);
+        if (declaring.isPresent()) {
+            return field(declaring.get(), e instanceof NameExpr n ? n.getNameAsString()
+                    : ((FieldAccessExpr) e).getNameAsString(), depth);
+        }
         if (e instanceof NameExpr n) {
             for (Node t = context; t != null; t = t.getParentNode().orElse(null)) {
                 if (t instanceof TypeDeclaration<?> td) {
@@ -72,7 +64,7 @@ final class ConstantEvaluator {
             String owner = fa.getScope() instanceof NameExpr sn ? sn.getNameAsString()
                     : fa.getScope() instanceof FieldAccessExpr sf ? sf.getNameAsString() : null;
             return owner == null ? Optional.empty()
-                    : type(owner).flatMap(td -> field(td, fa.getNameAsString(), depth));
+                    : types.bySimpleNameNear(owner, e).flatMap(td -> field(td, fa.getNameAsString(), depth));
         }
         return Optional.empty();
     }

@@ -40,7 +40,8 @@
 <script>/*@CYTOSCAPE_DAGRE@*/</script>
 <script>
 const GRAPH = /*@GRAPH@*/null;
-const VERB = { GET: '#2e9e4f', POST: '#f08c00', PUT: '#8e44ad', PATCH: '#e0b000', DELETE: '#d63031' };
+// ANY = mapping without a method: it serves every verb
+const VERB = { GET: '#2e9e4f', POST: '#f08c00', PUT: '#8e44ad', PATCH: '#e0b000', DELETE: '#d63031', ANY: '#57606a' };
 const verbColor = v => VERB[v] || '#57606a';
 const serviceColor = i => `hsl(${(i * 137.5) % 360}, 65%, 85%)`;
 const colorOf = Object.fromEntries(GRAPH.services.map(s => [s.name, serviceColor(s.colorIndex)]));
@@ -96,7 +97,8 @@ document.getElementById('stats').textContent = `${endpoints.length} endpoints in
 cy.on('tap', 'node.endpoint', ev => {
   const d = ev.target.data();
   document.getElementById('details').textContent =
-    `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}`;
+    `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}` +
+    (d.alsoHandledBy || []).map(h => `\nalso handled by: ${h.handler} (${h.file}:${h.line})`).join('');
 });
 document.getElementById('search').addEventListener('input', ev => {
   const q = ev.target.value.trim().toLowerCase();

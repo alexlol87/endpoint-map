@@ -128,6 +128,21 @@ class MapCommandTest {
     }
 
     @Test
+    void sameSimpleClassNameInTwoReposResolvesWithinTheRepo() {
+        assertPresent("billing-service POST /billing/invoices", "notification-service POST /notifications/sms",
+                "notification-service POST /notifications/broadcast");
+        assertTrue(nodes.keySet().stream().noneMatch(id -> id.startsWith("notification-service") && id.contains("/billing")),
+                nodes.keySet().toString());
+    }
+
+    @Test
+    void mappingInheritedFromAbstractBaseController() {
+        JsonNode n = node("warehouse-service GET /warehouse/health");
+        assertEquals("WarehouseController.health", n.get("handler").asText());
+        assertEquals("warehouse-service/src/main/java/com/acme/warehouse/BaseController.java", n.get("file").asText());
+    }
+
+    @Test
     void unparseableFileDoesNotStopTheRun() {
         assertPresent("report-service GET /reports/{type}", "report-service POST /reports/export");
         assertTrue(stdout.contains("UnparseableLegacyExporter.java"), stdout);
@@ -154,6 +169,7 @@ class MapCommandTest {
         for (String color : List.of("#2e9e4f", "#f08c00", "#8e44ad", "#e0b000", "#d63031")) {
             assertTrue(html.contains(color), color);
         }
+        assertTrue(html.contains("ANY: '#57606a'"), "ANY verb in the legend");
         assertTrue(html.contains("(i * 137.5) % 360"), "pastel service hue");
         assertFalse(html.contains("/*@"), "all placeholders filled");
     }
@@ -174,6 +190,48 @@ class MapCommandTest {
         assertEquals(Set.of("svc GET /file/ping"), ids(root, "prod"));
         write(svc.resolve("src/main/resources/application-prod.yml"), "spring:\n  webflux:\n    base-path: /flux\n");
         assertEquals(Set.of("svc GET /file/ping"), ids(root, "prod"), "servlet context path wins over base path");
+    }
+
+    @Test
+    void importsPlaceholdersAnyVerbSharedIdsAndInheritance(@TempDir Path root) throws Exception {
+        Path a = root.resolve("a-service/src/main/java/demo");
+        write(a.resolve("App.java"), "package demo;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        // same simple name twice in one repo: only the import tells them apart
+        write(a.resolve("legacy/ApiPaths.java"), "package demo.legacy;\npublic class ApiPaths { public static final String BASE = \"/legacy\"; }\n");
+        write(a.resolve("v2/ApiPaths.java"), "package demo.v2;\npublic class ApiPaths { public static final String BASE = \"/v2\"; }\n");
+        write(a.resolve("api/BaseApi.java"), "package demo.api;\nimport org.springframework.web.bind.annotation.*;\n"
+                + "public interface BaseApi { @GetMapping(\"/ping\") String ping(); }\n");
+        write(a.resolve("api/ItemApi.java"), "package demo.api;\npublic interface ItemApi extends BaseApi {}\n");
+        write(a.resolve("web/ItemController.java"), """
+                package demo.web;
+                import demo.api.ItemApi;
+                import demo.v2.ApiPaths;
+                import org.springframework.web.bind.annotation.*;
+                @RestController @RequestMapping(ApiPaths.BASE)
+                public class ItemController implements ItemApi {
+                  @GetMapping(value = "/x", headers = "X-API=1") public String v1() { return ""; }
+                  @GetMapping(value = "/x", headers = "X-API=2") public String v2() { return ""; }
+                  @RequestMapping("/any") public String any() { return ""; }
+                  public String ping() { return ""; }
+                }
+                """);
+        write(root.resolve("a-service/src/main/resources/application.yml"),
+                "server.servlet.context-path: ${CONTEXT_PATH:${base:/a-api}}\n");
+        write(root.resolve("a-service/src/main/resources/application-prod.yml"), "server: [broken\n");
+        Path o = root.resolve("out");
+        Run r = run("map", "--root", root.toString(), "--profile", "prod", "--out", o.toString());
+        assertEquals(0, r.code, r.err);
+        Map<String, JsonNode> byId = new HashMap<>();
+        JSON.readTree(o.resolve("graph.json").toFile()).get("nodes").forEach(n -> byId.put(n.get("id").asText(), n));
+        assertEquals(Set.of("a-service GET /a-api/v2/x", "a-service ANY /a-api/v2/any", "a-service GET /a-api/v2/ping"),
+                byId.keySet());
+        JsonNode x = byId.get("a-service GET /a-api/v2/x");
+        assertEquals("ItemController.v1", x.get("handler").asText());
+        assertEquals("ItemController.v2", x.get("alsoHandledBy").get(0).get("handler").asText());
+        assertTrue(r.out.contains("a-service GET /a-api/v2/x is mapped by more than one handler"), r.out);
+        assertTrue(r.out.contains("application-prod.yml"), r.out);
+        assertEquals("ItemController.ping", byId.get("a-service GET /a-api/v2/ping").get("handler").asText());
+        assertTrue(byId.get("a-service GET /a-api/v2/ping").get("file").asText().endsWith("web/ItemController.java"));
     }
 
     @Test

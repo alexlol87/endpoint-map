@@ -13,7 +13,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.TreeMap;
 
-/** Builds the graph.json document (PLAN.md section 4). Output is sorted so runs are reproducible. */
+/**
+ * Builds the graph.json document (PLAN.md section 4). Output is sorted so runs are reproducible.
+ * Endpoints sharing an id become one node; every other handler is listed in {@code alsoHandledBy}.
+ */
 public final class GraphWriter {
 
     private static final ObjectMapper JSON = new ObjectMapper().enable(SerializationFeature.INDENT_OUTPUT);
@@ -29,9 +32,20 @@ public final class GraphWriter {
         }
         Map<String, Map<String, Object>> nodes = new TreeMap<>();
         for (Endpoint e : endpoints) {
-            nodes.putIfAbsent(e.id(), ordered("id", e.id(), "kind", "endpoint", "service", e.service(),
-                    "method", e.method(), "path", e.path(), "handler", e.handler(), "file", e.file(),
-                    "line", e.line(), "source", e.source()));
+            Map<String, Object> node = nodes.get(e.id());
+            if (node == null) {
+                nodes.put(e.id(), ordered("id", e.id(), "kind", "endpoint", "service", e.service(),
+                        "method", e.method(), "path", e.path(), "handler", e.handler(), "file", e.file(),
+                        "line", e.line(), "source", e.source()));
+            } else if (!(e.handler().equals(node.get("handler")) && e.file().equals(node.get("file")))) {
+                // same id from another handler (headers/params versioning, unresolved {*} paths): keep them all
+                @SuppressWarnings("unchecked")
+                List<Map<String, Object>> also = (List<Map<String, Object>>) node.computeIfAbsent("alsoHandledBy", k -> new ArrayList<>());
+                Map<String, Object> other = ordered("handler", e.handler(), "file", e.file(), "line", e.line());
+                if (!also.contains(other)) {
+                    also.add(other);
+                }
+            }
         }
         return ordered("services", services, "nodes", new ArrayList<>(nodes.values()),
                 "edges", List.of(), "flows", Map.of());
