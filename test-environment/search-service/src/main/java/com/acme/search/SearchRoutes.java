@@ -18,6 +18,7 @@ import org.springframework.web.reactive.function.server.ServerResponse;
  *   /search/products             GET  -> handler.products
  *   /search/products/{sku}       GET  -> handler.productBySku
  *   /search/products/{sku}/similar GET (3 levels of nesting)
+ *   /search/products/{sku}/bundle  GET (deep chain: handler -> services -> utils)
  *   /search/suggest              POST -> lambda
  *   /search/admin/reindex        POST (via .add(adminRoutes()))
  *   /search/admin/index          DELETE
@@ -35,7 +36,8 @@ public class SearchRoutes {
                                 .GET("", handler::products)
                                 .nest(path("/{sku}"), sku -> sku
                                         .GET("", accept(MediaType.APPLICATION_JSON), handler::productBySku)
-                                        .GET("/similar", handler::similar)))
+                                        .GET("/similar", handler::similar)
+                                        .GET("/bundle", handler::bundle)))
                         .POST("/suggest", request -> handler.suggest(request))
                         .nest(path("/history"), h -> h.GET("/{userId}", handler::history)))
                 .add(adminRoutes(handler))

@@ -7,3 +7,5 @@ spring:
     name: order-service
 inventory:
   base-url: http://localhost:8083
+tax:
+  base-url: http://localhost:8090/tax-api
