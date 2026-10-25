@@ -278,6 +278,48 @@ class MapCommandTest {
     }
 
     @Test
+    void genericBaseTypeArgumentsAreSubstitutedBeforeMatchingOverrides(@TempDir Path root) throws Exception {
+        Path f = root.resolve("f-service/src/main/java/f");
+        write(f.resolve("App.java"), "package f;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(f.resolve("CrudController.java"), """
+                package f;
+                import org.springframework.web.bind.annotation.*;
+                public abstract class CrudController<T, ID> {
+                  @GetMapping("/{id}") public T get(@PathVariable ID id) { return null; }
+                  @PostMapping public T create(@RequestBody T body) { return null; }
+                }
+                """);
+        String user = """
+                package f;
+                import org.springframework.web.bind.annotation.*;
+                @RestController @RequestMapping("/users")
+                public class UserController extends CrudController<User, Long> {
+                  MAPPING public User get(@PathVariable String slug) { return null; }
+                  @Override public User create(User body) { return null; }
+                }
+                class User {}
+                """;
+        for (String mapping : List.of("@GetMapping(\"/by-slug/{slug}\")", "")) {
+            write(f.resolve("UserController.java"), user.replace("MAPPING", mapping));
+            Path o = root.resolve("out" + mapping.length());
+            Run r = run("map", "--root", root.toString(), "--profile", "prod", "--out", o.toString());
+            assertEquals(0, r.code, r.err);
+            Map<String, JsonNode> byId = new HashMap<>();
+            JSON.readTree(o.resolve("graph.json").toFile()).get("nodes").forEach(n -> byId.put(n.get("id").asText(), n));
+            Set<String> expected = new TreeSet<>(Set.of("f-service GET /users/{id}", "f-service POST /users"));
+            if (!mapping.isEmpty()) {
+                expected.add("f-service GET /users/by-slug/{slug}");
+            }
+            assertEquals(expected, new TreeSet<>(byId.keySet()));
+            JsonNode get = byId.get("f-service GET /users/{id}");
+            assertTrue(get.get("file").asText().endsWith("CrudController.java"), "get(String) does not override get(ID=Long)");
+            assertEquals(4, get.get("line").asInt());
+            assertTrue(byId.get("f-service POST /users").get("file").asText().endsWith("UserController.java"),
+                    "create(User) overrides create(T=User)");
+        }
+    }
+
+    @Test
     void nonJavaFoldersSkippedAndLibraryWithoutBootApp(@TempDir Path root) throws Exception {
         write(root.resolve("infra/main.tf"), "resource \"x\" \"y\" {}\n");
         write(root.resolve("infra/application.yml"), "server.servlet.context-path: /nope\n");
