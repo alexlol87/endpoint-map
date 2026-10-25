@@ -21,7 +21,6 @@ import java.util.ArrayDeque;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.Deque;
-import java.util.HashMap;
 import java.util.HashSet;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -79,26 +78,56 @@ public final class AnnotationEndpointDetector {
     }
 
     /**
-     * Walks the controller, then its superclasses and interfaces breadth-first. A method is mapped by the first
-     * mapping found for its name/arity, and handled by the most derived implementation.
+     * Walks the controller, then its superclasses and interfaces breadth-first. Every mapped method the controller
+     * declares is emitted; an inherited mapping is skipped when a more derived type already mapped the same method,
+     * and is handled by the most derived implementation. Methods match by name and erased parameter types.
      */
     private void detect(Repo repo, SourceFile sf, ClassOrInterfaceDeclaration controller, String contextPath, List<Endpoint> out) {
         List<ClassOrInterfaceDeclaration> hierarchy = hierarchy(controller);
         List<String> classPrefixes = hierarchy.stream().filter(t -> !t.isInterface() && hasTypeMapping(t))
                 .findFirst().map(this::typePrefixes).orElse(List.of(""));
-        Map<String, MethodDeclaration> impls = new HashMap<>();
-        Set<String> mapped = new HashSet<>();
+        List<MethodDeclaration> seen = new ArrayList<>();
+        List<MethodDeclaration> mapped = new ArrayList<>();
         for (ClassOrInterfaceDeclaration type : hierarchy) {
             List<String> prefixes = type.isInterface() && hasTypeMapping(type) ? typePrefixes(type) : classPrefixes;
             for (MethodDeclaration m : type.getMethods()) {
-                String sig = m.getNameAsString() + "/" + m.getParameters().size();
-                MethodDeclaration handler = impls.computeIfAbsent(sig, k -> m);
-                if (mapping(m).isPresent() && mapped.add(sig)) {
-                    String file = handler.findCompilationUnit().orElse(null) == sf.cu() ? sf.relPath() : types.relPath(handler);
-                    emit(repo, prefixes, controller, m, handler, file, contextPath, out);
+                MethodDeclaration handler = seen.stream().filter(o -> sameMethod(o, m)).findFirst().orElse(m);
+                seen.add(m);
+                if (mapping(m).isEmpty() || mapped.stream().anyMatch(o -> o.getParentNode().orElse(null) != m.getParentNode().orElse(null) && sameMethod(o, m))) {
+                    continue;
                 }
+                mapped.add(m);
+                String file = handler.findCompilationUnit().orElse(null) == sf.cu() ? sf.relPath() : types.relPath(handler);
+                emit(repo, prefixes, controller, m, handler, file, contextPath, out);
             }
         }
+    }
+
+    /** Same name and erased parameter types; a type variable (e.g. {@code T} of a generic base) matches any type. */
+    private static boolean sameMethod(MethodDeclaration a, MethodDeclaration b) {
+        if (!a.getNameAsString().equals(b.getNameAsString()) || a.getParameters().size() != b.getParameters().size()) {
+            return false;
+        }
+        Set<String> vars = new HashSet<>();
+        for (MethodDeclaration m : List.of(a, b)) {
+            m.getTypeParameters().forEach(t -> vars.add(t.getNameAsString()));
+            m.getParentNode().filter(ClassOrInterfaceDeclaration.class::isInstance)
+                    .map(ClassOrInterfaceDeclaration.class::cast)
+                    .ifPresent(c -> c.getTypeParameters().forEach(t -> vars.add(t.getNameAsString())));
+        }
+        for (int i = 0; i < a.getParameters().size(); i++) {
+            String x = erased(a.getParameter(i)), y = erased(b.getParameter(i));
+            if (!x.equals(y) && !vars.contains(x) && !vars.contains(y)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    private static String erased(com.github.javaparser.ast.body.Parameter p) {
+        // shortcut: simple names only (a.Foo == b.Foo), fine for overload matching; resolve types if that ever collides
+        String t = p.getType().getElementType().asString().replaceAll("<.*>", "").replaceAll("^.*\\.", "");
+        return t + "[]".repeat(p.getType().getArrayLevel() + (p.isVarArgs() ? 1 : 0));
     }
 
     private List<ClassOrInterfaceDeclaration> hierarchy(ClassOrInterfaceDeclaration controller) {

@@ -235,6 +235,49 @@ class MapCommandTest {
     }
 
     @Test
+    void overloadsWithSameArityAreAllMappedAndMatchedByParameterTypes(@TempDir Path root) throws Exception {
+        Path d = root.resolve("d-service/src/main/java/d");
+        write(d.resolve("App.java"), "package d;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(d.resolve("Base.java"), """
+                package d;
+                import org.springframework.web.bind.annotation.*;
+                public abstract class Base<T> {
+                  @GetMapping("/base/{id}") public String find(@PathVariable Long id) { return ""; }
+                  @PostMapping("/crud") public String save(@RequestBody T body) { return ""; }
+                }
+                """);
+        write(d.resolve("DController.java"), """
+                package d;
+                import java.util.List;
+                import org.springframework.web.bind.annotation.*;
+                @RestController @RequestMapping("/d")
+                public class DController extends Base<String> {
+                  @GetMapping("/by-id/{id}") public String get(@PathVariable Long id) { return ""; }
+                  @GetMapping("/by-name/{n}") public String get(@PathVariable String n) { return ""; }
+                  @PostMapping("/one") public String put(@RequestBody String a) { return ""; }
+                  @PostMapping("/many") public String put(@RequestBody List<String> a) { return ""; }
+                  @GetMapping("/same") public String same(Long a) { return ""; }
+                  @GetMapping("/same") public String same(String a) { return ""; }
+                  public String find(String notAnOverride) { return ""; }
+                  @Override public String save(String body) { return ""; }
+                }
+                """);
+        Path o = root.resolve("out");
+        Run r = run("map", "--root", root.toString(), "--profile", "prod", "--out", o.toString());
+        assertEquals(0, r.code, r.err);
+        Map<String, JsonNode> byId = new HashMap<>();
+        JSON.readTree(o.resolve("graph.json").toFile()).get("nodes").forEach(n -> byId.put(n.get("id").asText(), n));
+        assertEquals(Set.of("d-service GET /d/by-id/{id}", "d-service GET /d/by-name/{n}", "d-service POST /d/one",
+                "d-service POST /d/many", "d-service GET /d/same", "d-service GET /d/base/{id}", "d-service POST /d/crud"),
+                byId.keySet());
+        assertEquals(1, byId.get("d-service GET /d/same").get("alsoHandledBy").size());
+        assertTrue(byId.get("d-service GET /d/base/{id}").get("file").asText().endsWith("Base.java"),
+                "find(String) does not override find(Long)");
+        assertTrue(byId.get("d-service POST /d/crud").get("file").asText().endsWith("DController.java"),
+                "save(String) overrides save(T)");
+    }
+
+    @Test
     void nonJavaFoldersSkippedAndLibraryWithoutBootApp(@TempDir Path root) throws Exception {
         write(root.resolve("infra/main.tf"), "resource \"x\" \"y\" {}\n");
         write(root.resolve("infra/application.yml"), "server.servlet.context-path: /nope\n");

@@ -37,7 +37,7 @@ public final class GraphWriter {
                 nodes.put(e.id(), ordered("id", e.id(), "kind", "endpoint", "service", e.service(),
                         "method", e.method(), "path", e.path(), "handler", e.handler(), "file", e.file(),
                         "line", e.line(), "source", e.source()));
-            } else if (!(e.handler().equals(node.get("handler")) && e.file().equals(node.get("file")))) {
+            } else if (!(e.handler().equals(node.get("handler")) && e.file().equals(node.get("file")) && node.get("line").equals(e.line()))) {
                 // same id from another handler (headers/params versioning, unresolved {*} paths): keep them all
                 @SuppressWarnings("unchecked")
                 List<Map<String, Object>> also = (List<Map<String, Object>>) node.computeIfAbsent("alsoHandledBy", k -> new ArrayList<>());
