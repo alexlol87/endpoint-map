@@ -64,7 +64,8 @@ const out = {};
 GRAPH.edges.forEach(e => (out[e.from] = out[e.from] || []).push(e));
 
 // L1 node for any L2 node: endpoints roll up to their service, external to its host, unresolved to what is missing
-const l1Of = n => n.kind === 'endpoint' || n.service ? 'svc:' + n.service
+// (a known service without the endpoint stays a separate ✕ node, so the gap shows at L1 too)
+const l1Of = n => n.kind === 'endpoint' ? 'svc:' + n.service
   : n.kind === 'external' ? 'external:' + n.host : 'unresolved:' + n.id.replace(/^unresolved:/, '').split(' ')[0];
 const l1Label = id => id.startsWith('svc:') ? id.slice(4) : id.startsWith('external:') ? id.slice(9) : '✕ ' + id.slice(11);
 

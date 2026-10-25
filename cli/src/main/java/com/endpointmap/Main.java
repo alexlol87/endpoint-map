@@ -69,7 +69,7 @@ public final class Main {
 
     /** Traces every endpoint's handler to its outbound calls and matches each call to its target nodes. */
     private static Map<String, Object> buildGraph(Workspace ws, String profile, AnnotationEndpointDetector detector,
-                                                  List<Endpoint> endpoints) {
+                                                  List<Endpoint> endpoints, List<String> warnings) {
         Map<String, Map<String, String>> configs = new HashMap<>();
         ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>())));
         Types types = new Types(ws);
@@ -80,7 +80,14 @@ public final class Main {
         Map<String, Map<String, Object>> targets = new HashMap<>();
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
-            for (FlowTracer.Found f : tracer.trace(e.decl(), repo, configs.get(repo.name()))) {
+            List<FlowTracer.Found> found;
+            try {
+                found = tracer.trace(e.decl(), repo, configs.get(repo.name()));
+            } catch (OutOfMemoryError | StackOverflowError err) { // one pathological endpoint must not lose the whole map
+                warnings.add("tracing " + e.id() + " failed (" + err.getClass().getSimpleName() + "), its edges are missing");
+                continue;
+            }
+            for (FlowTracer.Found f : found) {
                 for (TargetMatcher.Target t : matcher.match(f.call(), e.service())) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),
                             "client", f.call().client(), "via", f.via(), "file", f.file(), "line", f.line());
@@ -112,7 +119,8 @@ public final class Main {
         String profile = opts.get("--profile");
         AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
         List<Endpoint> endpoints = detector.detect(profile);
-        Map<String, Object> graph = buildGraph(ws, profile, detector, endpoints);
+        List<String> traceWarnings = new ArrayList<>();
+        Map<String, Object> graph = buildGraph(ws, profile, detector, endpoints, traceWarnings);
         Path dir = Files.createDirectories(Path.of(outDir));
         GraphWriter.write(graph, dir.resolve("graph.json"));
         MapHtmlWriter.write(GraphWriter.toJson(graph), dir.resolve("map.html"));
@@ -131,6 +139,7 @@ public final class Main {
             ws.parseFailures().forEach(f -> out.println("  " + f.relPath() + ": " + f.error()));
         }
         detector.warnings().forEach(w -> out.println("warning: config file skipped: " + w));
+        traceWarnings.forEach(w -> out.println("warning: " + w));
         // shortcut: printed only, list collisions in discover-report.md once that exists
         for (Object n : nodes) {
             Map<?, ?> node = (Map<?, ?>) n;

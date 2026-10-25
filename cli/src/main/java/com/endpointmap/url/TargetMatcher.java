@@ -16,8 +16,9 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Turns an outbound call into target node ids. The host names a service when its first label is a service's repo
- * name or {@code spring.application.name}, or when it is localhost with that service's {@code server.port}; any other
+ * Turns an outbound call into target node ids. The host names a service when it looks internal (no dots, or a private
+ * suffix such as {@code .internal} or {@code .svc.cluster.local}) and its first label is a service's repo name or
+ * {@code spring.application.name}, or when it is localhost with that service's {@code server.port}; any other
  * host is external. Within the service, verb must match ({@code ANY} matches every verb) and the path is compared
  * segment by segment, template variables matching anything. Every matching endpoint is a target; none, or an
  * unresolved base URL, gives an {@code unresolved:} node.
@@ -30,6 +31,7 @@ public final class TargetMatcher {
 
     private static final Pattern URL = Pattern.compile("^(?:([a-zA-Z][\\w+.-]*)://)?([^/:?#]+)(?::(\\d+))?([^?#]*).*$");
     private static final Set<String> LOCAL = Set.of("localhost", "127.0.0.1", "0.0.0.0");
+    private static final Set<String> INTERNAL_SUFFIXES = Set.of("local", "internal", "svc", "lan", "corp", "intranet");
 
     private final Map<String, String> serviceByName = new HashMap<>();
     private final Map<String, String> serviceByPort = new HashMap<>();
@@ -70,7 +72,7 @@ public final class TargetMatcher {
         String host = u.group(2);
         String port = u.group(3);
         String full = UrlPaths.join(u.group(4), path);
-        String service = serviceByName.get(host.split("\\.")[0]);
+        String service = looksInternal(host) ? serviceByName.get(host.split("\\.")[0]) : null;
         if (service == null && LOCAL.contains(host) && port != null) {
             service = serviceByPort.get(port);
         }
@@ -86,6 +88,12 @@ public final class TargetMatcher {
                 .map(Endpoint::id).distinct().sorted()
                 .map(id -> new Target(id, "http", null)).toList();
         return hits.isEmpty() ? List.of(unresolved(service, call.verb(), full, service, null)) : hits;
+    }
+
+    /** A bare name (k8s service, docker-compose) or a private DNS name; billing-service.stripe.com is not ours. */
+    // shortcut: k8s "name.namespace" short names look public and stay external; the resolutions file (#4) maps them
+    static boolean looksInternal(String host) {
+        return !host.contains(".") || INTERNAL_SUFFIXES.contains(host.substring(host.lastIndexOf('.') + 1));
     }
 
     static boolean samePath(String template, String path) {

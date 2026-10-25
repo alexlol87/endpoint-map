@@ -8,8 +8,8 @@ import com.endpointmap.endpoints.UrlPaths;
 import com.endpointmap.trace.CallSite;
 import com.endpointmap.trace.OutboundCall;
 import com.endpointmap.trace.OutboundDetector;
-import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
@@ -17,6 +17,7 @@ import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Optional;
+import java.util.stream.Stream;
 
 /**
  * A call to a method of a {@code @FeignClient(name, url, path)} interface: verb and path from the method's
@@ -37,10 +38,11 @@ public final class FeignDetector implements OutboundDetector {
     public List<OutboundCall> detect(CallSite site) {
         List<OutboundCall> out = new ArrayList<>();
         for (MethodDeclaration m : site.callees()) {
-            Optional<ClassOrInterfaceDeclaration> owner = m.getParentNode()
-                    .filter(ClassOrInterfaceDeclaration.class::isInstance).map(ClassOrInterfaceDeclaration.class::cast);
-            Optional<AnnotationExpr> feign = owner.flatMap(o -> o.getAnnotations().stream()
-                    .filter(a -> a.getName().getIdentifier().equals("FeignClient")).findFirst());
+            // the receiver's type first: "interface ItemClient extends ItemApi" puts @FeignClient above the declaring type
+            Stream<TypeDeclaration<?>> owners = Stream.concat(site.receiverTypes().stream(), m.getParentNode()
+                    .filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t).stream());
+            Optional<AnnotationExpr> feign = owners.flatMap(o -> o.getAnnotations().stream())
+                    .filter(a -> a.getName().getIdentifier().equals("FeignClient")).findFirst();
             Optional<Mapping> mapping = mappings.mappingOf(m);
             if (feign.isEmpty() || mapping.isEmpty()) {
                 continue; // not Feign, or a default method of the interface: keep walking

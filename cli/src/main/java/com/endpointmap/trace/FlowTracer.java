@@ -25,6 +25,7 @@ import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.IdentityHashMap;
+import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
@@ -37,6 +38,7 @@ import java.util.stream.Stream;
  * asks every {@link OutboundDetector} to classify each call. A classified call ends that branch; any other call
  * into workspace code is followed. An interface/abstract method is followed into each implementation.
  * Calls the symbol solver can't resolve fall back to name + arity matching and are marked low confidence.
+ * Each method keeps one result per call site and target, so repeated calls and diamonds don't multiply paths.
  */
 public final class FlowTracer {
 
@@ -47,13 +49,20 @@ public final class FlowTracer {
     private record Callees(List<MethodDeclaration> methods, boolean low) {
     }
 
-    private record Result(List<Found> found, boolean cut) {
+    /** {@code backTo}: stack depth of the shallowest method a recursive call jumped back to, MAX_VALUE if none. */
+    private record Result(List<Found> found, int backTo) {
+    }
+
+    /** One edge per call site and target: further paths to it only change {@code via}. */
+    private record Key(OutboundCall call, String file, int line) {
     }
 
     private final Types types;
     private final List<OutboundDetector> detectors;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
     // per service: detectors resolve placeholders with the calling service's config, so library results differ
+    // shortcut: keyed by method only, so a util called with different arguments (WebClient bean, URL) reuses the
+    // first caller's result; add argument bindings to the key with argument propagation (#5/#7)
     private final Map<Repo, Map<MethodDeclaration, List<Found>>> memo = new IdentityHashMap<>();
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors) {
@@ -66,49 +75,85 @@ public final class FlowTracer {
     }
 
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        return walk(handler, service, config, Collections.newSetFromMap(new IdentityHashMap<>())).found();
+        return walk(handler, service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
     }
 
-    private Result walk(MethodDeclaration m, Repo service, Map<String, String> config, Set<MethodDeclaration> stack) {
+    /**
+     * {@code stack} maps each method being walked to its depth. {@code partial} holds results cut short by a recursive
+     * call back to a method still on the stack: valid until that method returns, so a cycle is walked once, not once
+     * per path into it.
+     */
+    private Result walk(MethodDeclaration m, Repo service, Map<String, String> config, Map<MethodDeclaration, Integer> stack,
+                        Map<MethodDeclaration, Result> partial) {
         Map<MethodDeclaration, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>());
         if (done.containsKey(m)) {
-            return new Result(done.get(m), false);
+            return new Result(done.get(m), Integer.MAX_VALUE);
+        }
+        if (partial.containsKey(m)) {
+            return partial.get(m);
         }
         if (m.getBody().isEmpty()) {
-            return new Result(List.of(), false);
+            return new Result(List.of(), Integer.MAX_VALUE);
         }
-        stack.add(m);
-        List<Found> found = new ArrayList<>();
-        boolean cut = false;
+        int depth = stack.size();
+        stack.put(m, depth);
+        Map<Key, Found> found = new LinkedHashMap<>();
+        int backTo = Integer.MAX_VALUE;
+        // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
         for (Expression call : m.getBody().get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
             Callees c = callees(call);
-            CallSite site = new CallSite(call, c.methods(), service, config);
-            List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(site).stream()).toList();
-            if (!out.isEmpty()) {
-                List<String> via = c.methods().isEmpty() ? List.of() : List.of(label(c.methods().get(0)));
-                out.forEach(o -> found.add(new Found(o, via, types.relPath(call), line(call), c.low())));
+            List<TypeDeclaration<?>> receiver = receiverTypes(call);
+            boolean classified = false;
+            for (MethodDeclaration callee : c.methods()) { // one detection per callee, so via names the right one
+                List<OutboundCall> out = detectors.stream()
+                        .flatMap(d -> d.detect(new CallSite(call, List.of(callee), receiver, service, config)).stream()).toList();
+                // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
+                String label = receiver.isEmpty() || callee.getBody().isPresent() ? label(callee)
+                        : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
+                out.forEach(o -> add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low())));
+                classified |= !out.isEmpty();
+            }
+            if (classified) {
                 continue;
             }
-            for (MethodDeclaration callee : c.methods().stream().flatMap(d -> implementations(d).stream()).distinct().toList()) {
-                if (stack.contains(callee)) {
-                    cut = true; // recursion: the branch is already being walked higher up
+            for (MethodDeclaration callee : c.methods().stream().flatMap(d -> implementations(d, service).stream()).distinct().toList()) {
+                Integer at = stack.get(callee);
+                if (at != null) {
+                    backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
-                Result r = walk(callee, service, config, stack);
-                cut |= r.cut();
+                Result r = walk(callee, service, config, stack, partial);
+                backTo = Math.min(backTo, r.backTo());
                 for (Found f : r.found()) {
                     List<String> via = new ArrayList<>(List.of(label(callee)));
                     via.addAll(f.via());
-                    found.add(new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low()));
+                    add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low()));
                 }
             }
         }
         stack.remove(m);
-        if (!cut) { // a result cut short by recursion is only complete for the caller that cut it
-            done.put(m, found);
+        partial.values().removeIf(r -> r.backTo() >= depth); // they were cut back to m or below, which is done now
+        Result result = new Result(List.copyOf(found.values()), backTo);
+        if (backTo >= depth) { // complete: any recursion below came back to m itself, not to a caller still being walked
+            done.put(m, result.found());
+            return new Result(result.found(), Integer.MAX_VALUE);
         }
-        return new Result(found, cut);
+        partial.put(m, result);
+        return result;
+    }
+
+    /** First path found wins (deterministic), except that a certain path replaces a low-confidence one. */
+    private static void add(Map<Key, Found> found, Found f) {
+        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> a.lowConfidence() && !b.lowConfidence() ? b : a);
+    }
+
+    /** Static type of the call's receiver and its supertypes; empty when it has no scope or it can't be told. */
+    private List<TypeDeclaration<?>> receiverTypes(Expression call) {
+        Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope()
+                : Optional.of(((MethodReferenceExpr) call).getScope());
+        return scope.flatMap(this::scopeType)
+                .map(t -> Stream.concat(Stream.of(t), supertypes(t).stream()).toList()).orElse(List.of());
     }
 
     private Callees callees(Expression call) {
@@ -122,12 +167,14 @@ public final class FlowTracer {
     }
 
     // shortcut: no @Qualifier/@Primary narrowing and no oneOf node, every implementation is followed; M4 adds both
-    private List<MethodDeclaration> implementations(MethodDeclaration m) {
+    /** Implementations in the calling service or a library only: another service's class runs in that service. */
+    private List<MethodDeclaration> implementations(MethodDeclaration m, Repo service) {
         if (m.getBody().isPresent()) {
             return List.of(m);
         }
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
         List<MethodDeclaration> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
+                .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
                 .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream())
                 .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
                 .toList();

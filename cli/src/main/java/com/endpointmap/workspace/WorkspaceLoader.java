@@ -47,6 +47,8 @@ public final class WorkspaceLoader {
         ParserConfiguration solverConfig = new ParserConfiguration().setLanguageLevel(LANGUAGE_LEVEL);
         javaFilesByRepo.forEach((dir, files) -> sourceRoots(dir, files)
                 .forEach(r -> solver.add(new JavaParserTypeSolver(r, solverConfig))));
+        // the solver re-parses files it resolves through (record accessors need it), so it needs a resolver too
+        solverConfig.setSymbolResolver(new JavaSymbolSolver(solver));
         JavaParser parser = new JavaParser(new ParserConfiguration().setLanguageLevel(LANGUAGE_LEVEL)
                 .setSymbolResolver(new JavaSymbolSolver(solver)));
         List<Repo> repos = new ArrayList<>();

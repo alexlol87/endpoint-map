@@ -93,6 +93,11 @@ public final class Types {
                 .orElse(m);
     }
 
+    /** The repo that holds {@code node}, or null for nodes outside the workspace. */
+    public Repo repo(Node node) {
+        return node.findCompilationUnit().map(repoOf::get).orElse(null);
+    }
+
     /** Workspace-relative path of the file that holds {@code node}, or "" for nodes outside the workspace. */
     public String relPath(Node node) {
         return node.findCompilationUnit().map(relPathOf::get).orElse("");

@@ -2,6 +2,7 @@ package com.endpointmap;
 
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
+import static org.junit.jupiter.api.Assertions.assertTimeoutPreemptively;
 import static org.junit.jupiter.api.Assertions.assertTrue;
 
 import com.fasterxml.jackson.databind.JsonNode;
@@ -10,6 +11,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.PrintStream;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
@@ -199,6 +201,119 @@ class FeignTraceTest {
         // the profile file overrides the default: http://other-service:8080 -> other-service by host name
         Graph dev = map(root, "dev", root.resolve("out-dev"));
         assertEquals(Set.of("other-service GET /base/items/{id}"), dev.targetsOf(a, "other-service "));
+    }
+
+    @Test
+    void callsWithRecordAccessorArgumentsAreCertain() {
+        // customers.getCustomer(request.customerId()), skus().forEach(inventory::release), applyCoupon(.., request.couponCode())
+        for (String to : List.of("customer-service GET /customers-api/customers/{id}",
+                "inventory-service DELETE /inventory/{sku}/reservation", "unresolved:order-service:feign:pricing-service POST /prices/quote")) {
+            assertFalse(env.edge(CREATE, to).has("confidence"), to);
+        }
+        assertTrue(env.edges.stream().noneMatch(e -> e.has("confidence")), "every fixture call resolves");
+    }
+
+    @Test
+    void feignClientInheritingASharedApiAndInterfacesImplementedInOtherServices(@TempDir Path root) throws Exception {
+        write(root.resolve("lib-api/src/main/java/api/ItemApi.java"), """
+                package api;
+                public interface ItemApi { @org.springframework.web.bind.annotation.GetMapping("/items/{id}") Object get(String id); }
+                """);
+        write(root.resolve("lib-api/src/main/java/api/Publisher.java"), "package api;\npublic interface Publisher { void publish(String s); }\n");
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("ItemClient.java"), """
+                package a;
+                @org.springframework.cloud.openfeign.FeignClient(name = "b", url = "http://svc-b")
+                public interface ItemClient extends api.ItemApi {}
+                """);
+        write(a.resolve("Api.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Api {
+                  ItemClient items; api.Publisher publisher;
+                  @org.springframework.web.bind.annotation.GetMapping("/x") public void x() { items.get("1"); publisher.publish("x"); }
+                }
+                """);
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("Items.java"), """
+                package b;
+                @org.springframework.web.bind.annotation.RestController
+                public class Items implements api.ItemApi { AuditClient audit; public Object get(String id) { audit.send(); return null; } }
+                """);
+        write(b.resolve("Events.java"), "package b;\npublic class Events implements api.Publisher { AuditClient audit; public void publish(String s) { audit.send(); } }\n");
+        write(b.resolve("AuditClient.java"), """
+                package b;
+                @org.springframework.cloud.openfeign.FeignClient(name = "audit", url = "https://audit.example.com")
+                public interface AuditClient { @org.springframework.web.bind.annotation.PostMapping("/log") void send(); }
+                """);
+
+        Graph g = map(root, "prod", root.resolve("out"));
+        // @FeignClient sits on the receiver's type, the mapping on the inherited method; svc-b's own classes are not walked
+        assertEquals(Set.of("svc-b GET /items/{id}"), g.targetsOf("svc-a GET /x", ""));
+        assertEquals(List.of("ItemClient.get"), strings(g.edge("svc-a GET /x", "svc-b GET /items/{id}").get("via")));
+        g.edge("svc-b GET /items/{id}", "external:https://audit.example.com POST /log");
+    }
+
+    @Test
+    void deepChainWithRepeatedCallsAndRecursionFinishesFastWithOneEdge(@TempDir Path root) throws Exception {
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Api.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Api { L0 l; @org.springframework.web.bind.annotation.GetMapping("/x") public void x() { l.a(); } }
+                """);
+        write(a.resolve("Cl.java"), """
+                package a;
+                @org.springframework.cloud.openfeign.FeignClient(name = "b", url = "http://svc-b")
+                public interface Cl { @org.springframework.web.bind.annotation.GetMapping("/y") void y(); }
+                """);
+        int depth = 25; // each layer calls the next twice, both methods: 2^25 paths if nothing collapses them
+        for (int i = 0; i < depth - 1; i++) {
+            String next = "L" + (i + 1);
+            write(a.resolve("L" + i + ".java"), "package a;\npublic class L" + i + " { " + next + " nx; public void a() { nx.a(); nx.b(); } "
+                    + "public void b() { nx.a(); nx.b(); } }\n");
+        }
+        // a self-recursive helper and a cycle back to the top of the chain
+        write(a.resolve("L" + (depth - 1) + ".java"), "package a;\npublic class L" + (depth - 1) + " { Cl c; L0 back; "
+                + "void r(int k) { if (k > 0) r(k - 1); } public void a() { c.y(); r(3); back.a(); } public void b() { a(); } }\n");
+
+        Graph g = assertTimeoutPreemptively(Duration.ofSeconds(10), () -> map(root, "prod", root.resolve("out")));
+        assertEquals(1, g.edges.size(), g.edges.toString());
+        assertEquals(depth + 1, g.edges.get(0).get("via").size(), "one via per call site and target, the first path found");
+    }
+
+    @Test
+    void onlyInternalLookingHostsMatchServicesByFirstLabel(@TempDir Path root) throws Exception {
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Api.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Api { Stripe s; K8s k; @org.springframework.web.bind.annotation.GetMapping("/x") public void x() { s.pay(); k.pay(); } }
+                """);
+        write(a.resolve("Stripe.java"), """
+                package a;
+                @org.springframework.cloud.openfeign.FeignClient(name = "s", url = "https://billing-service.stripe.com")
+                public interface Stripe { @org.springframework.web.bind.annotation.PostMapping("/pay") void pay(); }
+                """);
+        write(a.resolve("K8s.java"), """
+                package a;
+                @org.springframework.cloud.openfeign.FeignClient(name = "k", url = "http://billing-service.payments.svc.cluster.local")
+                public interface K8s { @org.springframework.web.bind.annotation.PostMapping("/pay") void pay(); }
+                """);
+        Path b = root.resolve("billing-service/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("Pay.java"), """
+                package b;
+                @org.springframework.web.bind.annotation.RestController
+                public class Pay { @org.springframework.web.bind.annotation.PostMapping("/pay") public void pay() { } }
+                """);
+        Graph g = map(root, "prod", root.resolve("out"));
+        assertEquals(Set.of("billing-service POST /pay", "external:https://billing-service.stripe.com POST /pay"),
+                g.targetsOf("svc-a GET /x", ""));
     }
 
     @Test
