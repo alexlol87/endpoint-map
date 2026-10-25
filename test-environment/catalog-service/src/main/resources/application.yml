@@ -1,0 +1,10 @@
+server:
+  port: 9081
+spring:
+  application:
+    name: catalog-service
+clients:
+  pricing:
+    base-url: http://localhost:8084
+  inventory:
+    base-url: ${INVENTORY_URL:http://localhost:8083}

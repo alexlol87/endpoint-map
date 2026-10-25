@@ -1,0 +1,9 @@
+server:
+  port: 9090
+spring:
+  application:
+    name: warehouse-service
+warehouse:
+  clients:
+    inventory-url: http://localhost:8083
+    shipping-url: http://localhost:8086

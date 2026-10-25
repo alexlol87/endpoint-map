@@ -1,0 +1,9 @@
+server:
+  port: 8089
+spring:
+  application:
+    name: report-service
+report:
+  base-url: ${REPORT_EXPORT_URL}
+clients:
+  orders: http://localhost:8081/api

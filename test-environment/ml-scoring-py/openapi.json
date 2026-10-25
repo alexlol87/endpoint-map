@@ -1,0 +1,7 @@
+{
+  "openapi": "3.1.0",
+  "info": { "title": "ml-scoring (FastAPI)", "version": "0.1.0" },
+  "paths": {
+    "/scores/{user_id}": { "get": { "responses": { "200": { "description": "OK" } } } }
+  }
+}

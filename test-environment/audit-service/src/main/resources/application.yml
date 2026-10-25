@@ -1,0 +1,7 @@
+server:
+  port: 9087
+spring:
+  application:
+    name: audit-service
+vendor:
+  base-url: https://api.siem-vendor.example.com

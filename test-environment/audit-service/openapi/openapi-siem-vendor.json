@@ -1,0 +1,9 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "SIEM vendor API (external)", "version": "2" },
+  "servers": [ { "url": "https://api.siem-vendor.example.com" } ],
+  "paths": {
+    "/v2/events": { "post": { "responses": { "202": { "description": "Accepted" } } } },
+    "/v2/events/{eventId}": { "get": { "responses": { "200": { "description": "OK" } } } }
+  }
+}

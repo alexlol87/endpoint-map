@@ -1,0 +1,9 @@
+{
+  "swagger": "2.0",
+  "info": { "title": "report-service", "version": "0.9" },
+  "basePath": "/",
+  "paths": {
+    "/reports/{type}": { "get": { "responses": { "200": { "description": "OK" } } } },
+    "/reports/{type}/pdf": { "get": { "description": "openapi-only", "responses": { "200": { "description": "OK" } } } }
+  }
+}

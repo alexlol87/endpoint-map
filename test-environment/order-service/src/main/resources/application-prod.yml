@@ -1,0 +1,4 @@
+inventory:
+  base-url: http://inventory-service.prod.svc.cluster.local
+payment:
+  base-url: ${PAYMENT_SERVICE_URL}

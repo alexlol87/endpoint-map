@@ -1,0 +1,11 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "search-service", "version": "1.0" },
+  "paths": {
+    "/search": { "get": { "responses": { "200": { "description": "OK" } } } },
+    "/search/products/{sku}": { "get": { "responses": { "200": { "description": "OK" } } } },
+    "/search/facets/brand": { "get": { "description": "generated in a loop; walker cannot see it, OpenAPI can", "responses": { "200": { "description": "OK" } } } },
+    "/search/facets/color": { "get": { "responses": { "200": { "description": "OK" } } } },
+    "/search/facets/size": { "get": { "responses": { "200": { "description": "OK" } } } }
+  }
+}

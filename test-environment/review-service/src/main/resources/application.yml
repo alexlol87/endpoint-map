@@ -1,0 +1,7 @@
+server:
+  port: 9085
+spring:
+  application:
+    name: review-service
+catalog:
+  url: http://localhost:9081

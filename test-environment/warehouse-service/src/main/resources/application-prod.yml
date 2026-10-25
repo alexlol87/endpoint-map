@@ -1,0 +1,4 @@
+warehouse:
+  clients:
+    inventory-url: https://inventory.prod.acme.internal
+    shipping-url: ${SHIPPING_PROD_URL}
