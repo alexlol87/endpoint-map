@@ -39,7 +39,12 @@ class MapCommandTest {
         assertEquals(0, r.code, r.err);
         stdout = r.out;
         graph = JSON.readTree(out.resolve("graph.json").toFile());
-        graph.get("nodes").forEach(n -> nodes.put(n.get("id").asText(), n));
+        // endpoint nodes only: outbound targets (external, unresolved) are covered by FeignTraceTest
+        graph.get("nodes").forEach(n -> {
+            if (n.get("kind").asText().equals("endpoint")) {
+                nodes.put(n.get("id").asText(), n);
+            }
+        });
     }
 
     @Test

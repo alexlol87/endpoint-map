@@ -15,17 +15,17 @@ import java.util.List;
 import java.util.Optional;
 
 /** Evaluates compile-time String expressions: literals, concatenation and static final constants. */
-final class ConstantEvaluator {
+public final class ConstantEvaluator {
 
     private static final int MAX_DEPTH = 10;
 
     private final Types types;
 
-    ConstantEvaluator(Types types) {
+    public ConstantEvaluator(Types types) {
         this.types = types;
     }
 
-    Optional<String> eval(Expression e, Node context) {
+    public Optional<String> eval(Expression e, Node context) {
         return eval(e, context, 0);
     }
 
