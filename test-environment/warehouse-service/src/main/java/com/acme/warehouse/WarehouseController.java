@@ -10,7 +10,7 @@ import reactor.core.publisher.Mono;
 
 @RestController
 @RequestMapping("/warehouse")
-public class WarehouseController {
+public class WarehouseController extends BaseController {
 
     private final WarehouseService service;
 

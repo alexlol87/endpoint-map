@@ -9,7 +9,7 @@ import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
 @RestController
-@RequestMapping("/billing")
+@RequestMapping(ApiPaths.BASE)
 public class BillingController {
 
     private final BillingService service;
