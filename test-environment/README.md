@@ -55,6 +55,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Class-level prefix given as an array (each endpoint appears twice) | inventory-service `InventoryController` |
 | Path from a constant / constant concatenation, regex path variable | inventory-service `InventoryController` |
 | `@RequestMapping(method = {GET, PATCH})` | customer-service `CustomerController.preferences` |
+| Plain `@Controller` + `@ResponseBody`, single `method = RequestMethod.POST`, prefix and path from another class's constants, unmapped public method | tax-service `TaxAdminController` / `TaxPaths` |
 | No class prefix, prefix without a leading slash (`"payments"`, `"charge"`) | pricing-service `PriceController`, payment-service `PaymentController` |
 | Controller implementing an `@HttpExchange` interface | shipping-service `ShipmentApi` / `ShipmentController` |
 | Servlet context path (yml and .properties) | order-service, customer-service, tax-service |

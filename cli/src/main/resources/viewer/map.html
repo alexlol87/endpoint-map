@@ -1,0 +1,110 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>endpoint-map</title>
+<style>
+  :root { --fg: #1f2328; --muted: #57606a; --line: #d0d7de; --bg: #ffffff; }
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; background: var(--bg); color: var(--fg);
+    font: 14px/1.4 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+  body { display: grid; grid-template-rows: auto 1fr; grid-template-columns: 1fr 260px; }
+  header { grid-column: 1 / 3; display: flex; gap: 12px; align-items: center; padding: 8px 16px; border-bottom: 1px solid var(--line); }
+  header h1 { font-size: 16px; margin: 0; }
+  header input { flex: 1; max-width: 420px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; font: inherit; }
+  header .stats { color: var(--muted); }
+  #cy { min-height: 0; }
+  aside { border-left: 1px solid var(--line); padding: 12px 16px; overflow: auto; }
+  aside h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); margin: 12px 0 6px; }
+  .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
+  .sw { width: 14px; height: 14px; border-radius: 3px; flex: none; }
+  .verb { background: #fff; border: 3px solid; }
+  #details { white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, Menlo, monospace; }
+</style>
+</head>
+<body>
+<header>
+  <h1>endpoint-map</h1>
+  <input id="search" type="search" placeholder="Filter endpoints (service, verb, path, handler)" aria-label="Filter endpoints">
+  <span class="stats" id="stats"></span>
+</header>
+<div id="cy"></div>
+<aside>
+  <h2>Verbs</h2><div id="verbs"></div>
+  <h2>Services</h2><div id="services"></div>
+  <h2>Selected</h2><div id="details">Click an endpoint.</div>
+</aside>
+<script>/*@CYTOSCAPE@*/</script>
+<script>/*@DAGRE@*/</script>
+<script>/*@CYTOSCAPE_DAGRE@*/</script>
+<script>
+const GRAPH = /*@GRAPH@*/null;
+const VERB = { GET: '#2e9e4f', POST: '#f08c00', PUT: '#8e44ad', PATCH: '#e0b000', DELETE: '#d63031' };
+const verbColor = v => VERB[v] || '#57606a';
+const serviceColor = i => `hsl(${(i * 137.5) % 360}, 65%, 85%)`;
+const colorOf = Object.fromEntries(GRAPH.services.map(s => [s.name, serviceColor(s.colorIndex)]));
+
+const endpoints = GRAPH.nodes.filter(n => n.kind === 'endpoint');
+const byService = {};
+endpoints.forEach(n => (byService[n.service] = byService[n.service] || []).push(n));
+const shown = GRAPH.services.filter(s => byService[s.name]);
+
+// No edges yet: one column per service, wrapped into rows. dagre takes over once edges exist.
+const COL_W = 300, ROW_H = 34, PER_ROW = 6;
+const elements = [];
+let rowTop = 0, rowHeight = 0;
+shown.forEach((s, i) => {
+  if (i % PER_ROW === 0 && i > 0) { rowTop += rowHeight + 90; rowHeight = 0; }
+  const list = byService[s.name];
+  elements.push({ data: { id: 'svc:' + s.name, label: s.name, color: colorOf[s.name] }, classes: 'service' });
+  list.forEach((n, j) => elements.push({
+    data: { ...n, label: n.method + ' ' + n.path, parent: 'svc:' + s.name, color: colorOf[s.name], verb: verbColor(n.method) },
+    position: { x: (i % PER_ROW) * COL_W, y: rowTop + j * ROW_H }, classes: 'endpoint'
+  }));
+  rowHeight = Math.max(rowHeight, list.length * ROW_H);
+});
+GRAPH.edges.forEach((e, i) => elements.push({ data: { id: 'e' + i, source: e.from, target: e.to } }));
+
+const cy = cytoscape({
+  container: document.getElementById('cy'),
+  elements,
+  layout: GRAPH.edges.length ? { name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 80 } : { name: 'preset' },
+  wheelSensitivity: 0.3,
+  style: [
+    { selector: 'node.service', style: { label: 'data(label)', 'text-valign': 'top', 'text-halign': 'center',
+      'font-size': 14, 'font-weight': 600, color: '#1f2328', 'background-color': 'data(color)', 'background-opacity': 0.35,
+      'border-color': '#d0d7de', 'border-width': 1, padding: 12, shape: 'round-rectangle' } },
+    { selector: 'node.endpoint', style: { label: 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
+      'font-size': 11, color: '#1f2328', width: 260, height: 24, shape: 'round-rectangle',
+      'background-color': 'data(color)', 'border-color': 'data(verb)', 'border-width': 3,
+      'text-max-width': 250, 'text-wrap': 'ellipsis' } },
+    { selector: 'node.endpoint:selected', style: { 'border-width': 5, 'overlay-opacity': 0.08 } },
+    { selector: '.dim', style: { opacity: 0.12 } },
+    { selector: 'edge', style: { width: 1.5, 'line-color': '#8c959f', 'target-arrow-color': '#8c959f',
+      'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } }
+  ]
+});
+
+const legend = (el, items) => el.innerHTML = items.map(([label, css]) =>
+  `<div class="row"><span class="sw ${css.cls || ''}" style="${css.style}"></span>${label}</div>`).join('');
+legend(document.getElementById('verbs'), Object.entries(VERB).map(([v, c]) => [v, { cls: 'verb', style: 'border-color:' + c }]));
+legend(document.getElementById('services'), GRAPH.services.map(s =>
+  [s.name + (s.kind === 'library' ? ' (library)' : ''), { style: 'background:' + colorOf[s.name] }]));
+document.getElementById('stats').textContent = `${endpoints.length} endpoints in ${shown.length} services`;
+
+cy.on('tap', 'node.endpoint', ev => {
+  const d = ev.target.data();
+  document.getElementById('details').textContent =
+    `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}`;
+});
+document.getElementById('search').addEventListener('input', ev => {
+  const q = ev.target.value.trim().toLowerCase();
+  cy.batch(() => cy.nodes('.endpoint').forEach(n => {
+    const hit = !q || (n.data('id') + ' ' + n.data('handler')).toLowerCase().includes(q);
+    n.toggleClass('dim', !hit);
+  }));
+});
+</script>
+</body>
+</html>
