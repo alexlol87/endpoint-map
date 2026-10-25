@@ -1,0 +1,5 @@
+server:
+  port: 9089
+spring:
+  application:
+    name: loyalty-service

@@ -1,0 +1,5 @@
+[project]
+name = "data-pipeline"
+version = "0.3.0"
+requires-python = ">=3.11"
+dependencies = ["requests>=2.31", "sqlalchemy>=2.0"]

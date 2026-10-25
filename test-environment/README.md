@@ -1,0 +1,151 @@
+# test-environment
+
+Fixture workspace for endpoint-map. Point the CLI at this folder:
+
+```bash
+java -jar endpoint-map.jar discover --root test-environment --profile prod --resolutions resolutions.yml
+```
+
+Each sub-folder is one "repository". The code is never run, only scanned, but it all compiles:
+
+```bash
+cd test-environment && mvn -B package -DskipTests   # needs JDK 25 (servlet services target 25)
+```
+
+`pom.xml` here is just a build aggregator so everything compiles with one command. It is a file, not a sub-folder, so the workspace loader never sees it as a repo.
+
+Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annotations 2.4, Spring Retry 2.0.
+
+## Repositories
+
+| Folder | Kind | Stack | Port / base path |
+|---|---|---|---|
+| lib-http-clients | library | Feign, RestClient wrapper | – |
+| lib-common-clients | library | RestTemplate wrapper, `@ConfigurationProperties` | – |
+| lib-reactive-clients | library | WebClient wrapper, `@HttpExchange`, `Notifier` impls | – |
+| order-service | service | MVC, Java 25 | 8081, context path `/api` |
+| customer-service | service | MVC, Java 25 | 8082, context path `/customers-api` |
+| inventory-service | service | MVC, Java 25 | 8083 |
+| pricing-service | service | MVC, Java 25 | 8084 |
+| payment-service | service | MVC, Java 25 | 8085 |
+| shipping-service | service | MVC, Java 25 | 8086 |
+| billing-service | service | MVC, Java 25 | 8087 |
+| notification-service | service | MVC, Java 25 | 8088 |
+| report-service | service | MVC, Java 25 | 8089 |
+| tax-service | service | MVC, Java 25 | 8090, context path `/tax-api` |
+| catalog-service | service | WebFlux, Java 21 | 9081 |
+| cart-service | service | WebFlux, Java 21 | 9082 |
+| search-service | service | WebFlux functional (builder), Java 21 | 9083 |
+| recommendation-service | service | WebFlux functional (static), Java 21 | 9084 |
+| review-service | service | WebFlux, Java 21 | 9085 |
+| user-profile-service | service | WebFlux, Java 21 | 9086, base path `/profile-api` |
+| audit-service | service | WebFlux, Java 21 | 9087 |
+| analytics-service | service | WebFlux, Java 21 | 9088 |
+| loyalty-service | service | WebFlux annotated + functional, Java 21 | 9089 |
+| warehouse-service | service | WebFlux, Java 21 | 9090 |
+| infra-network-terraform, infra-databases-terraform, infra-k8s-terraform | non-Java | Terraform | must be skipped |
+| data-pipeline-py, ml-scoring-py, ops-scripts-py | non-Java | Python | must be skipped |
+
+## Where each detection case lives
+
+### Inbound endpoints
+| Case | Location |
+|---|---|
+| Class prefix + verb annotations, multiple paths per method (`{"", "/search"}`) | order-service `OrderController` |
+| Class-level prefix given as an array (each endpoint appears twice) | inventory-service `InventoryController` |
+| Path from a constant / constant concatenation, regex path variable | inventory-service `InventoryController` |
+| `@RequestMapping(method = {GET, PATCH})` | customer-service `CustomerController.preferences` |
+| No class prefix, prefix without a leading slash (`"payments"`, `"charge"`) | pricing-service `PriceController`, payment-service `PaymentController` |
+| Controller implementing an `@HttpExchange` interface | shipping-service `ShipmentApi` / `ShipmentController` |
+| Servlet context path (yml and .properties) | order-service, customer-service, tax-service |
+| WebFlux base path | user-profile-service `application.properties` |
+| Builder routes: `route().path(..)`, `.nest(path(..))` 3 levels deep, `accept(..)`, lambda handler, `.add(otherRouter())` | search-service `SearchRoutes.searchRouter` / `adminRoutes` |
+| Routes the walker cannot understand (built in a loop) -> report | search-service `SearchRoutes.facetRouter` |
+| Static routes: `route(..).andRoute(..)`, `path(..).and(method(GET))`, `andNest`, `nest(path, route(..))`, `.and(privateMethod())`, lambda | recommendation-service `RecommendationRouter` |
+| Annotated and functional endpoints in one service | loyalty-service |
+
+### OpenAPI files
+| File | Mismatch |
+|---|---|
+| order-service/openapi.json | `GET /orders/{id}/invoice` only in OpenAPI; `POST /orders/{id}/cancel` only in code |
+| pricing-service/api-docs.json | `POST /prices/bulk` only in OpenAPI; `POST /prices/quote` only in code |
+| report-service/swagger.json (Swagger 2) | `GET /reports/{type}/pdf` only in OpenAPI; `POST /reports/export` only in code |
+| catalog-service/openapi.json | `PUT /catalog/products/{sku}` only in OpenAPI; `POST .../bulk` only in code |
+| search-service/openapi-search.json | `/search/facets/*` only in OpenAPI (generated in a loop in code) |
+| audit-service/openapi/openapi.json | matches code exactly (control case) |
+| payment-service/docs/external/openapi-stripe.json | external API (api.stripe.com) |
+| audit-service/openapi/openapi-siem-vendor.json | external API (api.siem-vendor.example.com) |
+| ml-scoring-py/openapi.json | belongs to a non-Java repo |
+
+### Outbound HTTP
+| Case | Location |
+|---|---|
+| Feign, name only, no url -> `feign:pricing-service` | lib-http-clients `PricingFeignClient` |
+| Feign, `@FeignClient("name")` value form -> `feign:user-profile-service` | notification-service `UserProfileClient` |
+| Feign, `${property}` url + `path` prefix + `@RequestMapping(method=PATCH)` | lib-http-clients `InventoryFeignClient` |
+| Feign, literal url that includes the target's context path | lib-http-clients `CustomerFeignClient` |
+| Feign, env-var url `${SHIPPING_SERVICE_URL}` | order-service `ShippingFeignClient` |
+| RestTemplate: `postForEntity`, `postForObject`, `getForObject`, `exchange`, `put`, `execute`, `delete` | order-service `PaymentClient`, payment-service `PaymentGateway`, lib-common-clients |
+| RestClient: `baseUrl` builder, `RestClient.create(url)`, `uri(Function)` URI builder | pricing-service `PriceService`, shipping-service carriers |
+| WebClient: `WebClient.create(url)`, builder `baseUrl`, two beans told apart by `@Qualifier`/bean name | catalog-service `WebClientConfig`, user-profile-service `ClientsConfig` |
+| `@HttpExchange` client via `RestClientAdapter` | shipping-service `BillingExchangeClient` + `ClientConfig` |
+| `@HttpExchange` client via `WebClientAdapter`, inline and through a factory bean | recommendation-service `ExchangeConfig`, loyalty-service `CartClientConfig` |
+| `@HttpExchange` interface shared from a library | lib-reactive-clients `ShippingExchange`, used by warehouse-service |
+| Library wrapper, URL/verb passed as parameters | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service -> `ReactiveHttp` |
+| Parameter chain 4 levels deep (beyond constant propagation) -> callSites | billing-service `syncTenant` -> `DeepChainCaller` |
+| `static final` constants, constant concatenation | lib-http-clients `HttpPaths`, used by pricing-service and billing-service |
+| `@Value("${x:default}")`, `@Value("${ENV_VAR}")` | order-service `PaymentClient`, payment-service `PaymentGateway` |
+| `@ConfigurationProperties` class (library) and record (service) | lib-common-clients `ServiceEndpointsProperties`, warehouse-service `WarehouseClientsProperties` |
+| Profile values: `application-prod.yml` and `---` + `on-profile` | order-service, warehouse-service, pricing-service |
+| `${ENV:default}` in yml | payment-service, catalog-service, billing-service |
+| `UriComponentsBuilder`, `String.format`, `StringBuilder` loop | lib-common-clients `UrlTemplates` |
+| Runtime-built URLs (config + request data, URL taken from the request body) | report-service `ReportService.export`, billing-service `syncTenant` |
+| External hosts (Stripe, DHL, UPS, FCM, SendGrid, FX, SIEM, fraud vendor) | payment, shipping, notification, lib-reactive-clients, pricing, audit |
+| Service calling itself through a library impl | notification-service `SmsNotifier` -> `POST /notifications/sms` |
+
+### Database and Redis
+| Case | Location |
+|---|---|
+| JPA `JpaRepository`, `@Table`, derived queries, `@Modifying @Query` JPQL, native `@Query` | order-service |
+| JPA `CrudRepository`, table from `@Entity(name)`, native query with JOIN | customer-service |
+| JPA bare `Repository` + `PagingAndSortingRepository`, table = class name, `EntityManager` | inventory-service |
+| `JdbcTemplate` and `JdbcClient` raw SQL (SELECT / INSERT / UPDATE / DELETE) | report-service |
+| R2DBC `ReactiveCrudRepository` + `@Query` JOIN | catalog-service, loyalty-service |
+| R2DBC `R2dbcRepository` | user-profile-service |
+| R2DBC `@Modifying @Query`, `@Table` without a name | audit-service |
+| `DatabaseClient.sql(..)`, `R2dbcEntityTemplate.insert/delete` | review-service |
+| `StringRedisTemplate` opsForValue / expire / hasKey, `@Cacheable/@CachePut/@CacheEvict` | customer-service |
+| `RedisTemplate` opsForHash / opsForList / opsForZSet, constant key, `@Cacheable("name")` | tax-service |
+| `ReactiveRedisTemplate` opsForHash / expire / delete / opsForValue | cart-service |
+| `ReactiveStringRedisTemplate` opsForList / opsForValue.increment / opsForZSet | analytics-service |
+| `ReactiveStringRedisTemplate` opsForSet / opsForHash + `@Cacheable` on a Mono method | warehouse-service |
+
+### Control flow
+| Case | Location |
+|---|---|
+| if/else, for-each, try/catch/finally, arrow switch, ternary, method ref in forEach | order-service `OrderService.create/cancel/list` |
+| Classic switch with break/default, switch expression with `yield` | pricing-service `PriceService` |
+| `while`, if/else | inventory-service `StockService` |
+| `do/while`, `stream().filter().forEach()`, ternary URL choice | report-service `ReportService.build` |
+| `@CircuitBreaker(fallbackMethod)` where the fallback makes its own HTTP call, `@Retry` | pricing-service `taxRate` / `defaultTaxRate` |
+| `@CircuitBreaker` with a DB fallback | order-service `priceOf` / `priceFallback` |
+| `@Retryable` + `@Recover` | payment-service `PaymentGateway` |
+| `flatMap`, `concatMap`, `filter`, `switchIfEmpty` | catalog-service `ProductService` |
+| `Mono.zip`, `switchIfEmpty`, `defaultIfEmpty`, `onErrorReturn` | cart-service `CartService` |
+| `onErrorResume`, `retryWhen`, `retry`, `then` chains | review-service, warehouse-service |
+| `Flux.zip`, `retryWhen`, `filter`, `Mono.fromCallable` over blocking RestClient | analytics-service |
+| `Mono.when`, `zipWith`, `flatMapMany` | recommendation-service, user-profile-service |
+| Interface with `@Primary` + `@Qualifier` impls | shipping-service `CarrierGateway` (Dhl primary, Ups qualified) |
+| Interface with two conditional impls and no qualifier -> oneOf | shipping-service `LabelPrinter` |
+| Library interface, impls from library `@Bean`s and a local `@Primary`, `@Qualifier("sms")`, `List<Notifier>` | notification-service + lib-reactive-clients `Notifier` |
+| Cross-service cycle (MVC) | order `GET /orders/by-customer/{id}/summary` <-> customer `GET /customers/{id}/orders-summary` |
+| Cross-service cycle (WebFlux) | search `GET /search/products/{sku}/similar` <-> analytics `GET /analytics/trending` |
+| Cross-service cycle (functional route + `@HttpExchange`) | loyalty `POST /loyalty/{userId}/simulate` <-> cart `GET /carts/{userId}/points-preview` |
+| Self-recursion | analytics-service `AnalyticsService.exportAll` |
+
+### Robustness
+| Case | Location |
+|---|---|
+| Unparseable Java file (excluded from the Maven build by the aggregator's `Unparseable*.java` rule) | report-service `legacy/UnparseableLegacyExporter.java` |
+| Terraform repos, one with a Spring-looking `application.yml` | infra-*-terraform |
+| Python repos: Spring annotations inside a docstring, FastAPI `openapi.json`, an invalid `.py` file | data-pipeline-py, ml-scoring-py, ops-scripts-py |

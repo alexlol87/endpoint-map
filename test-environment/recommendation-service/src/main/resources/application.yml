@@ -1,0 +1,8 @@
+server:
+  port: 9084
+spring:
+  application:
+    name: recommendation-service
+clients:
+  profile: http://localhost:9086/profile-api
+  catalog: ${CATALOG_URL}

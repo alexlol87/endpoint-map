@@ -1,0 +1,8 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "audit-service", "version": "1.0" },
+  "paths": {
+    "/audit/events": { "post": { "responses": { "202": { "description": "Accepted" } } } },
+    "/audit/events/{id}": { "get": { "responses": { "200": { "description": "OK" } } } }
+  }
+}

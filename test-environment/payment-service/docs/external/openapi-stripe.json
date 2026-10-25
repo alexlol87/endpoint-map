@@ -1,0 +1,10 @@
+{
+  "openapi": "3.0.0",
+  "info": { "title": "Stripe (external, trimmed)", "version": "2024-06-20" },
+  "servers": [ { "url": "https://api.stripe.com" } ],
+  "paths": {
+    "/v1/charges": { "post": { "responses": { "200": { "description": "Charge" } } } },
+    "/v1/refunds": { "post": { "responses": { "200": { "description": "Refund" } } } },
+    "/v1/payment_intents/{intent}/cancel": { "post": { "responses": { "200": { "description": "Cancelled" } } } }
+  }
+}

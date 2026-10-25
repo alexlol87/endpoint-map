@@ -1,0 +1,8 @@
+server:
+  port: 9088
+spring:
+  application:
+    name: analytics-service
+clients:
+  search: http://localhost:9083
+  warehouse: http://localhost:9090

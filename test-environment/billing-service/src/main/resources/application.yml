@@ -1,0 +1,11 @@
+server:
+  port: 8087
+spring:
+  application:
+    name: billing-service
+clients:
+  tax-url: http://localhost:8090/tax-api
+acme:
+  clients:
+    shipping-url: ${SHIPPING_SERVICE_URL:http://localhost:8086}
+    billing-url: http://localhost:8087

@@ -1,0 +1,95 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Build-only aggregator so the whole fixture workspace compiles with one command.
+     Not a repo itself: endpoint-map treats each sub-folder as one repository. -->
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 https://maven.apache.org/xsd/maven-4.0.0.xsd">
+  <modelVersion>4.0.0</modelVersion>
+  <parent>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-parent</artifactId>
+    <version>4.0.9</version>
+    <relativePath/>
+  </parent>
+  <groupId>com.acme.testenv</groupId>
+  <artifactId>test-environment</artifactId>
+  <version>1.0.0-SNAPSHOT</version>
+  <packaging>pom</packaging>
+
+  <properties>
+    <java.version>21</java.version>
+    <spring-cloud.version>2025.1.4</spring-cloud.version>
+    <resilience4j.version>2.4.0</resilience4j.version>
+    <spring-retry.version>2.0.13</spring-retry.version>
+  </properties>
+
+  <modules>
+    <!-- libraries (Java 21, consumed by both stacks) -->
+    <module>lib-http-clients</module>
+    <module>lib-common-clients</module>
+    <module>lib-reactive-clients</module>
+    <!-- servlet services (Spring MVC, Java 25) -->
+    <module>order-service</module>
+    <module>customer-service</module>
+    <module>inventory-service</module>
+    <module>pricing-service</module>
+    <module>payment-service</module>
+    <module>shipping-service</module>
+    <module>billing-service</module>
+    <module>notification-service</module>
+    <module>report-service</module>
+    <module>tax-service</module>
+    <!-- reactive services (WebFlux, Java 21) -->
+    <module>catalog-service</module>
+    <module>cart-service</module>
+    <module>search-service</module>
+    <module>recommendation-service</module>
+    <module>review-service</module>
+    <module>user-profile-service</module>
+    <module>audit-service</module>
+    <module>analytics-service</module>
+    <module>loyalty-service</module>
+    <module>warehouse-service</module>
+    <!-- infra-*-terraform and *-py folders are deliberately not modules -->
+  </modules>
+
+  <dependencyManagement>
+    <dependencies>
+      <dependency>
+        <groupId>org.springframework.cloud</groupId>
+        <artifactId>spring-cloud-dependencies</artifactId>
+        <version>${spring-cloud.version}</version>
+        <type>pom</type>
+        <scope>import</scope>
+      </dependency>
+      <dependency>
+        <groupId>io.github.resilience4j</groupId>
+        <artifactId>resilience4j-annotations</artifactId>
+        <version>${resilience4j.version}</version>
+      </dependency>
+      <dependency>
+        <groupId>org.springframework.retry</groupId>
+        <artifactId>spring-retry</artifactId>
+        <version>${spring-retry.version}</version>
+      </dependency>
+      <dependency><groupId>com.acme.testenv</groupId><artifactId>lib-http-clients</artifactId><version>${project.version}</version></dependency>
+      <dependency><groupId>com.acme.testenv</groupId><artifactId>lib-common-clients</artifactId><version>${project.version}</version></dependency>
+      <dependency><groupId>com.acme.testenv</groupId><artifactId>lib-reactive-clients</artifactId><version>${project.version}</version></dependency>
+    </dependencies>
+  </dependencyManagement>
+
+  <build>
+    <plugins>
+      <plugin>
+        <groupId>org.apache.maven.plugins</groupId>
+        <artifactId>maven-compiler-plugin</artifactId>
+        <configuration>
+          <!-- Deliberately broken fixture sources (parse-failure test cases) -->
+          <excludes>
+            <exclude>**/Unparseable*.java</exclude>
+          </excludes>
+        </configuration>
+      </plugin>
+    </plugins>
+  </build>
+</project>

@@ -1,0 +1,24 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "order-service", "version": "1.0" },
+  "servers": [ { "url": "http://localhost:8081/api" } ],
+  "paths": {
+    "/orders/{id}": {
+      "get": { "operationId": "get", "responses": { "200": { "description": "OK" } } },
+      "delete": { "operationId": "delete", "responses": { "200": { "description": "OK" } } }
+    },
+    "/orders": {
+      "get": { "operationId": "list", "responses": { "200": { "description": "OK" } } },
+      "post": { "operationId": "create", "responses": { "200": { "description": "OK" } } }
+    },
+    "/orders/search": {
+      "get": { "operationId": "list_1", "responses": { "200": { "description": "OK" } } }
+    },
+    "/orders/by-customer/{customerId}/summary": {
+      "get": { "operationId": "summaryForCustomer", "responses": { "200": { "description": "OK" } } }
+    },
+    "/orders/{id}/invoice": {
+      "get": { "operationId": "invoice", "description": "Documented but removed from code -> openapi-only", "responses": { "200": { "description": "OK" } } }
+    }
+  }
+}

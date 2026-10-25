@@ -1,0 +1,7 @@
+server:
+  port: 8085
+spring:
+  application:
+    name: payment-service
+fraud:
+  url: ${FRAUD_API_URL:https://fraud.example-vendor.com}

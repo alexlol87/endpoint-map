@@ -1,0 +1,14 @@
+server:
+  port: 8084
+spring:
+  application:
+    name: pricing-service
+tax:
+  url: http://localhost:8090/tax-api
+---
+spring:
+  config:
+    activate:
+      on-profile: prod
+tax:
+  url: http://tax-service.prod.internal/tax-api

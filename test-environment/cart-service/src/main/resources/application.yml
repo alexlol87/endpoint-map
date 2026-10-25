@@ -1,0 +1,8 @@
+server:
+  port: 9082
+spring:
+  application:
+    name: cart-service
+services:
+  catalog: http://localhost:9081
+  loyalty: http://localhost:9089

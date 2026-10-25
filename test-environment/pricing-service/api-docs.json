@@ -1,0 +1,8 @@
+{
+  "openapi": "3.0.1",
+  "info": { "title": "pricing-service", "version": "2.3" },
+  "paths": {
+    "/prices/{sku}": { "get": { "responses": { "200": { "description": "OK" } } } },
+    "/prices/bulk": { "post": { "description": "openapi-only endpoint", "responses": { "200": { "description": "OK" } } } }
+  }
+}

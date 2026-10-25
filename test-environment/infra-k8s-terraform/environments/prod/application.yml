@@ -1,0 +1,5 @@
+# A stray Spring-looking YAML in a non-Java repo: must not turn this repo into a service.
+server:
+  port: 8080
+  servlet:
+    context-path: /should-be-ignored
