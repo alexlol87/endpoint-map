@@ -190,24 +190,31 @@ public final class AnnotationEndpointDetector {
         return t.getAnnotations().stream().anyMatch(a -> TYPE_MAPPINGS.contains(a.getName().getIdentifier()));
     }
 
+    /** Verbs and paths of a method's own mapping annotation; empty when the method is not mapped. */
+    public Optional<Mapping> mappingOf(MethodDeclaration m) {
+        return mapping(m).map(a -> new Mapping(FIXED_VERB.containsKey(a.getName().getIdentifier())
+                ? List.of(FIXED_VERB.get(a.getName().getIdentifier())) : verbs(a), paths(a, m)));
+    }
+
+    public record Mapping(List<String> verbs, List<String> paths) {
+    }
+
     private void emit(Repo repo, List<String> prefixes, ClassOrInterfaceDeclaration controller,
                       MethodDeclaration declared, MethodDeclaration handler, String file, String contextPath,
                       List<Endpoint> out) {
-        Optional<AnnotationExpr> mapping = mapping(declared);
+        Optional<Mapping> mapping = mappingOf(declared);
         if (mapping.isEmpty()) {
             return;
         }
-        AnnotationExpr a = mapping.get();
-        List<String> verbs = FIXED_VERB.containsKey(a.getName().getIdentifier())
-                ? List.of(FIXED_VERB.get(a.getName().getIdentifier())) : verbs(a);
-        List<String> paths = paths(a, declared);
+        List<String> verbs = mapping.get().verbs();
+        List<String> paths = mapping.get().paths();
         int line = handler.getBegin().map(p -> p.line).orElse(0);
         for (String prefix : prefixes) {
             for (String path : paths) {
                 String full = UrlPaths.join(contextPath, prefix, path);
                 for (String verb : verbs) {
                     out.add(new Endpoint(repo.name(), verb, full,
-                            controller.getNameAsString() + "." + handler.getNameAsString(), file, line, "annotation"));
+                            controller.getNameAsString() + "." + handler.getNameAsString(), file, line, "annotation", handler));
                 }
             }
         }

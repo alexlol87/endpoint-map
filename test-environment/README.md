@@ -150,6 +150,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Case | Location |
 |---|---|
 | MVC: controller -> handler interface (one `@Component` impl) -> `CheckoutService` -> `OrderPricingService` -> `OrderTaxService` -> `TaxRestUtils` (`@Component` util doing a RestTemplate call 5 hops down, URL via static `UrlUtils.join` + `HttpPaths` constant) | order-service `POST /orders/{id}/checkout` |
+| MVC: same chain, `CheckoutService` -> static library helper `CustomerChecks.requireActive` -> private static `load` -> `CustomerFeignClient.getCustomer` (Feign client passed as an argument; via has 5 hops) | order-service `CheckoutService`, lib-http-clients `CustomerChecks` |
 | MVC: same chain, second branch -> `FulfilmentService` -> pure static `ShippingPayloadUtils`, then Feign + RestTemplate; pure static `MoneyUtils` (no I/O, nothing to report) | order-service `CheckoutService` |
 | WebFlux annotated: controller -> `ProductDetailsHandler` -> `ProductDetailsService` (`Mono.zip`) -> `AvailabilityService` -> `StockLookupService` / `PriceLookupService` -> one static util `ReactiveClientUtils.getJson` called with two different `WebClient` beans (inventory vs pricing) | catalog-service `GET /catalog/products/{sku}/details` |
 | WebFlux functional: route -> `SearchHandler.bundle` -> `BundleService` -> `RelatedProductsService` -> path from static `SearchPathUtils` -> catalog `GET /catalog/products/{sku}/details` (deep chain calling another deep chain) | search-service `GET /search/products/{sku}/bundle` |

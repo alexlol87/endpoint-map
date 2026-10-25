@@ -10,7 +10,10 @@ import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.NameExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.resolution.declarations.ResolvedValueDeclaration;
+import com.github.javaparser.ast.body.MethodDeclaration;
+import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -26,6 +29,7 @@ public final class Types {
 
     private final Map<CompilationUnit, Repo> repoOf = new IdentityHashMap<>();
     private final Map<CompilationUnit, String> relPathOf = new IdentityHashMap<>();
+    private final Map<Path, CompilationUnit> byFile = new HashMap<>();
     private final Map<String, List<TypeDeclaration<?>>> byQualifiedName = new LinkedHashMap<>();
     private final Map<String, List<TypeDeclaration<?>>> bySimpleName = new LinkedHashMap<>();
 
@@ -34,6 +38,7 @@ public final class Types {
             for (SourceFile sf : repo.sources()) {
                 repoOf.put(sf.cu(), repo);
                 relPathOf.put(sf.cu(), sf.relPath());
+                sf.cu().getStorage().ifPresent(st -> byFile.put(st.getPath(), sf.cu()));
                 for (TypeDeclaration<?> t : sf.cu().findAll(TypeDeclaration.class)) {
                     t.getFullyQualifiedName().ifPresent(q -> byQualifiedName.computeIfAbsent(q, k -> new ArrayList<>()).add(t));
                     bySimpleName.computeIfAbsent(t.getNameAsString(), k -> new ArrayList<>()).add(t);
@@ -72,6 +77,25 @@ public final class Types {
     // shortcut: name fallback ignores imports and packages; mark results confidence "low" once edges carry it
     public Optional<TypeDeclaration<?>> bySimpleNameNear(String simpleName, Node context) {
         return pick(bySimpleName.get(simpleName), context);
+    }
+
+    /**
+     * The workspace's own copy of a method the symbol solver returned: the solver parses files again, so its nodes
+     * are not the ones the workspace holds. Matched by file and position; the method itself when already ours.
+     */
+    public MethodDeclaration canonical(MethodDeclaration m) {
+        Optional<CompilationUnit> cu = m.findCompilationUnit();
+        if (cu.isEmpty() || repoOf.containsKey(cu.get())) {
+            return m;
+        }
+        return cu.get().getStorage().map(st -> byFile.get(st.getPath()))
+                .flatMap(own -> own.findFirst(MethodDeclaration.class, o -> o.getRange().equals(m.getRange())))
+                .orElse(m);
+    }
+
+    /** The repo that holds {@code node}, or null for nodes outside the workspace. */
+    public Repo repo(Node node) {
+        return node.findCompilationUnit().map(repoOf::get).orElse(null);
     }
 
     /** Workspace-relative path of the file that holds {@code node}, or "" for nodes outside the workspace. */

@@ -20,20 +20,33 @@
   .row { display: flex; align-items: center; gap: 8px; margin: 3px 0; }
   .sw { width: 14px; height: 14px; border-radius: 3px; flex: none; }
   .verb { background: #fff; border: 3px solid; }
+  header button { font: inherit; padding: 5px 10px; border: 1px solid var(--line); background: #f6f8fa; border-radius: 6px; cursor: pointer; }
+  .seg { display: flex; }
+  .seg button { border-radius: 0; }
+  .seg button:first-child { border-radius: 6px 0 0 6px; }
+  .seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
+  header button.on { background: #0969da; border-color: #0969da; color: #fff; }
+  .hint { color: var(--muted); margin: 0 0 8px; }
   #details { white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, Menlo, monospace; }
 </style>
 </head>
 <body>
 <header>
   <h1>endpoint-map</h1>
+  <div class="seg" role="group" aria-label="Detail level">
+    <button id="l1" type="button">L1 services</button><button id="l2" type="button">L2 endpoints</button>
+  </div>
   <input id="search" type="search" placeholder="Filter endpoints (service, verb, path, handler)" aria-label="Filter endpoints">
+  <button id="clear" type="button">Show all</button>
   <span class="stats" id="stats"></span>
 </header>
 <div id="cy"></div>
 <aside>
+  <p class="hint">Click an endpoint (L2) or a service (L1) to see what it calls downstream. Shift-click adds to the selection.</p>
   <h2>Verbs</h2><div id="verbs"></div>
+  <h2>Targets</h2><div id="kinds"></div>
   <h2>Services</h2><div id="services"></div>
-  <h2>Selected</h2><div id="details">Click an endpoint.</div>
+  <h2>Selected</h2><div id="details">Nothing selected.</div>
 </aside>
 <script>/*@CYTOSCAPE@*/</script>
 <script>/*@DAGRE@*/</script>
@@ -45,68 +58,150 @@ const VERB = { GET: '#2e9e4f', POST: '#f08c00', PUT: '#8e44ad', PATCH: '#e0b000'
 const verbColor = v => VERB[v] || '#57606a';
 const serviceColor = i => `hsl(${(i * 137.5) % 360}, 65%, 85%)`;
 const colorOf = Object.fromEntries(GRAPH.services.map(s => [s.name, serviceColor(s.colorIndex)]));
-
+const nodeById = Object.fromEntries(GRAPH.nodes.map(n => [n.id, n]));
 const endpoints = GRAPH.nodes.filter(n => n.kind === 'endpoint');
-const byService = {};
-endpoints.forEach(n => (byService[n.service] = byService[n.service] || []).push(n));
-const shown = GRAPH.services.filter(s => byService[s.name]);
+const out = {};
+GRAPH.edges.forEach(e => (out[e.from] = out[e.from] || []).push(e));
 
-// No edges yet: one column per service, wrapped into rows. dagre takes over once edges exist.
-const COL_W = 300, ROW_H = 34, PER_ROW = 6;
-const elements = [];
-let rowTop = 0, rowHeight = 0;
-shown.forEach((s, i) => {
-  if (i % PER_ROW === 0 && i > 0) { rowTop += rowHeight + 90; rowHeight = 0; }
-  const list = byService[s.name];
-  elements.push({ data: { id: 'svc:' + s.name, label: s.name, color: colorOf[s.name] }, classes: 'service' });
-  list.forEach((n, j) => elements.push({
-    data: { ...n, label: n.method + ' ' + n.path, parent: 'svc:' + s.name, color: colorOf[s.name], verb: verbColor(n.method) },
-    position: { x: (i % PER_ROW) * COL_W, y: rowTop + j * ROW_H }, classes: 'endpoint'
+// L1 node for any L2 node: endpoints roll up to their service, external to its host, unresolved to what is missing
+// (a known service without the endpoint stays a separate ✕ node, so the gap shows at L1 too)
+const l1Of = n => n.kind === 'endpoint' ? 'svc:' + n.service
+  : n.kind === 'external' ? 'external:' + n.host : 'unresolved:' + n.id.replace(/^unresolved:/, '').split(' ')[0];
+const l1Label = id => id.startsWith('svc:') ? id.slice(4) : id.startsWith('external:') ? id.slice(9) : '✕ ' + id.slice(11);
+
+let level = 'L2';
+let roots = new Set(); // selected endpoint ids; empty = whole map
+
+function downstream() {
+  if (!roots.size) return { nodes: new Set(GRAPH.nodes.map(n => n.id)), edges: GRAPH.edges };
+  const nodes = new Set(roots), edges = [], todo = [...roots];
+  while (todo.length) {
+    (out[todo.pop()] || []).forEach(e => {
+      edges.push(e);
+      if (!nodes.has(e.to)) { nodes.add(e.to); todo.push(e.to); }
+    });
+  }
+  return { nodes, edges };
+}
+
+function elements() {
+  const { nodes, edges } = downstream();
+  const els = [], seen = new Set();
+  const add = (id, data, classes) => { if (!seen.has(id)) { seen.add(id); els.push({ data: { id, ...data }, classes }); } };
+  const pair = {};
+  const link = (from, to, e) => {
+    const k = from + '\u0000' + to;
+    (pair[k] = pair[k] || { from, to, list: [] }).list.push(e);
+  };
+  if (level === 'L2') {
+    nodes.forEach(id => {
+      const n = nodeById[id];
+      if (n.service) add('svc:' + n.service, { label: n.service, color: colorOf[n.service] }, 'service');
+      const parent = n.service ? 'svc:' + n.service : undefined;
+      if (n.kind === 'endpoint') add(id, { ...n, label: n.method + ' ' + n.path, parent, color: colorOf[n.service], verb: verbColor(n.method) }, 'endpoint');
+      else add(id, { ...n, label: (n.kind === 'unresolved' ? '✕ ' : '') + (n.method || '') + ' ' + (n.path || ''), parent, verb: verbColor(n.method) }, n.kind);
+    });
+    edges.forEach(e => link(e.from, e.to, e));
+  } else {
+    nodes.forEach(id => {
+      const n = nodeById[id], l1 = l1Of(n);
+      add(l1, { label: l1Label(l1), color: n.service ? colorOf[n.service] : '#ffffff' }, l1.startsWith('svc:') ? 'service1' : n.kind);
+    });
+    edges.forEach(e => link(l1Of(nodeById[e.from]), l1Of(nodeById[e.to]), e));
+  }
+  Object.values(pair).forEach((p, i) => els.push({
+    data: { id: 'e' + i, source: p.from, target: p.to, edges: p.list, label: p.list.length > 1 ? '×' + p.list.length : '' },
+    classes: p.list.every(e => e.confidence === 'low') ? 'low' : ''
   }));
-  rowHeight = Math.max(rowHeight, list.length * ROW_H);
-});
-GRAPH.edges.forEach((e, i) => elements.push({ data: { id: 'e' + i, source: e.from, target: e.to } }));
+  return els;
+}
 
 const cy = cytoscape({
   container: document.getElementById('cy'),
-  elements,
-  layout: GRAPH.edges.length ? { name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 80 } : { name: 'preset' },
   wheelSensitivity: 0.3,
   style: [
     { selector: 'node.service', style: { label: 'data(label)', 'text-valign': 'top', 'text-halign': 'center',
       'font-size': 14, 'font-weight': 600, color: '#1f2328', 'background-color': 'data(color)', 'background-opacity': 0.35,
       'border-color': '#d0d7de', 'border-width': 1, padding: 12, shape: 'round-rectangle' } },
+    { selector: 'node.service1', style: { label: 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
+      'font-size': 13, 'font-weight': 600, color: '#1f2328', width: 200, height: 40, shape: 'round-rectangle',
+      'background-color': 'data(color)', 'border-color': '#8c959f', 'border-width': 1 } },
     { selector: 'node.endpoint', style: { label: 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
       'font-size': 11, color: '#1f2328', width: 260, height: 24, shape: 'round-rectangle',
       'background-color': 'data(color)', 'border-color': 'data(verb)', 'border-width': 3,
       'text-max-width': 250, 'text-wrap': 'ellipsis' } },
-    { selector: 'node.endpoint:selected', style: { 'border-width': 5, 'overlay-opacity': 0.08 } },
+    { selector: 'node.external, node.unresolved', style: { label: 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
+      'font-size': 11, color: '#1f2328', width: 260, height: 28, shape: 'rectangle', 'background-color': '#ffffff',
+      'border-color': '#57606a', 'border-width': 2, 'border-style': 'dashed', 'text-max-width': 250, 'text-wrap': 'ellipsis' } },
+    { selector: 'node.unresolved', style: { 'border-color': '#d63031', 'border-style': 'solid', 'background-color': '#fff0f0', color: '#a31515' } },
+    { selector: 'node:selected', style: { 'border-width': 5, 'overlay-opacity': 0.08 } },
+    { selector: 'node.root', style: { 'underlay-color': '#0969da', 'underlay-opacity': 0.25, 'underlay-padding': 4 } },
     { selector: '.dim', style: { opacity: 0.12 } },
-    { selector: 'edge', style: { width: 1.5, 'line-color': '#8c959f', 'target-arrow-color': '#8c959f',
-      'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } }
+    { selector: 'edge', style: { width: 1.5, 'line-color': '#8c959f', 'target-arrow-color': '#8c959f', label: 'data(label)',
+      'font-size': 10, color: '#57606a', 'target-arrow-shape': 'triangle', 'curve-style': 'bezier' } },
+    { selector: 'edge.low', style: { 'line-style': 'dashed' } },
+    { selector: 'edge:selected', style: { width: 3, 'line-color': '#0969da', 'target-arrow-color': '#0969da' } }
   ]
 });
+
+function render() {
+  cy.elements().remove();
+  cy.add(elements());
+  cy.nodes().forEach(n => n.toggleClass('root', roots.has(n.id()) ||
+    (level === 'L1' && [...roots].some(r => l1Of(nodeById[r]) === n.id()))));
+  cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
+  cy.fit(undefined, 30);
+  document.getElementById('l1').classList.toggle('on', level === 'L1');
+  document.getElementById('l2').classList.toggle('on', level === 'L2');
+  document.getElementById('stats').textContent = roots.size
+    ? `downstream of ${roots.size} endpoint(s): ${cy.edges().length} link(s)`
+    : `${endpoints.length} endpoints, ${GRAPH.edges.length} calls`;
+}
 
 const legend = (el, items) => el.innerHTML = items.map(([label, css]) =>
   `<div class="row"><span class="sw ${css.cls || ''}" style="${css.style}"></span>${label}</div>`).join('');
 legend(document.getElementById('verbs'), Object.entries(VERB).map(([v, c]) => [v, { cls: 'verb', style: 'border-color:' + c }]));
+legend(document.getElementById('kinds'), [
+  ['external API', { style: 'border:2px dashed #57606a' }],
+  ['✕ unresolved', { style: 'border:2px solid #d63031;background:#fff0f0' }],
+  ['low-confidence call (dashed)', { style: 'border-top:2px dashed #8c959f;border-radius:0;height:0' }]]);
 legend(document.getElementById('services'), GRAPH.services.map(s =>
   [s.name + (s.kind === 'library' ? ' (library)' : ''), { style: 'background:' + colorOf[s.name] }]));
-document.getElementById('stats').textContent = `${endpoints.length} endpoints in ${shown.length} services`;
 
-cy.on('tap', 'node.endpoint', ev => {
+const details = document.getElementById('details');
+cy.on('tap', 'node', ev => {
   const d = ev.target.data();
-  document.getElementById('details').textContent =
-    `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}` +
-    (d.alsoHandledBy || []).map(h => `\nalso handled by: ${h.handler} (${h.file}:${h.line})`).join('');
+  if (d.kind === 'endpoint') {
+    details.textContent = `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}` +
+      (d.alsoHandledBy || []).map(h => `\nalso handled by: ${h.handler} (${h.file}:${h.line})`).join('');
+  } else if (d.kind) {
+    details.textContent = `${d.id}\n\n${d.reason || d.kind}` + (d.missing ? `\nmissing: ${d.missing}` : '');
+  } else {
+    details.textContent = d.label;
+  }
+  const picked = d.kind === 'endpoint' ? [d.id]
+    : ev.target.hasClass('service1') ? endpoints.filter(n => 'svc:' + n.service === d.id).map(n => n.id) : null;
+  if (!picked) return;
+  if (!ev.originalEvent || !ev.originalEvent.shiftKey) roots = new Set();
+  picked.forEach(id => roots.add(id));
+  render();
+});
+cy.on('tap', 'edge', ev => {
+  details.textContent = ev.target.data('edges').map(e =>
+    `${e.from}\n  -> ${e.to}\nclient: ${e.client} (${e.kind})${e.confidence ? ', confidence ' + e.confidence : ''}\n` +
+    `via: ${e.via.join(' -> ')}\nat: ${e.file}:${e.line}`).join('\n\n');
 });
 document.getElementById('search').addEventListener('input', ev => {
   const q = ev.target.value.trim().toLowerCase();
-  cy.batch(() => cy.nodes('.endpoint').forEach(n => {
-    const hit = !q || (n.data('id') + ' ' + n.data('handler')).toLowerCase().includes(q);
+  cy.batch(() => cy.nodes('.endpoint, .service1').forEach(n => {
+    const hit = !q || (n.data('id') + ' ' + (n.data('handler') || '')).toLowerCase().includes(q);
     n.toggleClass('dim', !hit);
   }));
 });
+document.getElementById('l1').onclick = () => { level = 'L1'; render(); };
+document.getElementById('l2').onclick = () => { level = 'L2'; render(); };
+document.getElementById('clear').onclick = () => { roots = new Set(); details.textContent = 'Nothing selected.'; render(); };
+render();
 </script>
 </body>
 </html>

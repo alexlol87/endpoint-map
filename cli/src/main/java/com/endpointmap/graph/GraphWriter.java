@@ -8,6 +8,9 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.ArrayList;
+import java.util.Collection;
+import java.util.Comparator;
+import java.util.LinkedHashSet;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
@@ -24,7 +27,12 @@ public final class GraphWriter {
     private GraphWriter() {
     }
 
-    public static Map<String, Object> build(Workspace ws, List<Endpoint> endpoints) {
+    /**
+     * {@code edges} are deduplicated and sorted; {@code targets} are the non-endpoint nodes they point to
+     * (external, unresolved).
+     */
+    public static Map<String, Object> build(Workspace ws, List<Endpoint> endpoints, Collection<Map<String, Object>> edges,
+                                            Collection<Map<String, Object>> targets) {
         List<Map<String, Object>> services = new ArrayList<>();
         for (int i = 0; i < ws.repos().size(); i++) {
             Workspace.Repo r = ws.repos().get(i);
@@ -47,8 +55,16 @@ public final class GraphWriter {
                 }
             }
         }
+        targets.forEach(t -> nodes.putIfAbsent((String) t.get("id"), t));
+        List<Map<String, Object>> sortedEdges = new ArrayList<>(new LinkedHashSet<>(edges));
+        sortedEdges.sort(Comparator.comparing((Map<String, Object> e) -> (String) e.get("from"))
+                .thenComparing(e -> (String) e.get("to"))
+                .thenComparing(e -> String.valueOf(e.get("via")))
+                .thenComparing(e -> (String) e.get("file"))
+                .thenComparing(e -> (Integer) e.get("line")));
+        // shortcut: flows (L3 tree) stay empty until M4; L1/L2 are rolled up from edges in the viewer
         return ordered("services", services, "nodes", new ArrayList<>(nodes.values()),
-                "edges", List.of(), "flows", Map.of());
+                "edges", sortedEdges, "flows", Map.of());
     }
 
     public static String toJson(Map<String, Object> graph) {
@@ -63,7 +79,7 @@ public final class GraphWriter {
         Files.writeString(file, toJson(graph) + "\n");
     }
 
-    private static Map<String, Object> ordered(Object... kv) {
+    public static Map<String, Object> ordered(Object... kv) {
         Map<String, Object> m = new LinkedHashMap<>();
         for (int i = 0; i < kv.length; i += 2) {
             m.put((String) kv[i], kv[i + 1]);
