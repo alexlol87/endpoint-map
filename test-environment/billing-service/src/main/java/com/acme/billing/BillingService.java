@@ -61,5 +61,8 @@ public class BillingService {
         restClient.send(callbackUrl, Map.of("tenant", tenant), Void.class);
         // 4 levels of parameter passing -> beyond constant propagation depth
         deepChain.level1(endpoints.getBillingUrl() + "/billing/invoices/0");
+        // the same URL through 3 calls resolves (GET /shipments/{id}); through 4 it is a callSites entry
+        deepChain.threeLevels(endpoints.getShippingUrl() + "/shipments/" + tenant);
+        deepChain.fourLevels(endpoints.getShippingUrl() + "/shipments/" + tenant);
     }
 }

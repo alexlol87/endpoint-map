@@ -43,6 +43,10 @@ import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.UnaryExpr;
 import com.github.javaparser.ast.stmt.BlockStmt;
+import com.github.javaparser.ast.stmt.ExpressionStmt;
+import com.github.javaparser.ast.stmt.ForEachStmt;
+import com.github.javaparser.ast.stmt.Statement;
+import com.github.javaparser.ast.stmt.ExplicitConstructorInvocationStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
@@ -89,10 +93,14 @@ public final class UrlEvaluator implements ArgumentBinder {
             "replaceQueryParam", "fragment", "encode", "build", "buildAndExpand", "expand", "toUriString", "toUri",
             "toString", "uriVariables", "normalize");
     private static final Pattern FORMAT = Pattern.compile("%(%|n|(?:(\\d+)\\$)?[-#+ 0,(<]*\\d*(?:\\.\\d+)?[a-zA-Z])");
+    /** Key prefix of an object's field in bound arguments ({@code this.webClient}). */
+    private static final String THIS = "this.";
+    /** Key suffix of an object in bound arguments ({@code gw#obj}); its fields follow as {@code gw.this.<field>}. */
+    private static final String OBJ = "#obj";
     private static final Pattern ORIGIN = Pattern.compile("^([a-zA-Z][\\w+.-]*://[^/?#]*)(.*)$");
 
     /** Where an expression is evaluated: the walked method and its bound arguments, the calling service's config. */
-    public record Env(MethodDeclaration method, Map<String, ArgValue> args, Repo service, Map<String, String> config,
+    public record Env(CallableDeclaration<?> method, Map<String, ArgValue> args, Repo service, Map<String, String> config,
                       Choices choices) {
 
         public static Env of(CallSite site) {
@@ -104,7 +112,7 @@ public final class UrlEvaluator implements ArgumentBinder {
             return new Env(null, Map.of(), service, config, choices);
         }
 
-        Env in(MethodDeclaration m, Map<String, ArgValue> boundArgs) {
+        Env in(CallableDeclaration<?> m, Map<String, ArgValue> boundArgs) {
             return new Env(m, boundArgs, service, config, choices);
         }
 
@@ -166,6 +174,9 @@ public final class UrlEvaluator implements ArgumentBinder {
     private final Map<String, AnnotationDeclaration> annotations = new HashMap<>();
     /** Workspace classes and interfaces by simple name, for client types by assignability. */
     private final Map<String, List<ClassOrInterfaceDeclaration>> declared = new HashMap<>();
+    /** Every {@code new X(..)} in the workspace by the simple name of X, {@code @Bean} methods included. */
+    private final Map<String, List<ObjectCreationExpr>> creations = new HashMap<>();
+    private final Map<TypeDeclaration<?>, Boolean> wraps = new java.util.IdentityHashMap<>();
 
     public UrlEvaluator(Workspace ws, Types types, ConstantEvaluator constants) {
         this.types = types;
@@ -182,6 +193,8 @@ public final class UrlEvaluator implements ArgumentBinder {
                             simpleName(m.getType())));
                 });
         ws.repos().stream().flatMap(r -> r.sources().stream()).map(Workspace.SourceFile::cu).forEach(cu -> {
+            cu.findAll(ObjectCreationExpr.class).forEach(o -> creations.computeIfAbsent(o.getType().getNameAsString(),
+                    k -> new ArrayList<>()).add(o));
             cu.findAll(ObjectCreationExpr.class).stream()
                     .filter(o -> o.findAncestor(MethodDeclaration.class).filter(m -> Workspace.hasAnnotation(m, "Bean")).isEmpty())
                     .forEach(o -> newed.add(o.getType().getNameAsString()));
@@ -227,7 +240,14 @@ public final class UrlEvaluator implements ArgumentBinder {
 
     @Override
     public List<Map<String, ArgValue>> bind(MethodDeclaration callee, MethodCallExpr call, CallSite caller) {
-        return each(Env.of(caller), e -> bind(callee, call.getArguments(), e, 0)).stream().distinct().toList();
+        return each(Env.of(caller), e -> bind(callee, call, e, 0)).stream().distinct().toList();
+    }
+
+    /** The parameters, and as {@code this.<field>} the fields of the object the call is made on (see {@link #receiver}). */
+    private Map<String, ArgValue> bind(CallableDeclaration<?> callee, MethodCallExpr call, Env env, int depth) {
+        Map<String, ArgValue> out = receiver(callee, call, env, depth);
+        out.putAll(bind(callee, call.getArguments(), env, depth));
+        return out;
     }
 
     private Map<String, ArgValue> bind(CallableDeclaration<?> callee, List<Expression> args, Env env, int depth) {
@@ -237,8 +257,21 @@ public final class UrlEvaluator implements ArgumentBinder {
             Parameter p = params.get(i);
             String type = simpleName(p.getType());
             boolean isClient = clientIn(type, p).isPresent();
-            if (p.isVarArgs() || !BOUND.contains(type) && !isClient) {
-                continue; // varargs fill template variables, they are never the URL itself
+            if (p.isVarArgs()) {
+                varargs(p, args.subList(i, args.size()), env, depth + 1, out);
+                continue;
+            }
+            Optional<TypeDeclaration<?>> w = isClient || BOUND.contains(type) ? Optional.empty() : wrapper(p.getType());
+            if (w.isPresent()) { // a wrapper object: what the caller built, up to MAX_HOPS calls on
+                String name = p.getNameAsString();
+                object(w.get(), args.get(i), env, depth + 1).filter(o -> o.get(OBJ).hops() < MAX_HOPS).ifPresent(o -> {
+                    store(out, name, o);
+                    out.put(name + OBJ, new ArgValue("", o.get(OBJ).hops() + 1));
+                });
+                continue;
+            }
+            if (!BOUND.contains(type) && !isClient) {
+                continue;
             }
             Expression a = args.get(i);
             int d = depth + 1;
@@ -252,6 +285,227 @@ public final class UrlEvaluator implements ArgumentBinder {
             }
         }
         return out;
+    }
+
+    /**
+     * {@code String... segments}: each value as {@code segments#0..}, their count as {@code segments#n}, for a loop over
+     * them ({@link #builder}); an unknown segment is {@code {*}}. Not for an array passed whole, nor {@code Object...}
+     * (template variables of a client call, never URL parts).
+     */
+    private void varargs(Parameter p, List<Expression> args, Env env, int d, Map<String, ArgValue> out) {
+        if (!Set.of("String", "CharSequence").contains(simpleName(p.getType())) || args.size() == 1
+                && (args.get(0) instanceof com.github.javaparser.ast.expr.ArrayCreationExpr
+                || declaration(args.get(0)).flatMap(UrlEvaluator::typeOfDecl).filter(Type::isArrayType).isPresent())) {
+            return;
+        }
+        List<ArgValue> vs = args.stream().map(a -> string(a, env, d)).toList();
+        int hops = vs.stream().mapToInt(ArgValue::hops).max().orElse(0);
+        if (hops >= MAX_HOPS) {
+            return;
+        }
+        String name = p.getNameAsString();
+        for (int k = 0; k < vs.size(); k++) {
+            out.put(name + "#" + k, new ArgValue(vs.get(k).text(), hops + 1));
+        }
+        out.put(name + "#n", new ArgValue(String.valueOf(vs.size()), hops + 1));
+    }
+
+    /**
+     * Fields of the object {@code call} is made on (see {@link #object}); a call on the same object ({@code m()},
+     * {@code this.m()}) keeps the caller's fields.
+     */
+    private Map<String, ArgValue> receiver(CallableDeclaration<?> callee, MethodCallExpr call, Env env, int d) {
+        Map<String, ArgValue> out = new HashMap<>();
+        Expression scope = call.getScope().orElse(null);
+        while (scope instanceof EnclosedExpr || scope instanceof CastExpr) {
+            scope = scope instanceof EnclosedExpr en ? en.getInner() : ((CastExpr) scope).getExpression();
+        }
+        if (scope == null || scope instanceof ThisExpr) {
+            env.args().forEach((k, v) -> {
+                if (k.startsWith(THIS)) {
+                    out.put(k, v);
+                }
+            });
+            return out;
+        }
+        Optional<TypeDeclaration<?>> owner = callee.findAncestor(TypeDeclaration.class).map(t -> (TypeDeclaration<?>) t);
+        if (callee.isStatic() || owner.isEmpty() || d > MAX_DEPTH || stereotyped(owner.get(), new HashSet<>())) {
+            return out; // a component is built by Spring: its fields are injected (see variable)
+        }
+        object(owner.get(), scope, env, d + 1).ifPresent(o -> o.forEach((k, v) -> {
+            if (k.startsWith(THIS)) {
+                out.put(k, v);
+            }
+        }));
+        return out;
+    }
+
+    /**
+     * The {@code type} object an expression evaluates to, as what its constructor stored ({@code this.<field>}) plus
+     * {@link #OBJ} (text "", hops: the calls it was passed through); empty when unknown. Followed: {@code new X(..)},
+     * a factory method's return ({@code Presets.p1()}), a local or field initialized (or constructor-assigned) with
+     * one, a parameter bound to the caller's argument and a field of an object built with {@code new}. An injected
+     * object or an unbound parameter is a {@link #guess}.
+     */
+    private Optional<Map<String, ArgValue>> object(TypeDeclaration<?> type, Expression e, Env env, int d) {
+        while (e instanceof EnclosedExpr || e instanceof CastExpr) {
+            e = e instanceof EnclosedExpr en ? en.getInner() : ((CastExpr) e).getExpression();
+        }
+        if (d > MAX_DEPTH) {
+            return Optional.empty();
+        }
+        if (e instanceof ObjectCreationExpr o) {
+            if (o.getAnonymousClassBody().isPresent() || types.resolve(o.getType()).filter(t -> t == type).isEmpty()) {
+                return Optional.empty();
+            }
+            Map<String, ArgValue> out = construct(type, o.getArguments(), env, d + 1, new HashMap<>());
+            out.put(OBJ, known(""));
+            return Optional.of(out);
+        }
+        if (e instanceof MethodCallExpr mc) {
+            Optional<MethodDeclaration> m = resolve(mc);
+            return m.isEmpty() || m.get().getBody().isEmpty() ? Optional.empty()
+                    : pick(type, returns(m.get()), env.in(m.get(), bind(m.get(), mc, env, d)), d);
+        }
+        Node decl = declaration(e).orElse(null);
+        if (decl instanceof Parameter p) {
+            Optional<Node> owner = p.getParentNode();
+            Optional<Map<String, ArgValue>> bound = owner.orElse(null) == env.method() ? stored(env.args(), p.getNameAsString()) : Optional.empty();
+            return bound.isPresent() ? bound : guess(type, env, d, owner.filter(o -> o instanceof ConstructorDeclaration c && springBean(c)
+                    || o instanceof MethodDeclaration m && Workspace.hasAnnotation(m, "Bean")).isPresent());
+        }
+        if (!(decl instanceof VariableDeclarator v)) {
+            return Optional.empty();
+        }
+        if (!(v.getParentNode().orElse(null) instanceof FieldDeclaration)) {
+            return v.getInitializer().isPresent() ? object(type, v.getInitializer().get(), env, d + 1) : guess(type, env, d, false);
+        }
+        Optional<Map<String, ArgValue>> built = stored(env.args(), THIS + v.getNameAsString());
+        if (built.isPresent()) {
+            return built;
+        }
+        Optional<Expression> init = v.getInitializer().or(() -> v.findAncestor(TypeDeclaration.class).stream()
+                .flatMap(t -> ((TypeDeclaration<?>) t).getConstructors().stream())
+                .flatMap(c -> c.findAll(AssignExpr.class, a -> assigns(a, v.getNameAsString())).stream())
+                .map(AssignExpr::getValue).filter(x -> x instanceof ObjectCreationExpr || x instanceof MethodCallExpr).findFirst());
+        // this.gw = gw from a constructor parameter: injected into a component, unknown in a class built with new
+        return init.isPresent() ? object(type, init.get(), env.outside(), d + 1) : guess(type, env, d, springBean(v));
+    }
+
+    /**
+     * An object code doesn't show: one of the calling service's {@code @Bean}s of the type, followed through its
+     * return; when injected and the service has none, a library's (auto-configuration) {@code @Bean} - a library
+     * {@code @ConditionalOnMissingBean} default never counts next to the service's own. Not injected (a parameter
+     * nobody bound): the service's beans and its own {@code new X(..)}, never another service's or a library's.
+     * One per run of {@link #each}; empty when there is none.
+     */
+    private Optional<Map<String, ArgValue>> guess(TypeDeclaration<?> type, Env env, int d, boolean injected) {
+        List<Expression> own = new ArrayList<>();
+        List<Expression> lib = new ArrayList<>();
+        for (Bean b : beans) {
+            Repo r = types.repo(b.method());
+            // of the type, or of a supertype built here (@Bean Notifier sms() { return new SmsNotifier(url); }); a bean of
+            // an unrelated type that merely builds one inside (Holder holder() { new Holder(new X(..)) }) is not an X bean
+            if (b.type().equals(type.getNameAsString()) || type instanceof ClassOrInterfaceDeclaration c
+                    && assignable(c, b.type(), new HashSet<>()) && !b.method().findAll(ObjectCreationExpr.class,
+                    o -> o.getType().getNameAsString().equals(type.getNameAsString())).isEmpty()) {
+                (r == env.service() ? own : r != null && r.kind() == Workspace.Kind.library ? lib : new ArrayList<Expression>())
+                        .addAll(returns(b.method()));
+            }
+        }
+        if (!injected) {
+            creations.getOrDefault(type.getNameAsString(), List.of()).stream()
+                    .filter(o -> types.repo(o) == env.service() && !inBean(o)).forEach(own::add);
+        }
+        // shortcut: no @Qualifier/@Primary narrowing between the service's own beans of one wrapper type: each is an alternative
+        return pick(type, own.isEmpty() && injected ? lib : own, env.outside(), d);
+    }
+
+    /** Of several expressions that may give the object, the one this run of {@link #each} takes. */
+    private Optional<Map<String, ArgValue>> pick(TypeDeclaration<?> type, List<Expression> all, Env env, int d) {
+        List<Expression> values = all.stream().filter(v -> !(v instanceof NullLiteralExpr)).toList();
+        int i = values.size() == 1 ? 0 : env.pick(values.size());
+        return i >= 0 && i < values.size() ? object(type, values.get(i), env, d + 1) : Optional.empty();
+    }
+
+    /** {@code key}'s object as {@link #store} put it in bound arguments, keys relative to it. */
+    private static Optional<Map<String, ArgValue>> stored(Map<String, ArgValue> args, String key) {
+        if (!args.containsKey(key + OBJ)) {
+            return Optional.empty();
+        }
+        Map<String, ArgValue> out = new HashMap<>();
+        out.put(OBJ, args.get(key + OBJ));
+        args.forEach((k, v) -> {
+            if (k.startsWith(key + ".")) {
+                out.put(k.substring(key.length() + 1), v);
+            }
+        });
+        return Optional.of(out);
+    }
+
+    /** An object under {@code key} ("gw" a parameter, "this.w" a field): {@code key#obj}, {@code key.this.<field>}. */
+    private static void store(Map<String, ArgValue> out, String key, Map<String, ArgValue> object) {
+        object.forEach((k, v) -> out.put(k.equals(OBJ) ? key + OBJ : key + "." + k, v));
+    }
+
+    /** A workspace class, not a component, holding a client in a field, directly or through another such class. */
+    private Optional<TypeDeclaration<?>> wrapper(Type t) {
+        return t instanceof ClassOrInterfaceType ct ? types.resolve(ct).filter(c -> wraps.computeIfAbsent(c, k -> wraps(k, new HashSet<>())))
+                : Optional.empty();
+    }
+
+    private boolean wraps(TypeDeclaration<?> c, Set<TypeDeclaration<?>> seen) {
+        return seen.add(c) && !stereotyped(c, new HashSet<>()) && c.getFields().stream().anyMatch(f -> clientIn(simpleName(f.getElementType()), f).isPresent()
+                || f.getElementType() instanceof ClassOrInterfaceType ft && types.resolve(ft).filter(x -> wraps(x, seen)).isPresent());
+    }
+
+    /** {@code type}'s constructor taking {@code args}: what it stores in fields, as {@code this.<field>}, into {@code out}. */
+    private Map<String, ArgValue> construct(TypeDeclaration<?> type, List<Expression> args, Env env, int d, Map<String, ArgValue> out) {
+        // same arity: a client parameter takes a client expression, any other one does not
+        List<ConstructorDeclaration> cs = type.getConstructors().stream().filter(c -> c.getParameters().size() == args.size())
+                .filter(c -> java.util.stream.IntStream.range(0, args.size()).allMatch(i -> clientIn(simpleName(c.getParameter(i).getType()),
+                        c.getParameter(i)).isPresent() == clientType(args.get(i)).isPresent())).toList();
+        if (cs.size() != 1 || d > MAX_DEPTH) {
+            return out;
+        }
+        ConstructorDeclaration c = cs.get(0);
+        Env in = env.in(c, bind(c, args, env, d));
+        c.getBody().getStatements().stream().filter(s -> s instanceof ExplicitConstructorInvocationStmt e && e.isThis())
+                .findFirst().ifPresent(s -> construct(type, ((ExplicitConstructorInvocationStmt) s).getArguments(), in, d + 1, out));
+        for (AssignExpr a : c.getBody().findAll(AssignExpr.class)) {
+            String name = a.getTarget() instanceof FieldAccessExpr fa ? fa.getNameAsString() : a.getTarget().toString();
+            Optional<FieldDeclaration> f = type.getFieldByName(name);
+            if (f.isEmpty() || !assigns(a, name)) {
+                continue;
+            }
+            Type t = f.get().getElementType();
+            boolean isClient = clientIn(simpleName(t), f.get()).isPresent();
+            Optional<TypeDeclaration<?>> w = isClient || BOUND.contains(simpleName(t)) ? Optional.empty() : wrapper(t);
+            if (w.isPresent()) { // this.w = new W2(..) / a wrapper passed to the constructor
+                object(w.get(), a.getValue(), in, d + 1).ifPresent(o -> store(out, THIS + name, o));
+                continue;
+            }
+            if (!isClient && !BOUND.contains(simpleName(t))) {
+                continue;
+            }
+            ArgValue v = isClient ? client(a.getValue(), in, d) : string(a.getValue(), in, d);
+            if (isClient ? v.text() != null : !v.text().equals(ANY)) {
+                out.put(THIS + name, v);
+            }
+        }
+        return out;
+    }
+
+    private static boolean inBean(Node n) {
+        return n.findAncestor(MethodDeclaration.class).filter(m -> Workspace.hasAnnotation(m, "Bean")).isPresent();
+    }
+
+    /** {@code this.name = ..} or {@code name = ..} where name is the field (not a local or parameter). */
+    private boolean assigns(AssignExpr a, String name) {
+        Expression t = a.getTarget();
+        return a.getOperator() == AssignExpr.Operator.ASSIGN && (t instanceof FieldAccessExpr fa && fa.getScope() instanceof ThisExpr
+                && fa.getNameAsString().equals(name) || t instanceof NameExpr n && n.getNameAsString().equals(name)
+                && declaration(n).filter(x -> x.getParentNode().orElse(null) instanceof FieldDeclaration).isPresent());
     }
 
     // --- strings ---
@@ -726,12 +980,20 @@ public final class UrlEvaluator implements ArgumentBinder {
                     return client(handler.get(), env, d);
                 }
             }
+            if (!asClient && v.getInitializer().orElse(null) instanceof ObjectCreationExpr o
+                    && Set.of("StringBuilder", "StringBuffer").contains(o.getType().getNameAsString())) {
+                return builder(v, o, use, env, d);
+            }
             return v.getInitializer().map(i -> asClient ? client(i, env, d) : string(i, env, d))
                     .orElse(asClient ? unknown() : any());
         }
         Optional<String> value = valueAnnotation(f);
         if (value.isPresent()) {
             return known(value.get());
+        }
+        ArgValue built = env.args().get(THIS + v.getNameAsString());
+        if (built != null) { // the walked object was built with new X(..): what its constructor stored
+            return built;
         }
         Env outside = env.outside();
         if (v.getInitializer().isPresent()) {
@@ -755,8 +1017,75 @@ public final class UrlEvaluator implements ArgumentBinder {
                 }
             }
         }
-        // shortcut: only the first constructor assignment that tells anything is used; this(..) chains are not followed
+        // shortcut: only the first constructor assignment that tells anything is used; this(..) chains are followed only
+        // for objects built with new X(..) (see receiver), not for Spring beans
         return asClient && springBean(f) ? bean(f.getElementType(), f, name, env, d) : asClient ? unknown() : any();
+    }
+
+    /**
+     * {@code StringBuilder sb = new StringBuilder(base)} then, in the same block before {@code use},
+     * {@code sb.append(..)..} statements and for-each loops over bound varargs made only of such appends
+     * ({@code for (String s : segments) sb.append('/').append(s)}). Anything else touching {@code sb} leaves the tail unknown.
+     */
+    private ArgValue builder(VariableDeclarator v, ObjectCreationExpr init, Node use, Env env, int d) {
+        boolean text = init.getArguments().size() == 1 && !(init.getArgument(0) instanceof IntegerLiteralExpr);
+        ArgValue out = text ? string(init.getArgument(0), env, d) : known("");
+        Optional<Statement> decl = v.findAncestor(Statement.class);
+        Optional<BlockStmt> block = decl.flatMap(Node::getParentNode).filter(BlockStmt.class::isInstance).map(BlockStmt.class::cast);
+        if (block.isEmpty()) {
+            return concat(out, any());
+        }
+        String sb = v.getNameAsString();
+        List<Statement> stmts = block.get().getStatements();
+        for (Statement st : stmts.subList(stmts.indexOf(decl.get()) + 1, stmts.size())) {
+            if (st == use || st.isAncestorOf(use)) {
+                return out;
+            }
+            Optional<List<Expression>> appended = appends(st, sb);
+            if (appended.isPresent()) {
+                for (Expression a : appended.get()) {
+                    out = concat(out, string(a, env, d));
+                }
+                continue;
+            }
+            if (st instanceof ForEachStmt fe && fe.getIterable() instanceof NameExpr it
+                    && env.args().containsKey(it.getNameAsString() + "#n")) {
+                List<Statement> body = fe.getBody() instanceof BlockStmt b ? b.getStatements() : List.of(fe.getBody());
+                List<List<Expression>> each = body.stream().map(b -> appends(b, sb).orElse(null)).toList();
+                if (!each.contains(null)) {
+                    String var = fe.getVariable().getVariable(0).getNameAsString();
+                    int n = Integer.parseInt(env.args().get(it.getNameAsString() + "#n").text());
+                    for (int k = 0; k < n; k++) {
+                        for (List<Expression> as : each) {
+                            for (Expression a : as) {
+                                out = concat(out, a instanceof NameExpr ne && ne.getNameAsString().equals(var)
+                                        ? env.args().get(it.getNameAsString() + "#" + k) : string(a, env, d));
+                            }
+                        }
+                    }
+                    continue;
+                }
+            }
+            if (st.findFirst(NameExpr.class, ne -> ne.getNameAsString().equals(sb)).isPresent()) {
+                return concat(out, any());
+            }
+        }
+        return concat(out, any());
+    }
+
+    /** {@code sb.append(a).append(b);} as a statement: [a, b]; empty when it is anything else. */
+    private static Optional<List<Expression>> appends(Statement st, String sb) {
+        if (!(st instanceof ExpressionStmt es)) {
+            return Optional.empty();
+        }
+        List<Expression> out = new ArrayList<>();
+        Expression e = es.getExpression();
+        while (e instanceof MethodCallExpr mc && mc.getNameAsString().equals("append") && mc.getArguments().size() == 1
+                && mc.getScope().isPresent()) {
+            out.add(0, mc.getArgument(0));
+            e = mc.getScope().get();
+        }
+        return e instanceof NameExpr n && n.getNameAsString().equals(sb) && !out.isEmpty() ? Optional.of(out) : Optional.empty();
     }
 
     /**
@@ -795,19 +1124,24 @@ public final class UrlEvaluator implements ArgumentBinder {
         if (m.isEmpty() || m.get().getBody().isEmpty()) {
             return Optional.empty();
         }
-        Map<String, ArgValue> args = bind(m.get(), mc.getArguments(), env, d);
+        Map<String, ArgValue> args = bind(m.get(), mc, env, d);
         return Optional.of(returned(m.get(), env.in(m.get(), args), d, asClient));
     }
 
     /** The returned value of a method body: of several returns, each in turn (see {@link #each}). */
     private ArgValue returned(MethodDeclaration m, Env env, int d, boolean asClient) {
-        List<Expression> values = m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class)
-                .map(l -> !m.isAncestorOf(l)).orElse(true)).stream().flatMap(r -> r.getExpression().stream()).toList();
+        List<Expression> values = returns(m);
         if (!asClient) {
             return choose(values, env, d);
         }
         // shortcut: a client from several returns is the first one known; clients built per branch are rare
         return values.stream().map(v -> client(v, env, d)).filter(v -> v.text() != null).findFirst().orElse(unknown());
+    }
+
+    /** The expressions a method body returns, those of lambdas inside it left out. */
+    private static List<Expression> returns(MethodDeclaration m) {
+        return m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class).map(l -> !m.isAncestorOf(l)).orElse(true))
+                .stream().flatMap(r -> r.getExpression().stream()).toList();
     }
 
     /** One of several possible values: the one this run of {@link #each} takes, else the most complete one. */

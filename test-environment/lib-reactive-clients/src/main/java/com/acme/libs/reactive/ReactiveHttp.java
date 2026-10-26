@@ -14,6 +14,10 @@ public class ReactiveHttp {
         this.webClient = webClient;
     }
 
+    public ReactiveHttp(String baseUrl) {
+        this(WebClient.create(baseUrl));
+    }
+
     public <T> Mono<T> get(String path, Class<T> type) {
         return webClient.get().uri(path).retrieve().bodyToMono(type);
     }

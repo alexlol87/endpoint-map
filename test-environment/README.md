@@ -99,17 +99,18 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | `@HttpExchange` client via `WebClientAdapter`, inline and through a factory bean | recommendation-service `ExchangeConfig`, loyalty-service `CartClientConfig` |
 | `@HttpExchange` interface shared from a library | lib-reactive-clients `ShippingExchange`, used by warehouse-service |
 | `@HttpExchange` client via `RestTemplateAdapter`; the library interface is implemented by another service's controller (still an outbound call) | order-service `RestClientsConfig` + `RestockService` -> lib-common-clients `TaxRatesApi` -> tax-service `TaxController` |
-| Library wrapper, URL/verb passed as parameters | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service -> `ReactiveHttp` |
-| Parameter chain 4 levels deep (beyond constant propagation) -> callSites | billing-service `syncTenant` -> `DeepChainCaller` |
+| Library wrapper, URL/verb passed as parameters (edge `client` = the outermost library class the service calls, `transport` = the client underneath) | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service, warehouse-service -> `ReactiveHttp` |
+| Wrapper objects built with `new`: in a constructor (`new ReactiveHttp(WebClient.create(url))`), as a `@Bean`, inline `new ReactiveHttp(url).post(..)` through a `this(..)` constructor | warehouse-service `RestockCoordinator` / `WarehouseHttpConfig` (`POST /warehouse/restock/{sku}`) |
+| Parameter chain: through 3 calls resolves (`threeLevels`), through 4 (`fourLevels`) or more (`level1`) -> callSites | billing-service `syncTenant` -> `DeepChainCaller` |
 | `static final` constants, constant concatenation | lib-http-clients `HttpPaths`, used by pricing-service and billing-service |
 | `@Value("${x:default}")`, `@Value("${ENV_VAR}")` | order-service `PaymentClient`, payment-service `PaymentGateway` |
 | `@ConfigurationProperties` class (library) and record (service) | lib-common-clients `ServiceEndpointsProperties`, warehouse-service `WarehouseClientsProperties` |
 | Profile values: `application-prod.yml` and `---` + `on-profile` | order-service, warehouse-service, pricing-service |
 | `${ENV:default}` in yml | payment-service, catalog-service, billing-service |
-| `UriComponentsBuilder`, `String.format`, `StringBuilder` loop | lib-common-clients `UrlTemplates` |
+| `UriComponentsBuilder`, `String.format`, `StringBuilder` loop over varargs | lib-common-clients `UrlTemplates` |
 | Runtime-built URLs (config + request data, URL taken from the request body) | report-service `ReportService.export`, billing-service `syncTenant` |
 | External hosts (Stripe, DHL, UPS, FCM, SendGrid, FX, SIEM, fraud vendor) | payment, shipping, notification, lib-reactive-clients, pricing, audit |
-| Service calling itself through a library impl | notification-service `SmsNotifier` -> `POST /notifications/sms` |
+| Service calling itself through a library impl built by `@Bean new SmsNotifier(url)` (`/sms` also fits `/{userId}`: both edges) | notification-service `SmsNotifier` -> `POST /notifications/sms` |
 
 ### Database and Redis
 | Case | Location |

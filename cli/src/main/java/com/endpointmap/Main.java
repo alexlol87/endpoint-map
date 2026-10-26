@@ -116,6 +116,8 @@ public final class Main {
                 warnings.add("tracing " + e.id() + " failed (" + err.getClass().getSimpleName() + "), its edges are missing");
                 continue;
             }
+            new TreeSet<>(tracer.partialClusters()).forEach(c -> warnings.add("tracing " + e.id() + ": the recursive cluster at " + c
+                    + " has too many paths, only part of them were followed (some of its edges may be missing)"));
             for (FlowTracer.Found f : found) {
                 // the method holding the call: the one entered before the client method, or the handler itself
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
@@ -132,7 +134,8 @@ public final class Main {
                 }
                 for (TargetMatcher.Target t : matcher.match(f.call(), e.service(), callSite)) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),
-                            "client", f.call().client(), "via", f.via(), "file", f.file(), "line", f.line());
+                            "client", f.wrapper() != null ? f.wrapper() : f.call().client(), "transport", f.call().client(),
+                            "via", f.via(), "file", f.file(), "line", f.line());
                     if (f.lowConfidence()) {
                         edge.put("confidence", "low");
                     }

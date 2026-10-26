@@ -11,11 +11,13 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.ast.expr.EnclosedExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.TypeExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
@@ -45,9 +47,13 @@ public final class FlowTracer {
 
     /**
      * An outbound call reached from a method: {@code via} lists every method entered on the way, client method last;
-     * {@code sites} the position (file:line:column) of each call on that path, the client call last.
+     * {@code sites} the position (file:line:column) of each call on that path, the client call last. {@code wrapper}:
+     * for a raw client call made in library code, the outermost library class the service code called
+     * (PLAN: client "&lt;wrapper class&gt;"); null otherwise. {@code lossy}: it came through a recursive result reused for
+     * other arguments, so its URL may belong to another path through the same call site.
      */
-    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites) {
+    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites,
+                        String wrapper, boolean lossy) {
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
@@ -57,8 +63,11 @@ public final class FlowTracer {
     private record Typed(TypeDeclaration<?> type, boolean exact) {
     }
 
-    /** {@code backTo}: stack depth of the shallowest method a recursive call jumped back to, MAX_VALUE if none. */
-    private record Result(List<Found> found, int backTo) {
+    /**
+     * {@code backTo}: stack depth of the shallowest method a recursive call jumped back to, MAX_VALUE if none.
+     * {@code lossy}: the recursive clusters (named by their first method) where a cut-short result was reused.
+     */
+    private record Result(List<Found> found, int backTo, Set<String> lossy) {
     }
 
     /** One edge per call site and target: further paths to it only change {@code via}. */
@@ -69,9 +78,11 @@ public final class FlowTracer {
     private final List<OutboundDetector> detectors;
     private final ArgumentBinder binder;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
+    private final Map<Expression, Callees> callees = new IdentityHashMap<>();
+    private final Map<Expression, List<TypeDeclaration<?>>> receivers = new IdentityHashMap<>();
     // per service: detectors resolve placeholders with the calling service's config, so library results differ;
     // per argument values: a util called with another WebClient bean or URL reaches another target
-    private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, List<Found>>>> memo = new IdentityHashMap<>();
+    private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, Result>>> memo = new IdentityHashMap<>();
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors) {
         this(ws, types, detectors, ArgumentBinder.NONE);
@@ -93,10 +104,23 @@ public final class FlowTracer {
      */
     public static final int MAX_URLS_PER_CALL_SITE = 4;
 
+    /**
+     * Cut-short walks inside one recursive cluster (counted at the cluster's first method) before its cut-short results
+     * are reused whatever their arguments. Walks outside a cluster never count, so results don't depend on handler order.
+     */
+    static final int MAX_WALKS = 100;
+    /** Cut-short walks per stack depth of the cluster's first method; reset when a method is entered at that depth. */
+    private final List<Integer> clusterWalks = new ArrayList<>();
+    private Set<String> lossy = Set.of();
+
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        List<Found> all = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        Result r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        lossy = r.lossy();
+        // a result reused across arguments may pair a URL with the wrong path: those URLs are capped per client call
+        // site, not per path, so a mixed-up pairing never stands as a confident edge
         Map<List<String>, List<Found>> byPath = new LinkedHashMap<>();
-        all.forEach(f -> byPath.computeIfAbsent(f.sites(), k -> new ArrayList<>()).add(f));
+        r.found().forEach(f -> byPath.computeIfAbsent(f.lossy() ? List.of("*", f.sites().get(f.sites().size() - 1)) : f.sites(),
+                k -> new ArrayList<>()).add(f));
         Map<Key, Found> out = new LinkedHashMap<>(); // several capped paths to one site give the same {*} edge
         for (List<Found> site : byPath.values()) {
             if (site.size() <= MAX_URLS_PER_CALL_SITE) {
@@ -110,9 +134,14 @@ public final class FlowTracer {
             String eg = site.stream().filter(f -> f.call().baseUrl() != null).findFirst().orElse(first).call().source();
             add(out, new Found(new OutboundCall(c.client(), verb, null, "{*}", null,
                     "one of " + site.size() + " combinations, e.g. " + eg, c.label()), first.via(), first.file(),
-                    first.line(), first.lowConfidence(), first.sites()));
+                    first.line(), first.lowConfidence(), first.sites(), first.wrapper(), first.lossy()));
         }
         return List.copyOf(out.values());
+    }
+
+    /** Clusters of the last {@link #trace} explored only partly (some paths through them may be missing), sorted. */
+    public Set<String> partialClusters() {
+        return lossy;
     }
 
     /**
@@ -121,29 +150,46 @@ public final class FlowTracer {
      * per path into it. {@code args}: what the caller passed to m's parameters.
      */
     private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
-                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Result> partial) {
-        Map<Map<String, ArgValue>, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
+                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Map<Map<String, ArgValue>, Result>> partial) {
+        Map<Map<String, ArgValue>, Result> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
                 .computeIfAbsent(m, k -> new HashMap<>());
         if (done.containsKey(args)) {
-            return new Result(done.get(args), Integer.MAX_VALUE);
+            return done.get(args);
         }
-        // shortcut: a cut-short result is reused whatever the arguments; only matters for a cycle walked with two
-        // different argument values at once, key partial by args too if that shows up
-        if (partial.containsKey(m)) {
-            return partial.get(m);
+        Map<Map<String, ArgValue>, Result> cuts = partial.getOrDefault(m, Map.of());
+        if (cuts.containsKey(args)) {
+            return cuts.get(args);
+        }
+        // a cut-short result holds for the same arguments only; past its cluster's budget any one is reused, else every
+        // simple path through a mutually recursive cluster is walked (exponential). Its URLs are then marked lossy.
+        Optional<Result> reuse = cuts.values().stream().filter(c -> clusterWalks.get(c.backTo()) > MAX_WALKS).findFirst();
+        if (reuse.isPresent()) {
+            Result c = reuse.get();
+            String cluster = stack.entrySet().stream().filter(e -> e.getValue() == c.backTo()).map(e -> label(e.getKey()))
+                    .findFirst().orElseThrow();
+            Set<String> names = new java.util.TreeSet<>(c.lossy());
+            names.add(cluster);
+            return new Result(c.found().stream().map(f -> new Found(f.call(), f.via(), f.file(), f.line(), f.lowConfidence(),
+                    f.sites(), f.wrapper(), true)).toList(), c.backTo(), Set.copyOf(names));
         }
         if (m.getBody().isEmpty()) {
-            return new Result(List.of(), Integer.MAX_VALUE);
+            return new Result(List.of(), Integer.MAX_VALUE, Set.of());
         }
         int depth = stack.size();
         stack.put(m, depth);
+        while (clusterWalks.size() <= depth) {
+            clusterWalks.add(0);
+        }
+        clusterWalks.set(depth, 0);
         Map<Key, Found> found = new LinkedHashMap<>();
+        Set<String> lossyHere = new java.util.TreeSet<>();
         int backTo = Integer.MAX_VALUE;
         // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
         for (Expression call : m.getBody().get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
-            Callees c = callees(call);
-            List<TypeDeclaration<?>> receiver = receiverTypes(call);
+            // the same in every walk of m: a recursive cluster walks m once per argument combination
+            Callees c = callees.computeIfAbsent(call, this::callees);
+            List<TypeDeclaration<?>> receiver = receivers.computeIfAbsent(call, this::receiverTypes);
             boolean classified = false;
             // one detection per callee, so via names the right one; a framework call (WebClient...) has none
             for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
@@ -153,7 +199,9 @@ public final class FlowTracer {
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
-                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call))));
+                    String wrapper = RAW_CLIENTS.contains(o.client()) && library(call)
+                            ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call)), wrapper, false));
                 }
                 classified |= !out.isEmpty();
             }
@@ -171,25 +219,31 @@ public final class FlowTracer {
                 for (Map<String, ArgValue> calleeArgs : bound) {
                     Result r = walk(callee, calleeArgs, service, config, stack, partial);
                     backTo = Math.min(backTo, r.backTo());
+                    lossyHere.addAll(r.lossy());
                     for (Found f : r.found()) {
                         List<String> via = new ArrayList<>(List.of(label(callee)));
                         via.addAll(f.via());
                         List<String> sites = new ArrayList<>(List.of(site(call)));
                         sites.addAll(f.sites());
+                        // entering library code from the service's: that library class is the client the service calls
+                        String wrapper = f.wrapper() != null && library(callee) && !library(m)
+                                ? enclosingType(callee).map(TypeDeclaration::getNameAsString).orElse(f.wrapper()) : f.wrapper();
                         add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low(),
-                                List.copyOf(sites)));
+                                List.copyOf(sites), wrapper, f.lossy()));
                     }
                 }
             }
         }
         stack.remove(m);
-        partial.values().removeIf(r -> r.backTo() >= depth); // they were cut back to m or below, which is done now
-        Result result = new Result(List.copyOf(found.values()), backTo);
+        partial.values().forEach(byArgs -> byArgs.values().removeIf(r -> r.backTo() >= depth)); // they were cut back to m or below, which is done now
         if (backTo >= depth) { // complete: any recursion below came back to m itself, not to a caller still being walked
-            done.put(args, result.found());
-            return new Result(result.found(), Integer.MAX_VALUE);
+            Result result = new Result(List.copyOf(found.values()), Integer.MAX_VALUE, Set.copyOf(lossyHere));
+            done.put(args, result);
+            return result;
         }
-        partial.put(m, result);
+        clusterWalks.set(backTo, clusterWalks.get(backTo) + 1);
+        Result result = new Result(List.copyOf(found.values()), backTo, Set.copyOf(lossyHere));
+        partial.computeIfAbsent(m, k -> new LinkedHashMap<>()).put(args, result);
         return result;
     }
 
@@ -198,8 +252,11 @@ public final class FlowTracer {
      * a cycle can carry a longer, looping chain), then the first found.
      */
     private static void add(Map<Key, Found> found, Found f) {
-        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> a.lowConfidence() != b.lowConfidence()
-                ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a);
+        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> {
+            Found w = a.lowConfidence() != b.lowConfidence() ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a;
+            return a.lossy() || b.lossy() // lossy if either path was, so the capped grouping still sees it
+                    ? new Found(w.call(), w.via(), w.file(), w.line(), w.lowConfidence(), w.sites(), w.wrapper(), true) : w;
+        });
     }
 
     /** Static type of the call's receiver and its supertypes; empty when it has no scope or it can't be told. */
@@ -264,6 +321,12 @@ public final class FlowTracer {
         if (scope instanceof ThisExpr) {
             return enclosingType(scope).map(t -> new Typed(t, true));
         }
+        if (scope instanceof ObjectCreationExpr o) { // new Gateway(..).call(..)
+            return typeOf(o.getType());
+        }
+        if (scope instanceof EnclosedExpr e) {
+            return scopeType(e.getInner());
+        }
         if (scope instanceof TypeExpr t) { // "inventory::release" parses as a type; a variable of that name wins
             return variableType(t.getType().asString(), scope).or(() -> typeOf(t.getType()));
         }
@@ -321,6 +384,13 @@ public final class FlowTracer {
         }
         return new ArrayList<>(out);
     }
+
+    private boolean library(Node n) {
+        Repo r = types.repo(n);
+        return r != null && r.kind() == Workspace.Kind.library;
+    }
+
+    private static final Set<String> RAW_CLIENTS = Set.of("webclient", "restclient", "resttemplate");
 
     private static String label(MethodDeclaration m) {
         return m.findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString() + ".").orElse("") + m.getNameAsString();

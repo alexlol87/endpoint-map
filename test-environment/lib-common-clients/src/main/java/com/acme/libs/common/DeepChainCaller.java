@@ -27,4 +27,26 @@ public class DeepChainCaller {
     private String level4(String url) {
         return client.fetch(url, String.class);
     }
+
+    /** The URL is passed through three calls (threeLevels, relay, fetch): still propagated, so it resolves. */
+    public String threeLevels(String url) {
+        return relay(url);
+    }
+
+    private String relay(String url) {
+        return client.fetch(url, String.class);
+    }
+
+    /** Through four calls (fourLevels, relayTwice, relayOnce, remove): one too many, a callSites entry. */
+    public void fourLevels(String url) {
+        relayTwice(url);
+    }
+
+    private void relayTwice(String url) {
+        relayOnce(url);
+    }
+
+    private void relayOnce(String url) {
+        client.remove(url);
+    }
 }
