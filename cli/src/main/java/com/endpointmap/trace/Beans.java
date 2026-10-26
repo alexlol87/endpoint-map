@@ -40,11 +40,23 @@ final class Beans {
     private record BeanMethod(MethodDeclaration method, Set<String> names, boolean primary) {
     }
 
-    private static final Set<String> STEREOTYPES = Set.of("Component", "Service", "Repository", "Controller", "RestController", "Configuration");
+    /** Stereotypes by simple name; workspace annotations meta-annotated with one ({@code @UseCase}) are added. */
+    private final Set<String> stereotypes = new HashSet<>(Set.of("Component", "Service", "Repository", "Controller", "RestController",
+            "Configuration", "ControllerAdvice", "RestControllerAdvice", "Named"));
 
     private final List<BeanMethod> beanMethods = new ArrayList<>();
 
     Beans(Workspace ws) {
+        List<com.github.javaparser.ast.body.AnnotationDeclaration> annotations = ws.repos().stream().flatMap(r -> r.sources().stream())
+                .flatMap(sf -> sf.cu().findAll(com.github.javaparser.ast.body.AnnotationDeclaration.class).stream()).toList();
+        for (boolean grew = true; grew; ) { // to a fixpoint: meta-annotations of meta-annotations
+            grew = false;
+            for (var a : annotations) {
+                if (a.getAnnotations().stream().anyMatch(x -> stereotypes.contains(x.getName().getIdentifier()))) {
+                    grew |= stereotypes.add(a.getNameAsString());
+                }
+            }
+        }
         ws.repos().stream().flatMap(r -> r.sources().stream()).flatMap(sf -> sf.cu().findAll(MethodDeclaration.class).stream())
                 .filter(m -> Workspace.hasAnnotation(m, "Bean")).forEach(m -> {
                     Set<String> names = new HashSet<>(values(m, "Bean", "value", "name"));
@@ -110,12 +122,12 @@ final class Beans {
         return Optional.of(f);
     }
 
-    private static Set<String> names(ClassOrInterfaceDeclaration c, List<BeanMethod> visible) {
+    private Set<String> names(ClassOrInterfaceDeclaration c, List<BeanMethod> visible) {
         Set<String> out = new HashSet<>(values(c, "Qualifier", "value"));
-        c.getAnnotations().stream().filter(a -> STEREOTYPES.contains(a.getName().getIdentifier()))
+        c.getAnnotations().stream().filter(a -> stereotypes.contains(a.getName().getIdentifier()))
                 .forEach(a -> out.addAll(values(a, "value")));
         String n = c.getNameAsString(); // Spring's default for a scanned class: PushNotifier -> pushNotifier, URLApi stays
-        if (c.getAnnotations().stream().anyMatch(a -> STEREOTYPES.contains(a.getName().getIdentifier()))) out.add(n.length() > 1 && Character.isUpperCase(n.charAt(1)) ? n : Character.toLowerCase(n.charAt(0)) + n.substring(1));
+        if (c.getAnnotations().stream().anyMatch(a -> stereotypes.contains(a.getName().getIdentifier()))) out.add(n.length() > 1 && Character.isUpperCase(n.charAt(1)) ? n : Character.toLowerCase(n.charAt(0)) + n.substring(1));
         creators(c, visible).forEach(b -> out.addAll(b.names()));
         return out;
     }
@@ -125,10 +137,38 @@ final class Beans {
     }
 
     private static List<BeanMethod> creators(ClassOrInterfaceDeclaration c, List<BeanMethod> visible) {
-        // only what the method returns: new FooInterceptor() inside a RestTemplate @Bean is no FooInterceptor bean
-        return visible.stream().filter(b -> b.method().findAll(com.github.javaparser.ast.stmt.ReturnStmt.class).stream()
-                .anyMatch(r -> r.getExpression().filter(ObjectCreationExpr.class::isInstance)
-                        .map(o -> ((ObjectCreationExpr) o).getType().getNameAsString().equals(c.getNameAsString())).orElse(false))).toList();
+        return visible.stream().filter(b -> creates(b.method(), c.getNameAsString())).toList();
+    }
+
+    /**
+     * {@code m} returns a new {@code x}: its declared return type is {@code x}, or every return is {@code new x(..)} or a
+     * local initialized/assigned with one. When a return can't be told (a builder call, a parameter), any {@code new x(..)}
+     * in the body counts, as a {@code new FooInterceptor()} inside a RestTemplate @Bean is rarer than a lost @Primary.
+     */
+    static boolean creates(MethodDeclaration m, String x) {
+        if (m.getType().isClassOrInterfaceType() && m.getType().asClassOrInterfaceType().getNameAsString().equals(x)) {
+            return true;
+        }
+        List<Expression> returned = m.findAll(com.github.javaparser.ast.stmt.ReturnStmt.class).stream()
+                .flatMap(r -> r.getExpression().stream()).toList();
+        List<String> made = new ArrayList<>();
+        for (Expression r : returned) {
+            List<Expression> sources = new ArrayList<>(List.of(r));
+            if (r instanceof NameExpr n) {
+                Optional<Node> d = Names.declaration(n.getNameAsString(), r);
+                if (d.isPresent() && d.get() instanceof VariableDeclarator v) {
+                    sources.clear();
+                    v.getInitializer().ifPresent(sources::add);
+                    m.findAll(AssignExpr.class, a -> a.getTarget() instanceof NameExpr t && t.getNameAsString().equals(n.getNameAsString()))
+                            .forEach(a -> sources.add(a.getValue()));
+                }
+            }
+            if (sources.isEmpty() || !sources.stream().allMatch(ObjectCreationExpr.class::isInstance)) {
+                return m.findAll(ObjectCreationExpr.class).stream().anyMatch(o -> o.getType().getNameAsString().equals(x));
+            }
+            sources.forEach(o -> made.add(((ObjectCreationExpr) o).getType().getNameAsString()));
+        }
+        return made.contains(x);
     }
 
     /** {@code @ConditionalOnProperty} on the class, checked against the service's config (prefix, name/value, havingValue, matchIfMissing). */

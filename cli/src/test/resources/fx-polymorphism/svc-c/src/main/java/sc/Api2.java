@@ -1,0 +1,1 @@
+package sc; @org.springframework.web.bind.annotation.RestController public class Api2 { private final Sender sender; public Api2(Sender sender){this.sender=sender;} @org.springframework.web.bind.annotation.GetMapping("/send") void s(){ sender.send().block(); } }

@@ -1,0 +1,1 @@
+package sc; @org.springframework.web.bind.annotation.RestController public class Api { private final l.Facade f; public Api(l.Facade f){this.f=f;} @org.springframework.web.bind.annotation.GetMapping("/pay") void pay(){ f.go(); } }

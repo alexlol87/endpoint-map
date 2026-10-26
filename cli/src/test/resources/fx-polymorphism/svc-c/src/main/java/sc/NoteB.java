@@ -1,0 +1,1 @@
+package sc; import org.springframework.web.reactive.function.client.WebClient; import reactor.core.publisher.Mono; @org.springframework.stereotype.Component public class NoteB implements Note { public Mono<String> note() { return WebClient.create("http://svc-b").get().uri("/b/two").retrieve().bodyToMono(String.class); } }

@@ -212,4 +212,22 @@ class PolymorphismTest {
         }
         n.path("children").forEach(c -> leaves(c, out));
     }
+
+    @Test
+    void reviewFixtureLibrarySiteBuilderBeansAndCustomStereotype(@TempDir Path out) throws Exception {
+        // src/test/resources/fx-polymorphism: a library Facade with one injected Pay; CardPay only where card.on=true (svc-a)
+        Path root = Path.of("src/test/resources/fx-polymorphism");
+        Path res = out.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        run("map", root, "--resolutions", res.toString(), "--out", out.resolve("out").toString());
+        JsonNode g = new ObjectMapper().readTree(out.resolve("out/graph.json").toFile());
+        assertEquals(List.of("call Facade.go > oneOf Pay > call CardPay.pay > edge svc-b GET /b/{x}",
+                "call Facade.go > oneOf Pay > call WirePay.pay > edge svc-b GET /b/{x}"), paths(g, "svc-a GET /pay"));
+        // the same library call site in svc-c dispatches to WirePay only: no oneOf marker carried over from svc-a
+        assertEquals(List.of("call Facade.go > call WirePay.pay > edge svc-b GET /b/{x}"), paths(g, "svc-c GET /pay"));
+        // @Bean @Primary Sender one() { OneS s = new OneS(); return s; }: still the primary, TwoS never runs
+        assertEquals(List.of("call OneS.send > edge svc-b GET /b/{x}"), paths(g, "svc-c GET /send"));
+        // NoteA carries @UseCase (meta-annotated @Component): bean name noteA, picked by the field's name
+        assertEquals(List.of("call NoteA.note > edge svc-b GET /b/{x}"), paths(g, "svc-c GET /note"));
+    }
 }

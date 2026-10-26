@@ -1,0 +1,1 @@
+package sc; @org.springframework.web.bind.annotation.RestController public class Api3 { private final Note noteA; public Api3(Note noteA){this.noteA=noteA;} @org.springframework.web.bind.annotation.GetMapping("/note") void n(){ noteA.note().block(); } }

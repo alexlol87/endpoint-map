@@ -1,0 +1,1 @@
+package sc; import org.springframework.web.reactive.function.client.WebClient; import reactor.core.publisher.Mono; public class OneS implements Sender { public Mono<String> send() { return WebClient.create("http://svc-b").get().uri("/b/one").retrieve().bodyToMono(String.class); } }

@@ -1,0 +1,1 @@
+package sc; @org.springframework.context.annotation.Configuration public class Cfg { @org.springframework.context.annotation.Bean @org.springframework.context.annotation.Primary Sender one(){ OneS s = new OneS(); return s; } @org.springframework.context.annotation.Bean Sender two(){ return new TwoS(); } }
