@@ -293,8 +293,11 @@ public final class FlowTree {
             if (c.getScope().filter(s -> s.toString().matches("(reactor\\.core\\.publisher\\.)?Flux")).isPresent()) {
                 return true;
             }
-            if (FLUX_SOURCES.contains(c.getNameAsString()) || c.getNameAsString().startsWith("findAll")
-                    || returnTypes.apply(c).stream().anyMatch(FlowTree::fluxType)) {
+            List<String> declared = returnTypes.apply(c);
+            if (!declared.isEmpty()) { // a workspace method: its declared type decides, never its name
+                return declared.stream().anyMatch(FlowTree::fluxType);
+            }
+            if (FLUX_SOURCES.contains(c.getNameAsString()) || c.getNameAsString().startsWith("findAll")) {
                 return true;
             }
             return FLUX_KEEP.contains(c.getNameAsString()) && c.getScope().filter(this::flux).isPresent();

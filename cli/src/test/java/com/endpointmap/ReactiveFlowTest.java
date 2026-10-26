@@ -94,6 +94,8 @@ class ReactiveFlowTest {
                         local.flatMap(i -> ext.c()), Mono.just("m").flatMap(top -> Mono.just(top).flatMap(v -> ext.d())));
                   }
                   Flux<String> ids() { return Flux.just("i"); }
+                  Mono<java.util.List<String>> findAll() { return Mono.just(java.util.List.of()); }
+                  @GetMapping("/m") public Object m() { return findAll().flatMap(l -> ext.a()); }
                   @GetMapping("/r") public Object r() {
                     Flux<String> ids = Flux.just("a");
                     return Flux.zip(ext.a(), ext.b())
@@ -117,6 +119,8 @@ class ReactiveFlowTest {
         assertEquals(List.of("parallel Flux.zip > edge " + x + "a", "parallel Flux.zip > edge " + x + "b",
                         "edge " + x + "c", "edge " + x + "d", "loop ids.map > edge " + x + "a"),
                 paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "rx-service GET /r"));
+        // a workspace findAll() declared Mono is no Flux, whatever its name
+        assertEquals(List.of("edge " + x + "a"), paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "rx-service GET /m"));
         // a Flux from a workspace method, a Feign method, bodyToFlux, a field, a var; a lambda parameter shadowing the field is no Flux
         assertEquals(List.of("loop ids().flatMap > edge " + x + "b", "loop this.ids().concatMap > edge " + x + "c", "edge " + x + "l",
                         "loop ext.list().flatMap > edge " + x + "d", "unresolved unresolved:rx-service:Api.s:15 GET /l",
