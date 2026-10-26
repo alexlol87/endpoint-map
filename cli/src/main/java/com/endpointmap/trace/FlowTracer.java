@@ -59,21 +59,29 @@ public final class FlowTracer {
 
     /**
      * One distinct way to reach a Found's call (for the flow tree): its {@code via} and {@code sites}. A Found keeps at
-     * most {@link #MAX_FLOW_PATHS}, the first ones in walk order; the edge itself is one whatever the count.
+     * most {@link #MAX_FLOW_PATHS}, the first ones in walk order; the edge itself is one whatever the count. {@code cut}:
+     * a marker that more paths went on from the end of {@code sites} (the method they were dropped in) and are not listed.
      */
-    public record CallPath(List<String> via, List<String> sites) {
+    public record CallPath(List<String> via, List<String> sites, boolean cut) {
     }
 
-    /** shortcut: paths beyond this per call and method are dropped from the flow tree (not from edges); raise if users miss branches. */
-    public static final int MAX_FLOW_PATHS = 16;
+    /** shortcut: paths beyond this per call and method are dropped from the flow tree (not from edges), leaving a cut marker. */
+    public static final int MAX_FLOW_PATHS = 64;
 
     private static List<CallPath> union(List<CallPath> a, List<CallPath> b) {
-        return new LinkedHashSet<>(Stream.concat(a.stream(), b.stream()).toList()).stream().limit(MAX_FLOW_PATHS).toList();
+        List<CallPath> all = new LinkedHashSet<>(Stream.concat(a.stream(), b.stream()).toList()).stream().toList();
+        List<CallPath> real = all.stream().filter(p -> !p.cut()).toList();
+        List<CallPath> out = new ArrayList<>(real.stream().limit(MAX_FLOW_PATHS).toList());
+        all.stream().filter(CallPath::cut).limit(MAX_FLOW_PATHS).forEach(out::add);
+        if (real.size() > MAX_FLOW_PATHS && !out.contains(new CallPath(List.of(), List.of(), true))) {
+            out.add(new CallPath(List.of(), List.of(), true));
+        }
+        return out;
     }
 
     private static List<CallPath> prepend(List<CallPath> paths, String via, String site) {
         return paths.stream().map(p -> new CallPath(Stream.concat(Stream.ofNullable(via), p.via().stream()).toList(),
-                Stream.concat(Stream.ofNullable(site), p.sites().stream()).toList())).toList();
+                Stream.concat(Stream.ofNullable(site), p.sites().stream()).toList(), p.cut())).toList();
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
@@ -272,7 +280,7 @@ public final class FlowTracer {
                     String wrapper = RAW_CLIENTS.contains(o.client()) && library(call)
                             ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
                     add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low() || o.low(), List.of(site(call)), wrapper, false,
-                            List.of(new CallPath(List.of(label), List.of(site(call))))));
+                            List.of(new CallPath(List.of(label), List.of(site(call)), false))));
                 }
                 classified |= out.stream().anyMatch(o -> !o.cache());
             }

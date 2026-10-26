@@ -213,6 +213,7 @@ public final class Main {
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> written = (List<Map<String, Object>>) graph.get("edges");
         graph.put("flows", flows.build(written));
+        flows.truncated().forEach(t -> warnings.add("flow of " + t));
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> nodes = (List<Map<String, Object>>) graph.get("nodes");
         nodes.forEach(openapi::annotate);

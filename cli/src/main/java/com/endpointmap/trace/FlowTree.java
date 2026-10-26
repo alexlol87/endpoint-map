@@ -25,6 +25,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.TreeMap;
+import java.util.TreeSet;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -39,11 +40,17 @@ public final class FlowTree {
     private record Step(Map<String, Object> json, TreeMap<String, Step> kids) {
     }
 
-    private record Leaf(Map<String, Object> edge, String pos, List<String> keyPath, List<Map<String, Object>> jsonPath) {
+    private record Leaf(Map<String, Object> edge, String pos, List<String> keyPath, List<Map<String, Object>> jsonPath, boolean cut) {
     }
 
     private final Function<String, Node> sites;
     private final Map<String, List<Leaf>> leaves = new TreeMap<>();
+    private final Set<String> truncated = new TreeSet<>();
+
+    /** One line per flow branch {@link #build} cut short (shown there as a {@code truncated} leaf). */
+    public List<String> truncated() {
+        return List.copyOf(truncated);
+    }
 
     /** {@code sites}: the call expression at a {@link FlowTracer.Found#sites()} entry. */
     public FlowTree(Function<String, Node> sites) {
@@ -67,6 +74,7 @@ public final class FlowTree {
             keys.add("0:" + f.via().get(i));
             json.add(node("call", f.via().get(i)));
         }
+        int calls = f.cut() ? f.sites().size() : f.sites().size() - 1; // a cut marker ends inside its last callee
         for (int i = 0; i < f.sites().size(); i++) {
             Node call = sites.apply(f.sites().get(i));
             if (call == null) {
@@ -74,12 +82,12 @@ public final class FlowTree {
             }
             controls(call, handler, keys, json);
             last = pos(call);
-            if (i < f.sites().size() - 1) {
+            if (i < calls) {
                 keys.add(pos(call) + ":call:" + f.via().get(i + offset));
                 json.add(node("call", f.via().get(i + offset)));
             }
         }
-        leaves.computeIfAbsent(endpoint, k -> new ArrayList<>()).add(new Leaf(edge, last, keys, json));
+        leaves.computeIfAbsent(endpoint, k -> new ArrayList<>()).add(new Leaf(edge, f.cut() ? "999999:999999" : last, keys, json, f.cut()));
     }
 
     /** The flows map; {@code edges} as written, so leaves hold their index. */
@@ -104,6 +112,15 @@ public final class FlowTree {
                     at = at.kids().computeIfAbsent(l.keyPath().get(i), k -> new Step(j, new TreeMap<>()));
                 }
                 String to = (String) l.edge().get("to");
+                if (l.cut()) { // after the shown paths: more of them reach this edge from here
+                    Map<String, Object> mark = node("truncated", "more paths to this edge not shown");
+                    mark.put("edge", idx);
+                    at.kids().put(l.pos() + "~" + String.format("%08d", idx), new Step(mark, new TreeMap<>()));
+                    truncated.add(endpoint + ": paths to edge " + idx + " (" + to + ") cut at "
+                            + l.jsonPath().stream().map(j -> String.valueOf(j.get("label"))).collect(Collectors.joining(" > "))
+                            + ", only the first " + FlowTracer.MAX_FLOW_PATHS + " per call are in its flow");
+                    continue;
+                }
                 String key = l.pos() + "~" + String.format("%08d", idx);
                 Map<String, Object> leaf = node(to.startsWith("unresolved:") ? "unresolved" : "edge", null);
                 leaf.put("edge", idx);
@@ -159,8 +176,8 @@ public final class FlowTree {
                 label = text(p instanceof IfStmt s ? s.getCondition() : ((ConditionalExpr) p).getCondition());
             } else if (p instanceof IfStmt s && s.getElseStmt().filter(e -> e == child).isPresent()
                     || p instanceof ConditionalExpr c && ch == c.getElseExpr()) {
-                type = "else"; // the condition it is the else of: the if side may hold no edge and be left out
-                label = text(p instanceof IfStmt s ? s.getCondition() : ((ConditionalExpr) p).getCondition());
+                type = "else"; // the negated condition: the if side may hold no edge and be left out
+                label = "!(" + text(p instanceof IfStmt s ? s.getCondition() : ((ConditionalExpr) p).getCondition()) + ")";
             } else if (p instanceof SwitchEntry e && !e.getLabels().contains(ch)) {
                 type = "case";
                 label = e.getLabels().isEmpty() ? "default" : e.getLabels().stream().map(FlowTree::text).collect(Collectors.joining(", "));

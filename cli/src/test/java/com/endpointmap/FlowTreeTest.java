@@ -22,7 +22,7 @@ import org.junit.jupiter.api.io.TempDir;
 class FlowTreeTest {
 
     static final Set<String> TYPES = Set.of("seq", "call", "if", "else", "switch", "case", "loop", "try", "catch", "oneOf",
-            "parallel", "fallback", "retry", "edge", "cycle", "unresolved");
+            "parallel", "fallback", "retry", "edge", "cycle", "unresolved", "truncated");
 
     @TempDir
     static Path dir;
@@ -76,6 +76,7 @@ class FlowTreeTest {
             int i = n.get("edge").asInt();
             assertEquals(endpoint, edges.get(i).get("from").asText());
             assertEquals(edges.get(i).get("to").asText().startsWith("unresolved:") ? "unresolved" : "edge", n.get("type").asText());
+            assertFalse(n.has("children"));
             seen.add(i);
         }
         n.path("children").forEach(c -> collect(c, endpoint, edges, seen));
@@ -86,11 +87,11 @@ class FlowTreeTest {
         List<String> p = paths(graph, "order-service POST /api/orders/{id}/checkout");
         // controller -> handler impl -> service -> pricing -> tax (ternary else) -> utils; MoneyUtils leads to no edge
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call OrderPricingService.finalTotal"
-                + " > call OrderTaxService.rateFor > else \"XX\".equals(region) > call TaxRestUtils.fetchRate > edge tax-service GET /tax-api/tax/rates/{region}"), p.toString());
+                + " > call OrderTaxService.rateFor > else !(\"XX\".equals(region)) > call TaxRestUtils.fetchRate > edge tax-service GET /tax-api/tax/rates/{region}"), p.toString());
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call FulfilmentService.payAndShip"
                 + " > if express > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments/express"), p.toString());
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call FulfilmentService.payAndShip"
-                + " > else express > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments"), p.toString());
+                + " > else !(express) > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments"), p.toString());
         assertFalse(p.toString().contains("MoneyUtils"), p.toString());
     }
 
@@ -100,7 +101,7 @@ class FlowTreeTest {
         assertTrue(p.contains("call OrderService.create > loop for (String sku : request.skus())"
                 + " > if ((Number) stock.get(\"available\")).intValue() > 0 > edge inventory-service PUT /inventory/{sku}/reserve"), p.toString());
         assertTrue(p.contains("call OrderService.create > loop for (String sku : request.skus())"
-                + " > else ((Number) stock.get(\"available\")).intValue() > 0 > edge inventory-service PATCH /inventory/{sku}/quantity"), p.toString());
+                + " > else !(((Number) stock.get(\"available\")).intValue() > 0) > edge inventory-service PATCH /inventory/{sku}/quantity"), p.toString());
         assertTrue(p.contains("call OrderService.create > try > call PaymentClient.charge"
                 + " > unresolved unresolved:order-service:${PAYMENT_SERVICE_URL} POST /payments/charge"), p.toString());
         assertTrue(p.contains("call OrderService.create > catch FeignException > loop request.skus().forEach"
@@ -125,7 +126,7 @@ class FlowTreeTest {
         List<String> p = paths(graph, "notification-service POST /notifications/{userId}");
         String cond = "Boolean.TRUE.equals(profile.get(\"smsOptIn\"))";
         assertTrue(p.contains("if " + cond + " > call SmsNotifier.notify > edge notification-service POST /notifications/sms"), p.toString());
-        assertTrue(p.contains("else " + cond + " > call PushNotifier.notify > edge external:https://fcm.googleapis.com POST /v1/projects/acme/messages:send"), p.toString());
+        assertTrue(p.contains("else !(" + cond + ")" + " > call PushNotifier.notify > edge external:https://fcm.googleapis.com POST /v1/projects/acme/messages:send"), p.toString());
         // one edge, two places: the stream loop and the direct call in ReportService.build
         List<String> r = paths(graph, "report-service GET /reports/{type}");
         assertTrue(r.contains("call ReportService.build > loop rows.stream().filter(r -> r.get(\"orderId\") != null).forEach"
@@ -135,7 +136,7 @@ class FlowTreeTest {
 
     @Test
     void elseOfAPrunedIfStillCarriesTheCondition() {
-        assertTrue(paths(graph, "pricing-service GET /prices/{sku}").contains("call PriceService.price > else \"EUR\".equals(currency)"
+        assertTrue(paths(graph, "pricing-service GET /prices/{sku}").contains("call PriceService.price > else !(\"EUR\".equals(currency))"
                 + " > call PriceService.convert > edge external:https://api.exchangerate.host GET /convert"));
     }
 
@@ -198,5 +199,52 @@ class FlowTreeTest {
                         "call Svc.run > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.stream().map > edge external:https://api.example.com GET /b"),
                 paths(g, "flow-service GET /f"));
+    }
+
+    /** A handler switch with n cases, each calling S.m, an if/else-if chain of n arms each reaching the same call: n * n paths. */
+    static Path branches(Path root, int n) throws Exception {
+        Path c = root.resolve("fan-service/src/main/java/f");
+        StringBuilder sw = new StringBuilder();
+        StringBuilder chain = new StringBuilder();
+        for (int k = 1; k <= n; k++) {
+            sw.append("      case ").append(k).append(" -> s.m(k);\n");
+            chain.append(k == 1 ? "    " : " else ").append("if (k == ").append(k).append(") { return g(); }");
+        }
+        write(c.resolve("App.java"), "package f;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(c.resolve("Api.java"), "package f;\nimport org.springframework.web.bind.annotation.*;\n@RestController\npublic class Api {\n"
+                + "  private final S s;\n  Api(S s) { this.s = s; }\n  @GetMapping(\"/x\") public void x(int k) {\n    switch (k) {\n"
+                + sw + "      default -> { }\n    }\n  }\n}\n");
+        write(c.resolve("S.java"), "package f;\n@org.springframework.stereotype.Service\npublic class S {\n  private final Ext ext;\n"
+                + "  S(Ext ext) { this.ext = ext; }\n  Object m(int k) {\n" + chain + "\n    return null;\n  }\n"
+                + "  Object g() { return ext.a(); }\n}\n");
+        write(c.resolve("Ext.java"), "package f;\n@org.springframework.cloud.openfeign.FeignClient(name = \"ext\", url = \"https://api.example.com\")\n"
+                + "public interface Ext { @org.springframework.web.bind.annotation.GetMapping(\"/a\") Object a(); }\n");
+        Path out = root.resolve("out");
+        String res = out.resolve("resolutions.yml").toString();
+        run("discover", root, "--resolutions", res);
+        run("map", root, "--resolutions", res, "--out", out.toString());
+        return out;
+    }
+
+    @Test
+    void everyArmOfEveryCaseIsKept(@TempDir Path root) throws Exception {
+        Path out = branches(root, 5);
+        List<String> p = paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "fan-service GET /x");
+        assertEquals(25, p.size(), p.toString());
+        for (int k = 1; k <= 5; k++) {
+            String prefix = "switch k > case " + k + " > call S.m > ";
+            assertEquals(5, p.stream().filter(x -> x.startsWith(prefix)).count(), p.toString());
+        }
+        assertTrue(p.contains("switch k > case 5 > call S.m > else !(k == 1) > else !(k == 2) > else !(k == 3) > else !(k == 4)"
+                + " > if k == 5 > call S.g > edge external:https://api.example.com GET /a"), p.toString());
+        assertFalse(p.toString().contains("truncated"));
+    }
+
+    @Test
+    void cutPathsLeaveAMarkerAndAWarning(@TempDir Path root) throws Exception {
+        Path out = branches(root, 9); // 81 paths, over the 64 kept
+        List<String> p = paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "fan-service GET /x");
+        assertTrue(p.stream().anyMatch(x -> x.endsWith("truncated external:https://api.example.com GET /a")), p.toString());
+        assertTrue(java.nio.file.Files.readString(out.resolve("discover-report.md")).contains("fan-service GET /x: paths to edge"));
     }
 }
