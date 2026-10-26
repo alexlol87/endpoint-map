@@ -61,11 +61,12 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Same simple class name (`ApiPaths`) in two repos with different values, used as the class prefix | billing-service / notification-service `ApiPaths` |
 | Mapping inherited from an abstract base controller | warehouse-service `BaseController` / `WarehouseController` |
 | Servlet context path (yml and .properties) | order-service, customer-service, tax-service |
-| WebFlux base path | user-profile-service `application.properties` |
+| WebFlux base path (annotated and functional routes) | user-profile-service `application.properties` |
 | Builder routes: `route().path(..)`, `.nest(path(..))` 3 levels deep, `accept(..)`, lambda handler, `.add(otherRouter())` | search-service `SearchRoutes.searchRouter` / `adminRoutes` |
 | Routes the walker cannot understand (built in a loop) -> report | search-service `SearchRoutes.facetRouter` |
 | Static routes: `route(..).andRoute(..)`, `path(..).and(method(GET))`, `andNest`, `nest(path, route(..))`, `.and(privateMethod())`, lambda | recommendation-service `RecommendationRouter` |
 | Annotated and functional endpoints in one service | loyalty-service |
+| Functional routes under `spring.webflux.base-path`, paths from constants, Supplier-style `.path(CONST, () -> route(..).andRoute(..))`, block-body lambda handler | user-profile-service `ProfileRoutes` |
 
 ### OpenAPI files
 | File | Mismatch |

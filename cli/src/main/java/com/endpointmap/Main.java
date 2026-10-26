@@ -4,6 +4,7 @@ import com.endpointmap.config.ConfigResolver;
 import com.endpointmap.endpoints.AnnotationEndpointDetector;
 import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.endpoints.Endpoint;
+import com.endpointmap.endpoints.RouterEndpointDetector;
 import com.endpointmap.graph.GraphWriter;
 import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
@@ -78,7 +79,7 @@ public final class Main {
 
     /** Everything one run found: the graph, and every key resolutions.yml is asked about. */
     private record Scan(Workspace ws, Map<String, Object> graph, Map<String, Resolutions.Found> asked,
-                        List<String> configWarnings, List<String> traceWarnings) {
+                        List<String> configWarnings, List<String> traceWarnings, List<String> routesNotUnderstood) {
 
         /** "id: reason" of every unresolved node. */
         List<String> unresolved() {
@@ -91,13 +92,15 @@ public final class Main {
         Workspace ws = WorkspaceLoader.load(Path.of(opts.get("--root")).toAbsolutePath().normalize());
         String profile = opts.get("--profile");
         AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
-        List<Endpoint> endpoints = detector.detect(profile);
+        List<Endpoint> endpoints = new ArrayList<>(detector.detect(profile));
         Map<String, Map<String, String>> configs = new HashMap<>();
         Map<String, Map<String, String>> sources = new HashMap<>();
         ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>(),
                 sources.computeIfAbsent(r.name(), k -> new HashMap<>()))));
         Types types = new Types(ws);
         ConstantEvaluator constants = new ConstantEvaluator(types);
+        RouterEndpointDetector routes = new RouterEndpointDetector(ws, types, constants);
+        endpoints.addAll(routes.detect(profile));
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
                 new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls));
@@ -110,6 +113,9 @@ public final class Main {
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
             List<FlowTracer.Found> found;
+            if (e.decl() == null) { // a route handler the walker couldn't read: listed under routes not understood
+                continue;
+            }
             try {
                 found = tracer.trace(e.decl(), repo, configs.get(repo.name()));
             } catch (OutOfMemoryError | StackOverflowError err) { // one pathological endpoint must not lose the whole map
@@ -146,7 +152,8 @@ public final class Main {
                 }
             }
         }
-        return new Scan(ws, GraphWriter.build(ws, endpoints, edges, targets.values()), asked, detector.warnings(), warnings);
+        return new Scan(ws, GraphWriter.build(ws, endpoints, edges, targets.values()), asked, detector.warnings(), warnings,
+                routes.notUnderstood());
     }
 
     private static int discover(Map<String, String> opts, PrintStream out) throws Exception {
@@ -157,7 +164,7 @@ public final class Main {
         Resolutions.Stats stats = old.write(file, scan.asked().values());
         Path report = file.resolveSibling("discover-report.md");
         DiscoverReport.write(report, scan.ws(), scan.graph(), scan.asked().values(), old, scan.configWarnings(),
-                scan.traceWarnings(), stats);
+                scan.traceWarnings(), scan.routesNotUnderstood(), stats);
         summary(scan, out);
         out.printf("resolutions: %d entries, %d blank, %d new, %d stale, %d host: blank (kept external) -> %s%n",
                 stats.entries(), stats.blank(), stats.added(), stats.stale(), stats.hostBlank(), file);
@@ -206,6 +213,7 @@ public final class Main {
         }
         scan.configWarnings().forEach(w -> out.println("warning: config file skipped: " + w));
         scan.traceWarnings().forEach(w -> out.println("warning: " + w));
+        scan.routesNotUnderstood().forEach(w -> out.println("warning: route not understood: " + w));
         for (Object n : nodes) {
             Map<?, ?> node = (Map<?, ?>) n;
             if (node.containsKey("alsoHandledBy")) {

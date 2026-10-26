@@ -17,6 +17,7 @@ public final class DiscoverReport {
 
     public static void write(Path file, Workspace ws, Map<String, Object> graph, Collection<Resolutions.Found> asked,
                              Resolutions resolutions, List<String> configWarnings, List<String> traceWarnings,
+                             List<String> routesNotUnderstood,
                              Resolutions.Stats stats) throws IOException {
         List<Map<?, ?>> nodes = ((List<?>) graph.get("nodes")).stream().<Map<?, ?>>map(n -> (Map<?, ?>) n).toList();
         List<String> unresolved = unresolved(graph);
@@ -43,8 +44,8 @@ public final class DiscoverReport {
         section(md, "Endpoints mapped by more than one handler", nodes.stream().filter(n -> n.containsKey("alsoHandledBy"))
                 .map(n -> "`" + n.get("id") + "`: " + n.get("handler") + ", " + n.get("alsoHandledBy")).toList());
         section(md, "Tracing problems", traceWarnings);
-        md.append("\n## OpenAPI vs code mismatches\n\n_Not checked yet (#9)._\n\n");
-        md.append("## Routes not understood\n\n_Not checked yet (#8)._\n");
+        md.append("\n## OpenAPI vs code mismatches\n\n_Not checked yet (#9)._\n");
+        section(md, "Routes not understood", routesNotUnderstood.stream().map(r -> "`" + r.replaceFirst(": ", "`: ")).toList());
         Files.writeString(file, md);
     }
 
