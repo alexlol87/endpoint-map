@@ -434,6 +434,100 @@ class RestTemplateHttpExchangeTest {
                 && e.get("to").asText().startsWith("svc-a")), g.toString());
     }
 
+    @Test
+    void separateCallsThroughAHelperKeepTheirEdgesAndClientTypesStayInTheirService(@TempDir Path root) throws Exception {
+        write(root.resolve("shared/src/main/java/l/ItemsApi.java"), """
+                package l;
+                @org.springframework.web.service.annotation.HttpExchange("/items")
+                public interface ItemsApi {
+                  @org.springframework.web.service.annotation.GetExchange("/{id}") String get(@org.springframework.web.bind.annotation.PathVariable String id);
+                }
+                """);
+        // a stub in the library: not component-scanned by the services, so not a local implementation for svc-a
+        write(root.resolve("shared/src/main/java/l/ItemsStub.java"), """
+                package l;
+                @org.springframework.stereotype.Component
+                public class ItemsStub implements ItemsApi { public String get(String id) { return id; } }
+                """);
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Config.java"), """
+                package a;
+                import org.springframework.web.client.RestClient;
+                import org.springframework.web.client.support.RestClientAdapter;
+                import org.springframework.web.service.invoker.HttpServiceProxyFactory;
+                @org.springframework.context.annotation.Configuration
+                public class Config {
+                  @org.springframework.context.annotation.Bean l.ItemsApi itemsApi() {
+                    return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(RestClient.create("http://svc-b"))).build()
+                        .createClient(l.ItemsApi.class);
+                  }
+                }
+                """);
+        write(a.resolve("Http.java"), """
+                package a;
+                @org.springframework.stereotype.Component
+                public class Http {
+                  private final org.springframework.web.client.RestTemplate rt = new org.springframework.web.client.RestTemplate();
+                  public String get(String path) { return rt.getForObject("http://svc-b" + path, String.class); }
+                }
+                """);
+        write(a.resolve("Agg.java"), """
+                package a;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class Agg {
+                  private final Http http; private final l.ItemsApi items;
+                  Agg(Http http, l.ItemsApi items) { this.http = http; this.items = items; }
+                  @GetMapping("/six") void six() {
+                    http.get("/e1"); http.get("/e2"); http.get("/e3");
+                    http.get("/e4"); http.get("/e5"); http.get("/e6");
+                  }
+                  @GetMapping("/hx") String hx() { return items.get("1"); }
+                }
+                """);
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("E.java"), """
+                package b;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class E {
+                  @GetMapping("/e1") void e1() { } @GetMapping("/e2") void e2() { } @GetMapping("/e3") void e3() { }
+                  @GetMapping("/e4") void e4() { } @GetMapping("/e5") void e5() { } @GetMapping("/e6") void e6() { }
+                  @GetMapping("/items/{id}") void item() { }
+                }
+                """);
+        // an ApiClient unrelated to svc-c's RestTemplate subclass of the same name
+        write(b.resolve("ApiClient.java"), """
+                package b;
+                @org.springframework.stereotype.Component
+                public class ApiClient { public void delete(String id) { } public String getForObject(String k, Class<?> c) { return k; } }
+                """);
+        write(b.resolve("UsesApiClient.java"), """
+                package b;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class UsesApiClient {
+                  private final ApiClient client;
+                  UsesApiClient(ApiClient c) { this.client = c; }
+                  @GetMapping("/cache/{k}") String k(@PathVariable String k) { client.delete(k); return client.getForObject("http://svc-b/e1", String.class); }
+                }
+                """);
+        Path c = root.resolve("svc-c/src/main/java/c");
+        write(c.resolve("App.java"), "package c;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(c.resolve("ApiClient.java"), "package c;\npublic class ApiClient extends org.springframework.web.client.RestTemplate {}\n");
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        List<JsonNode> g = map(root, res, root.resolve("out"));
+        for (int i = 1; i <= 6; i++) {
+            assertTrue(has(g, "svc-a GET /six", "svc-b GET /e" + i), g.toString());
+        }
+        assertEquals(6, g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /six")).count(), g.toString());
+        assertTrue(has(g, "svc-a GET /hx", "svc-b GET /items/{id}"), g.toString());
+        assertFalse(g.stream().anyMatch(e -> e.get("from").asText().equals("svc-b GET /cache/{k}")), g.toString());
+    }
+
     // --- helpers ---
 
     private static JsonNode edge(String from, String to) {

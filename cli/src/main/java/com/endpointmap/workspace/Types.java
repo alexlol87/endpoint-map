@@ -65,7 +65,7 @@ public final class Types {
 
     /**
      * A workspace type named {@code name} ({@code Http}, {@code Outer.Inner}) as Java finds it from {@code context}:
-     * a single-type import, the same package, then on-demand imports. Empty when none of those is a workspace type.
+     * a single-type import, the same package, on-demand imports, then as a fully qualified name. Empty when none of those is a workspace type.
      */
     public Optional<TypeDeclaration<?>> byImports(String name, Node context) {
         Optional<CompilationUnit> cu = context.findCompilationUnit();
@@ -84,6 +84,7 @@ public final class Types {
         candidates.add(pkg + name);
         cu.get().getImports().stream().filter(i -> !i.isStatic() && i.isAsterisk())
                 .forEach(i -> candidates.add(i.getNameAsString() + "." + name));
+        candidates.add(name); // already fully qualified
         return candidates.stream().map(byQualifiedName::get).filter(l -> l != null && !l.isEmpty()).findFirst()
                 .flatMap(l -> pick(l, context));
     }

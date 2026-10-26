@@ -236,7 +236,7 @@ public final class UrlEvaluator implements ArgumentBinder {
         for (int i = 0; i < params.size() && i < args.size(); i++) {
             Parameter p = params.get(i);
             String type = simpleName(p.getType());
-            boolean isClient = clientIn(type).isPresent();
+            boolean isClient = clientIn(type, p).isPresent();
             if (p.isVarArgs() || !BOUND.contains(type) && !isClient) {
                 continue; // varargs fill template variables, they are never the URL itself
             }
@@ -517,7 +517,7 @@ public final class UrlEvaluator implements ArgumentBinder {
                     String n = mc.getNameAsString();
                     return e.findAncestor(TypeDeclaration.class).stream()
                             .flatMap(t -> ((TypeDeclaration<?>) t).getMethodsByName(n).stream())
-                            .map(m -> clientIn(m.getType().asString())).flatMap(Optional::stream).findFirst();
+                            .map(m -> clientIn(m.getType().asString(), m)).flatMap(Optional::stream).findFirst();
                 }
                 e = mc.getScope().get();
             } else if (e instanceof EnclosedExpr en) {
@@ -525,36 +525,43 @@ public final class UrlEvaluator implements ArgumentBinder {
             } else if (e instanceof NameExpr n && CLIENTS.contains(n.getNameAsString()) && declaration(n).isEmpty()) {
                 return Optional.of(n.getNameAsString()); // WebClient.create(..) / RestClient.builder()
             } else {
-                return declaration(e).flatMap(UrlEvaluator::typeOfDecl).flatMap(t -> clientIn(t.asString()));
+                return declaration(e).flatMap(UrlEvaluator::typeOfDecl).flatMap(t -> clientIn(t.asString(), t));
             }
         }
         return Optional.empty();
     }
 
-    private Optional<String> clientIn(String type) {
-        return clientIn(type.replaceAll("<.*>", ""), new HashSet<>());
+    /** {@code context}: where the type name is written, for Java's import rules. */
+    private Optional<String> clientIn(String type, Node context) {
+        return clientIn(type.replaceAll("<.*>", ""), context, java.util.Collections.newSetFromMap(new java.util.IdentityHashMap<>()));
     }
 
     /**
      * By assignability: the client itself (WebClient, org...WebClient, WebClient.Builder: a builder chain still ends
      * in build()), RestOperations, a workspace type extending/implementing one; a type outside the workspace named
-     * ...RestTemplate / ...RestOperations (OAuth2RestTemplate) is a RestTemplate.
+     * ...RestTemplate / ...RestOperations (OAuth2RestTemplate) is a RestTemplate. A workspace type is found by Java's
+     * import rules from {@code context}, in the calling repo or a library: another service's ApiClient is not it.
      */
-    private Optional<String> clientIn(String type, Set<String> seen) {
+    private Optional<String> clientIn(String type, Node context, Set<TypeDeclaration<?>> seen) {
         Optional<String> direct = CLIENTS.stream().filter(c -> type.equals(c) || type.endsWith("." + c) || type.startsWith(c + ".")).findFirst();
         String simple = type.substring(type.lastIndexOf('.') + 1);
-        if (direct.isPresent() || !seen.add(simple)) {
+        if (direct.isPresent()) {
             return direct;
         }
         if (simple.equals("RestOperations")) {
             return Optional.of("RestTemplate");
         }
-        List<ClassOrInterfaceDeclaration> ws = declared.getOrDefault(simple, List.of());
+        Repo from = types.repo(context);
+        Optional<TypeDeclaration<?>> ws = types.byImports(type, context).filter(t -> from == null || types.repo(t) == from
+                || types.repo(t) != null && types.repo(t).kind() == Workspace.Kind.library);
         if (ws.isEmpty()) {
             return simple.endsWith("RestTemplate") || simple.endsWith("RestOperations") ? Optional.of("RestTemplate") : Optional.empty();
         }
-        return ws.stream().flatMap(c -> java.util.stream.Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream()))
-                .map(t -> clientIn(t.getNameAsString(), seen)).flatMap(Optional::stream).findFirst();
+        if (!(ws.get() instanceof ClassOrInterfaceDeclaration c) || !seen.add(c)) {
+            return Optional.empty();
+        }
+        return java.util.stream.Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream())
+                .map(t -> clientIn(t.getNameWithScope(), c, seen)).flatMap(Optional::stream).findFirst();
     }
 
     /** Base URL of a client expression: text "" when it has none, null when it can't be told. */
@@ -607,7 +614,7 @@ public final class UrlEvaluator implements ArgumentBinder {
             if (type.equals("DefaultUriBuilderFactory")) {
                 return o.getArguments().size() == 1 ? string(o.getArgument(0), env, d) : known("");
             }
-            return clientIn(type).filter("RestTemplate"::equals).isPresent() ? known("") : unknown();
+            return clientIn(type, o).filter("RestTemplate"::equals).isPresent() ? known("") : unknown();
         }
         return unknown();
     }
@@ -618,16 +625,15 @@ public final class UrlEvaluator implements ArgumentBinder {
         // a RestOperations / RestTemplate injection point also takes a bean of a subclass (OAuth2RestTemplate)
         boolean general = Set.of("RestOperations", "RestTemplate", "WebClient", "RestClient").contains(t);
         List<Bean> candidates = beans.stream().filter(b -> b.type().equals(t)
-                || general && clientIn(b.type()).isPresent() && clientIn(b.type()).equals(clientIn(t))).filter(b -> {
+                || general && clientIn(b.type(), b.method()).isPresent() && clientIn(b.type(), b.method()).equals(clientIn(t, type))).filter(b -> {
             Repo r = types.repo(b.method());
             return r == env.service() || r != null && r.kind() == Workspace.Kind.library;
         }).toList();
         // stereotype classes of the type are beans too: as a client their base is unknown (null), which makes the
         // @HttpExchange detector see the service's own implementation
-        List<Component> local = components.stream().filter(c -> assignable(c.type(), t, new HashSet<>())).filter(c -> {
-            Repo r = types.repo(c.type());
-            return r == env.service() || r != null && r.kind() == Workspace.Kind.library;
-        }).toList();
+        // only the calling service's own: library packages are rarely component-scanned (a stub implementing an API)
+        List<Component> local = components.stream().filter(c -> assignable(c.type(), t, new HashSet<>()))
+                .filter(c -> types.repo(c.type()) == env.service()).toList();
         List<String> q = annotated instanceof com.github.javaparser.ast.nodeTypes.NodeWithAnnotations<?> na
                 ? annotationValues(na, "Qualifier", "value") : List.of();
         List<Bean> hit;
@@ -650,14 +656,14 @@ public final class UrlEvaluator implements ArgumentBinder {
         return hit.size() == 1 && localHit.isEmpty() ? returned(hit.get(0).method(), env.outside(), d, true) : unknown();
     }
 
-    /** {@code c} is, extends or implements (transitively, by simple name in the workspace) a type named {@code t}. */
+    /** {@code c} is, extends or implements (transitively, by Java's import rules) a type named {@code t}. */
     private boolean assignable(ClassOrInterfaceDeclaration c, String t, Set<String> seen) {
         if (c.getNameAsString().equals(t)) {
             return true;
         }
         return seen.add(c.getNameAsString()) && java.util.stream.Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream())
-                .anyMatch(s -> s.getNameAsString().equals(t) || declared.getOrDefault(s.getNameAsString(), List.of()).stream()
-                        .anyMatch(x -> assignable(x, t, seen)));
+                .anyMatch(s -> s.getNameAsString().equals(t) || types.resolveExact(s)
+                        .filter(x -> x instanceof ClassOrInterfaceDeclaration).stream().anyMatch(x -> assignable((ClassOrInterfaceDeclaration) x, t, seen)));
     }
 
     /**
