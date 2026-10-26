@@ -404,8 +404,10 @@ public final class UrlEvaluator implements ArgumentBinder {
         List<Expression> lib = new ArrayList<>();
         for (Bean b : beans) {
             Repo r = types.repo(b.method());
-            // of the type, or of a supertype built here (@Bean Notifier sms() { return new SmsNotifier(url); })
-            if (b.type().equals(type.getNameAsString()) || !b.method().findAll(ObjectCreationExpr.class,
+            // of the type, or of a supertype built here (@Bean Notifier sms() { return new SmsNotifier(url); }); a bean of
+            // an unrelated type that merely builds one inside (Holder holder() { new Holder(new X(..)) }) is not an X bean
+            if (b.type().equals(type.getNameAsString()) || type instanceof ClassOrInterfaceDeclaration c
+                    && assignable(c, b.type(), new HashSet<>()) && !b.method().findAll(ObjectCreationExpr.class,
                     o -> o.getType().getNameAsString().equals(type.getNameAsString())).isEmpty()) {
                 (r == env.service() ? own : r != null && r.kind() == Workspace.Kind.library ? lib : new ArrayList<Expression>())
                         .addAll(returns(b.method()));

@@ -116,6 +116,8 @@ public final class Main {
                 warnings.add("tracing " + e.id() + " failed (" + err.getClass().getSimpleName() + "), its edges are missing");
                 continue;
             }
+            new TreeSet<>(tracer.partialClusters()).forEach(c -> warnings.add("tracing " + e.id() + ": the recursive cluster at " + c
+                    + " has too many paths, only part of them were followed (some of its edges may be missing)"));
             for (FlowTracer.Found f : found) {
                 // the method holding the call: the one entered before the client method, or the handler itself
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();

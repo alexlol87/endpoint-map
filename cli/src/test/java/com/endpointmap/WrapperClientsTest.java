@@ -294,14 +294,17 @@ class WrapperClientsTest {
                 }
                 """;
         write(s0.resolve("Api.java"), api.formatted("s0"));
-        // svc-4: no GatewayClient bean of its own, so the library default is the one injected
+        // svc-4: no GatewayClient bean of its own (a Holder bean that builds one inside is not one), so the library
+        // default is the one injected
         Path s4 = root.resolve("svc-4/src/main/java/s4");
         write(s4.resolve("App.java"), "package s4;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(s4.resolve("Holder.java"), "package s4;\npublic class Holder { Holder(lib.gw.GatewayClient gw) { } }\n");
         write(s4.resolve("Cfg.java"), """
                 package s4;
                 @org.springframework.context.annotation.Configuration
                 public class Cfg {
                   @org.springframework.context.annotation.Bean lib.gw.W1 w1() { return lib.gw.Presets.p3(); }
+                  @org.springframework.context.annotation.Bean Holder holder() { return new Holder(new lib.gw.GatewayClient("http://svc-2:8080")); }
                 }
                 """);
         write(s4.resolve("Api.java"), api.formatted("s4"));
@@ -343,6 +346,10 @@ class WrapperClientsTest {
         }
         write(a.resolve("G.java"), "package a;\n@org.springframework.stereotype.Service\npublic class G {\n"
                 + "  final org.springframework.web.client.RestTemplate rt = new org.springframework.web.client.RestTemplate();\n" + body + "}\n");
+        run("discover", root, "--resolutions", root.resolve("conf/resolutions.yml").toString());
+        // the paths it did not follow are never dropped silently
+        assertTrue(Files.readString(root.resolve("conf/discover-report.md"))
+                .contains("tracing svc-a GET /e: the recursive cluster at G.m0 has too many paths"));
         List<JsonNode> g = map(root, root.resolve("none.yml"), root.resolve("out"));
         List<JsonNode> out = g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /e")).toList();
         Set<String> to = targets(g, "svc-a GET /e");
@@ -361,6 +368,100 @@ class WrapperClientsTest {
                 }
                 assertEquals(last - '0' + 5, e.get("line").asInt(), t);
             }
+        }
+    }
+
+    /** A chain of n trivial helper methods: many walks, no recursion. */
+    private static String pad(int n) {
+        StringBuilder pad = new StringBuilder("package a;\n@org.springframework.stereotype.Component\npublic class Pad {\n");
+        for (int i = 0; i < n; i++) {
+            pad.append("  int p").append(i).append("(int x) { return ").append(i + 1 < n ? "p" + (i + 1) + "(x + 1)" : "x").append("; }\n");
+        }
+        return pad.append("}\n").toString();
+    }
+
+    @Test
+    void aBigHandlerWithoutRecursionKeepsEveryExactEdge(@TempDir Path root) throws Exception {
+        write(root.resolve("lib-gw/pom.xml"), "<project><artifactId>lib-gw</artifactId></project>\n");
+        write(root.resolve("lib-gw/src/main/java/lib/gw/GatewayClient.java"), """
+                package lib.gw;
+                public class GatewayClient {
+                  private final org.springframework.web.client.RestTemplate rt = new org.springframework.web.client.RestTemplate();
+                  private final String base;
+                  public GatewayClient(String base) { this.base = base; }
+                  public String get(String path) { return rt.getForObject(base + path, String.class); }
+                }
+                """);
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Cfg.java"), """
+                package a;
+                @org.springframework.context.annotation.Configuration
+                public class Cfg {
+                  @org.springframework.context.annotation.Bean lib.gw.GatewayClient gw() { return new lib.gw.GatewayClient("http://svc-b"); }
+                }
+                """);
+        write(a.resolve("Pad.java"), pad(120));
+        write(a.resolve("Api.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Api {
+                  private final Pad pad; private final lib.gw.GatewayClient gw;
+                  Api(Pad pad, lib.gw.GatewayClient gw) { this.pad = pad; this.gw = gw; }
+                  @org.springframework.web.bind.annotation.GetMapping("/agg") String agg() {
+                    pad.p0(0);
+                    return gw.get("/i1") + gw.get("/i2") + gw.get("/i3") + gw.get("/i4") + gw.get("/i5");
+                  }
+                }
+                """);
+        Set<String> to = targets(map(root, root.resolve("none.yml"), root.resolve("out")), "svc-a GET /agg");
+        assertEquals(Set.of("external:http://svc-b GET /i1", "external:http://svc-b GET /i2", "external:http://svc-b GET /i3",
+                "external:http://svc-b GET /i4", "external:http://svc-b GET /i5"), to);
+    }
+
+    @Test
+    void aSmallClusterBehindABigHandlerKeepsEveryPathWhateverTheOtherEndpoints(@TempDir Path root) throws Exception {
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Pad.java"), pad(120));
+        write(a.resolve("Api.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Api {
+                  private final G g; private final Pad pad;
+                  Api(G g, Pad pad) { this.g = g; this.pad = pad; }
+                  @org.springframework.web.bind.annotation.GetMapping("/e0") void e0() { pad.p0(0); g.m0("/x"); }
+                  @org.springframework.web.bind.annotation.GetMapping("/e1") void e1() { pad.p0(0); g.m1("/x"); }
+                  @org.springframework.web.bind.annotation.GetMapping("/e2") void e2() { g.m2("/x"); }
+                }
+                """);
+        write(a.resolve("G.java"), """
+                package a;
+                @org.springframework.stereotype.Service
+                public class G {
+                  final org.springframework.web.client.RestTemplate rt = new org.springframework.web.client.RestTemplate();
+                  void m0(String p) { if (p.isEmpty()) { m1(p + "/01"); m2(p + "/02"); } rt.getForObject("http://svc-b" + p, String.class); }
+                  void m1(String p) { if (p.isEmpty()) { m0(p + "/10"); m2(p + "/12"); } rt.getForObject("http://svc-b" + p, String.class); }
+                  void m2(String p) { if (p.isEmpty()) { m0(p + "/20"); m1(p + "/21"); } rt.getForObject("http://svc-b" + p, String.class); }
+                }
+                """);
+        List<JsonNode> before = map(root, root.resolve("none.yml"), root.resolve("out1"));
+        assertEquals(Set.of("external:http://svc-b GET /x", "external:http://svc-b GET /x/01", "external:http://svc-b GET /x/01/12",
+                "external:http://svc-b GET /x/02", "external:http://svc-b GET /x/02/21"), targets(before, "svc-a GET /e0"));
+        // an unrelated endpoint traced first (it walks the same helpers) changes nothing for the others
+        write(a.resolve("Aa.java"), """
+                package a;
+                @org.springframework.web.bind.annotation.RestController
+                public class Aa {
+                  private final Pad pad; private final G g;
+                  Aa(Pad pad, G g) { this.pad = pad; this.g = g; }
+                  @org.springframework.web.bind.annotation.GetMapping("/aa") int aa() { g.m2("/y"); return pad.p60(0); }
+                }
+                """);
+        List<JsonNode> after = map(root, root.resolve("none.yml"), root.resolve("out2"));
+        for (String e : List.of("svc-a GET /e0", "svc-a GET /e1", "svc-a GET /e2")) {
+            assertEquals(before.stream().filter(x -> x.get("from").asText().equals(e)).toList(),
+                    after.stream().filter(x -> x.get("from").asText().equals(e)).toList(), e);
         }
     }
 
