@@ -30,7 +30,9 @@ function bigGraph() {
     edges.push(edge(n.id, nodes[(i * 7 + 31) % nodes.length].id));
     if (i % 10 === 0) edges.push(edge(n.id, `db:${n.service}:shared`, { kind: 'db', client: 'jpa' }));
   });
-  return { services, nodes, edges, flows: [] };
+  const flows = {};
+  edges.forEach((e, i) => ((flows[e.from] = flows[e.from] || { type: 'seq', children: [] }).children.push({ type: 'edge', edge: i })));
+  return { services, nodes, edges, flows };
 }
 
 (async () => {
@@ -76,17 +78,39 @@ function bigGraph() {
   // L3: flow tree per pick, a leaf click selects its edge, details show via chain
   await page.click('#l3');
   assert((await ids('*')).length === both.length, 'L3 graph = L2 map of the picks');
-  assert(await page.locator('#flow > details').count() === 2, 'L3 tree per pick');
-  const kws = await page.evaluate(() => [...new Set(Object.values(GRAPH.flows).flatMap(f =>
-    [...tree({ type: 'call', label: '', children: f.children }).querySelectorAll('.k')].map(k => k.textContent)))].sort());
-  assert(['if', 'loop', 'oneOf', 'parallel', 'try', 'fallback'].every(k => kws.includes(k)), 'L3 tree keywords: ' + kws.join(' '));
-  const leaf = page.locator('#flow button').first();
-  await leaf.click();
-  assert(await page.evaluate(() => cy.edges(':selected').length === 1), 'leaf click highlights its edge');
-  assert(/via: .*\nat: /.test(await page.textContent('#details')), 'leaf click shows via chain and file:line');
+  const heads = await page.$$eval('#flow > details > summary', s => s.map(x => x.textContent.trim()).sort());
+  assert(JSON.stringify(heads) === JSON.stringify([a, b].sort()), 'L3 one tree per pick: ' + heads.join(' | '));
+  // every leaf of both trees: selects exactly the cy edge carrying that graph.json edge, details show its via and file:line
+  const leafErr = await page.evaluate(() => {
+    const bad = [];
+    document.querySelectorAll('#flow button').forEach(btn => {
+      btn.click();
+      const sel = cy.edges(':selected'), txt = document.getElementById('details').textContent;
+      const e = GRAPH.edges.find(x => sel.length === 1 && sel[0].data('edges').includes(x) && txt.includes(`via: ${x.via.join(' -> ')}\nat: ${x.file}:${x.line}`));
+      if (!e || !btn.textContent.endsWith(e.to)) bad.push(btn.textContent);
+    });
+    return [document.querySelectorAll('#flow button').length, bad];
+  });
+  assert(leafErr[0] > 0 && !leafErr[1].length, `${leafErr[0]} leaf clicks select their own edge with via + file:line ${leafErr[1].join('; ')}`);
   await page.locator('#flow > details > summary').first().click();
   assert(!(await page.locator('#flow > details').first().evaluate(d => d.open)), 'tree collapses');
   await page.screenshot({ path: path.join(dir, 'viewer-l3.png') });
+  // keywords read from the rendered panel with every flow picked
+  await page.evaluate(() => { roots = new Set(Object.keys(GRAPH.flows)); render(); });
+  const kws = [...new Set(await page.$$eval('#flow .k', k => k.map(x => x.textContent)))];
+  assert(['if', 'else', 'loop', 'oneOf', 'parallel', 'try', 'catch', 'fallback', 'retry', 'switch', 'case'].every(k => kws.includes(k)), 'L3 panel keywords rendered');
+  // upstream at L3: callers' flows; a leaf outside the view says so instead of silently doing nothing
+  const callee = await page.evaluate(() => endpoints.find(n => (inc[n.id] || []).length).id);
+  await page.click('#clear'); await pick(callee); await page.click('#up'); await setDepth(1);
+  const upHeads = await page.$$eval('#flow > details > summary', s => s.map(x => x.textContent.trim()));
+  const callers = await page.evaluate(() => cy.nodes('.endpoint').map(n => n.id()).filter(id => !roots.has(id) && GRAPH.flows[id]));
+  assert(JSON.stringify(upHeads.sort()) === JSON.stringify(callers.sort()), `upstream L3 shows the ${callers.length} caller flow(s)`);
+  const upOk = await page.evaluate(() => [...document.querySelectorAll('#flow button')].every(btn => {
+    btn.click();
+    return cy.edges(':selected').length === 1 || document.getElementById('details').textContent.startsWith('Not in the current view');
+  }));
+  assert(upOk, 'upstream leaf clicks highlight or say not in view');
+  await setDepth(11); await page.click('#down'); await page.click('#clear');
   await page.click('#l2');
 
   // upstream from a table and a Redis key
@@ -132,16 +156,27 @@ function bigGraph() {
   await page.goto(writeWith('map-big.html', bigGraph()));
   const ms = { load: Date.now() - t };
   t = Date.now(); await pick('svc-07 GET /r1'); ms.pick = Date.now() - t;
+  t = Date.now(); await page.click('#l3'); ms.l3 = Date.now() - t;
+  assert(await page.locator('#flow > details').count() === 1, 'big map: L3 tree for the pick');
+  await page.click('#l1');
   t = Date.now(); await page.click('#up'); ms.upstream = Date.now() - t;
   await page.fill('#depth', '3'); await page.dispatchEvent('#depth', 'input');
   assert(await page.textContent('#depthv') === '3', 'depth label follows the drag');
   t = Date.now(); await setDepth(2); ms.depth = Date.now() - t;
-  t = Date.now(); await page.click('#clear'); await page.click('#l2'); ms.l2refused = Date.now() - t;
+  // fast layout on a big selection starts from the picks
+  await page.click('#down'); await setDepth(11);
+  const lay = await page.evaluate(() => {
+    const orig = cy.layout.bind(cy); let o; cy.layout = opts => { o = opts; return orig(opts); };
+    level = 'L2'; roots = new Set(endpoints.filter(n => n.service <= 'svc-09').map(n => n.id)); render(); cy.layout = orig; return { name: o.name, roots: o.roots && o.roots.map(n => n.id()), want: [...roots] };
+  });
+  assert(lay.name === 'breadthfirst' && JSON.stringify((lay.roots || []).sort()) === JSON.stringify(lay.want.sort()), 'big selection: breadthfirst rooted at the picks');
   let alerts = 0; page.on('dialog', () => alerts++);
-  await page.click('#up'); await page.click('#clear');
-  assert(alerts === 0, 'big map: routine actions raise no alert');
+  await page.click('#l2'); await page.click('#clear');
+  assert(alerts === 0 && await page.evaluate(() => level) === 'L1', 'big map: clear at L2 falls back to L1 without an alert');
+  t = Date.now(); await page.click('#l2'); ms.l2refused = Date.now() - t;
+  assert(alerts === 1, 'big map: clicking L2 alerts once');
   await page.click('#l3');
-  assert(alerts === 1 && await page.evaluate(() => level) === 'L1', 'big map: whole-map L3 refused with one alert');
+  assert(alerts === 2 && await page.evaluate(() => level) === 'L1', 'big map: whole-map L3 refused with one alert');
   console.log('     big map ms', JSON.stringify(ms));
   assert(await page.evaluate(() => level) === 'L1', 'big map: whole-map L2 is refused');
   assert(Object.values(ms).every(v => v < 5000), 'big map: every step under 5 s');

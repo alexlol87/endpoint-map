@@ -34,7 +34,7 @@
   #flow summary { cursor: pointer; }
   #flow .k { color: #8250df; }
   #flow button { display: block; margin-left: 12px; font: inherit; text-align: left; border: 0; background: none; padding: 0; cursor: pointer; color: #0969da; word-break: break-all; }
-  #flow button.cycle, #flow button.trunc { color: var(--muted); }
+  #flow button.trunc { color: var(--muted); }
   #flow button.unres { color: #a31515; }
   #details { white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, Menlo, monospace; }
 </style>
@@ -241,16 +241,18 @@ function showFlow() {
   document.getElementById('flowbox').hidden = level !== 'L3';
   box.textContent = '';
   if (level !== 'L3') return;
-  const eps = [...roots].filter(id => GRAPH.flows[id]);
-  if (!eps.length) box.textContent = 'Pick an endpoint to see its code flow.';
-  eps.forEach(id => box.append(tree({ type: 'call', label: id, children: GRAPH.flows[id].children }, true)));
+  // upstream: the flows of the callers in view, which lead to the selection
+  const eps = (dir === 'down' ? [...roots] : cy.nodes('.endpoint').map(n => n.id()).filter(id => !roots.has(id)))
+    .filter(id => GRAPH.flows[id]);
+  if (!eps.length) box.textContent = dir === 'down' ? 'Pick an endpoint to see its code flow.' : 'No callers in view.';
+  eps.forEach(id => box.append(tree({ type: 'call', label: id, children: GRAPH.flows[id].children })));
 }
-function tree(n, open) {
+function tree(n) {
   if (n.edge !== undefined) {
     const b = document.createElement('button'), e = GRAPH.edges[n.edge];
     b.type = 'button';
-    b.className = { cycle: 'cycle', truncated: 'trunc', unresolved: 'unres' }[n.type] || '';
-    b.textContent = n.type === 'cycle' ? n.label || '↻ ' + e.to : (n.type === 'truncated' ? '… more paths to ' : '→ ') + e.to;
+    b.className = { truncated: 'trunc', unresolved: 'unres' }[n.type] || '';
+    b.textContent = (n.type === 'truncated' ? '… more paths to ' : '→ ') + e.to;
     b.onclick = () => selectEdge(n.edge);
     return b;
   }
@@ -260,7 +262,7 @@ function tree(n, open) {
   k.className = 'k';
   k.textContent = KW[n.type] === undefined ? n.type : KW[n.type];
   s.append(k, (k.textContent ? ' ' : '') + (n.label || ''));
-  d.append(s, ...(n.children || []).map(c => tree(c)));
+  d.append(s, ...n.children.map(c => tree(c)));
   return d;
 }
 function selectEdge(i) {
@@ -268,7 +270,7 @@ function selectEdge(i) {
   cy.elements().unselect();
   const el = cy.edges().filter(x => x.data('edges').includes(e));
   el.select();
-  details.textContent = edgeText([e]);
+  details.textContent = (el.length ? '' : 'Not in the current view (depth or direction).\n\n') + edgeText([e]);
 }
 const edgeText = list => list.map(e =>
     `${e.from}\n  -> ${e.to}\nclient: ${e.client} (${e.kind})${e.confidence ? ', confidence ' + e.confidence : ''}\n` +
