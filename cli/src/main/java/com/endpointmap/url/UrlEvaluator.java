@@ -9,7 +9,9 @@ import com.endpointmap.workspace.Types;
 import com.endpointmap.workspace.Workspace;
 import com.endpointmap.workspace.Workspace.Repo;
 import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.body.AnnotationDeclaration;
 import com.github.javaparser.ast.body.CallableDeclaration;
+import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.ConstructorDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
@@ -32,6 +34,7 @@ import com.github.javaparser.ast.expr.LongLiteralExpr;
 import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.NullLiteralExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
@@ -39,11 +42,14 @@ import com.github.javaparser.ast.expr.StringLiteralExpr;
 import com.github.javaparser.ast.expr.TextBlockLiteralExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.UnaryExpr;
+import com.github.javaparser.ast.stmt.BlockStmt;
 import com.github.javaparser.ast.stmt.ReturnStmt;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -71,7 +77,8 @@ public final class UrlEvaluator implements ArgumentBinder {
     private static final Set<String> BOUND = Set.of("String", "CharSequence", "Object", "URI", "HttpMethod",
             "WebClient", "RestClient");
     private static final Set<String> STEREOTYPES = Set.of("Component", "Service", "Repository", "Controller",
-            "RestController", "Configuration", "ConfigurationProperties", "SpringBootApplication");
+            "RestController", "Configuration", "ConfigurationProperties", "SpringBootApplication", "AutoConfiguration",
+            "ControllerAdvice", "RestControllerAdvice", "Named");
     private static final Set<String> URI_BUILDERS = Set.of("UriComponentsBuilder", "ServletUriComponentsBuilder");
     private static final Set<String> URI_PASS = Set.of("queryParam", "queryParams", "queryParamIfPresent",
             "replaceQueryParam", "fragment", "encode", "build", "buildAndExpand", "expand", "toUriString", "toUri",
@@ -142,6 +149,11 @@ public final class UrlEvaluator implements ArgumentBinder {
     private final Types types;
     private final ConstantEvaluator constants;
     private final List<Bean> beans = new ArrayList<>();
+    /** Simple names of classes the workspace builds with {@code new X(..)} outside {@code @Bean} methods. */
+    private final Set<String> newed = new HashSet<>();
+    /** Workspace classes by the simple name of the class they extend. */
+    private final Map<String, List<ClassOrInterfaceDeclaration>> subclasses = new HashMap<>();
+    private final Map<String, AnnotationDeclaration> annotations = new HashMap<>();
 
     public UrlEvaluator(Workspace ws, Types types, ConstantEvaluator constants) {
         this.types = types;
@@ -157,6 +169,14 @@ public final class UrlEvaluator implements ArgumentBinder {
                     beans.add(new Bean(m, names, q.isEmpty() ? null : q.get(0), Workspace.hasAnnotation(m, "Primary"),
                             simpleName(m.getType())));
                 });
+        ws.repos().stream().flatMap(r -> r.sources().stream()).map(Workspace.SourceFile::cu).forEach(cu -> {
+            cu.findAll(ObjectCreationExpr.class).stream()
+                    .filter(o -> o.findAncestor(MethodDeclaration.class).filter(m -> Workspace.hasAnnotation(m, "Bean")).isEmpty())
+                    .forEach(o -> newed.add(o.getType().getNameAsString()));
+            cu.findAll(ClassOrInterfaceDeclaration.class).forEach(c -> c.getExtendedTypes()
+                    .forEach(t -> subclasses.computeIfAbsent(t.getNameAsString(), k -> new ArrayList<>()).add(c)));
+            cu.findAll(AnnotationDeclaration.class).forEach(a -> annotations.putIfAbsent(a.getNameAsString(), a));
+        });
     }
 
     /**
@@ -253,7 +273,7 @@ public final class UrlEvaluator implements ArgumentBinder {
             if (constant.isPresent()) {
                 return known(constant.get());
             }
-            return declaration(e).map(decl -> variable(decl, env, d, false)).orElse(any());
+            return declaration(e).map(decl -> variable(decl, e, env, d, false)).orElse(any());
         }
         if (e instanceof ObjectCreationExpr o) {
             String type = o.getType().getNameAsString();
@@ -526,7 +546,7 @@ public final class UrlEvaluator implements ArgumentBinder {
             return scope.map(s -> client(s, env, d)).orElse(unknown());
         }
         if (e instanceof NameExpr || e instanceof FieldAccessExpr) {
-            return declaration(e).map(decl -> variable(decl, env, d, true)).orElse(unknown());
+            return declaration(e).map(decl -> variable(decl, e, env, d, true)).orElse(unknown());
         }
         return unknown();
     }
@@ -555,17 +575,32 @@ public final class UrlEvaluator implements ArgumentBinder {
         return hit.size() == 1 ? returned(hit.get(0).method(), env.outside(), d, true) : unknown();
     }
 
-    /** The class holding {@code n} is created by Spring: a stereotype or a {@code @Bean} method returning it. */
+    /**
+     * The class holding {@code n} is created by Spring (so its constructor parameters are injected) unless the
+     * workspace builds it by hand: {@code new X(..)} of it or of a subclass calling {@code super(..)}, and no stereotype.
+     */
     private boolean springBean(Node n) {
-        Optional<TypeDeclaration<?>> t = n.findAncestor(TypeDeclaration.class).map(x -> (TypeDeclaration<?>) x);
-        return t.filter(c -> STEREOTYPES.stream().anyMatch(a -> Workspace.hasAnnotation(c, a))
-                || beans.stream().anyMatch(b -> b.type().equals(c.getNameAsString()))).isPresent();
+        return n.findAncestor(TypeDeclaration.class).map(t -> !builtByHand((TypeDeclaration<?>) t, new HashSet<>())).orElse(true);
+    }
+
+    private boolean builtByHand(TypeDeclaration<?> c, Set<String> seen) {
+        String name = c.getNameAsString();
+        if (!seen.add(name) || stereotyped(c, new HashSet<>()) || beans.stream().anyMatch(b -> b.type().equals(name))) {
+            return false;
+        }
+        return newed.contains(name) || subclasses.getOrDefault(name, List.of()).stream().anyMatch(s -> builtByHand(s, seen));
+    }
+
+    /** A stereotype annotation, directly or through a workspace annotation carrying one ({@code @MetaService}). */
+    private boolean stereotyped(TypeDeclaration<?> t, Set<String> seen) {
+        return t.getAnnotations().stream().map(a -> a.getName().getIdentifier()).anyMatch(a -> STEREOTYPES.contains(a)
+                || seen.add(a) && annotations.containsKey(a) && stereotyped(annotations.get(a), seen));
     }
 
     // --- shared: variables, fields, helper methods ---
 
     /** Value of a parameter, local or field, as a URL string or (asClient) a client base. */
-    private ArgValue variable(Node decl, Env env, int d, boolean asClient) {
+    private ArgValue variable(Node decl, Node use, Env env, int d, boolean asClient) {
         if (decl instanceof Parameter p) {
             Optional<Node> owner = p.getParentNode();
             if (owner.isPresent() && owner.get() == env.method() && env.args().containsKey(p.getNameAsString())) {
@@ -587,7 +622,7 @@ public final class UrlEvaluator implements ArgumentBinder {
         VariableDeclarator v = (VariableDeclarator) decl;
         if (!(v.getParentNode().orElse(null) instanceof FieldDeclaration f)) {
             if (v.getInitializer().isEmpty() && !asClient) {
-                return choose(assignments(v), env, d); // String url; if (..) url = a; else url = b;
+                return choose(assignments(v, use), env, d); // String url; if (..) url = a; else url = b;
             }
             return v.getInitializer().map(i -> asClient ? client(i, env, d) : string(i, env, d))
                     .orElse(asClient ? unknown() : any());
@@ -620,14 +655,34 @@ public final class UrlEvaluator implements ArgumentBinder {
         return asClient && springBean(f) ? bean(f.getElementType(), f, name, env, d) : asClient ? unknown() : any();
     }
 
-    /** Values assigned ({@code x = ..}) to a local declared without one, except those that read it back. */
-    private List<Expression> assignments(VariableDeclarator v) {
+    /**
+     * Values assigned ({@code x = ..}) to a local declared without one, except those that read it back, that may reach
+     * {@code use}: before it, from the last one in a block enclosing the use (it overwrites the earlier ones).
+     */
+    private List<Expression> assignments(VariableDeclarator v, Node use) {
+        // shortcut: by source position, so in a loop an assignment after the use isn't seen; upgrade with real data flow
+        List<AssignExpr> before = all(v).stream().filter(a -> before(a, use)).sorted(Comparator.comparing(a -> a.getBegin().orElseThrow())).toList();
+        int from = 0;
+        for (int i = 0; i < before.size(); i++) {
+            Optional<Node> stmt = before.get(i).getParentNode();
+            if (stmt.flatMap(Node::getParentNode).filter(b -> b instanceof BlockStmt && b.isAncestorOf(use)).isPresent()) {
+                from = i;
+            }
+        }
+        return before.subList(from, before.size()).stream().map(AssignExpr::getValue).toList();
+    }
+
+    private static boolean before(Node a, Node b) {
+        return a.getEnd().isPresent() && b.getBegin().isPresent() && a.getEnd().get().isBefore(b.getBegin().get());
+    }
+
+    private List<AssignExpr> all(VariableDeclarator v) {
         String name = v.getNameAsString();
         return v.findAncestor(Node.class, n -> n instanceof CallableDeclaration || n instanceof LambdaExpr).map(n -> n.findAll(AssignExpr.class,
                         a -> a.getOperator() == AssignExpr.Operator.ASSIGN && a.getTarget() instanceof NameExpr t
                                 && t.getNameAsString().equals(name) && declaration(t).filter(x -> x == v).isPresent()
                                 && a.getValue().findFirst(NameExpr.class, r -> r.getNameAsString().equals(name)).isEmpty()))
-                .orElse(List.of()).stream().map(AssignExpr::getValue).toList();
+                .orElse(List.of());
     }
 
     /** A workspace method called with these arguments: the value it returns. Empty when it isn't one. */
@@ -652,7 +707,9 @@ public final class UrlEvaluator implements ArgumentBinder {
     }
 
     /** One of several possible values: the one this run of {@link #each} takes, else the most complete one. */
-    private ArgValue choose(List<Expression> values, Env env, int d) {
+    private ArgValue choose(List<Expression> all, Env env, int d) {
+        // a null alternative (return null guard, x != null ? x : null) is no URL
+        List<Expression> values = all.stream().filter(v -> !(v instanceof NullLiteralExpr)).toList();
         if (values.isEmpty()) {
             return any();
         }

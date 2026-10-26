@@ -212,7 +212,22 @@ class WebClientRestClientTest {
                   private final P p = new P();
                   private final Q q = new Q();
                   private final Props props;
-                  Api(Props props) { this.props = props; }
+                  private final SubClient sub;
+                  private final Registered reg;
+                  private final MetaClient meta;
+                  Api(Props props, SubClient sub, Registered reg, MetaClient meta) {
+                    this.props = props; this.sub = sub; this.reg = reg; this.meta = meta;
+                  }
+                  @GetMapping("/base") Mono<String> base() { return sub.fetch("/b/base"); }
+                  @GetMapping("/reg") Mono<String> reg() { return reg.fetch("/b/reg"); }
+                  @GetMapping("/meta") Mono<String> meta() { return meta.fetch("/b/meta"); }
+                  @GetMapping("/guard") void guard(String k) { c.get().uri(guarded(k)).retrieve(); }
+                  @GetMapping("/seq") void seq() {
+                    String u;
+                    u = "/b/one"; c.get().uri(u).retrieve();
+                    u = "/b/two"; c.get().uri(u).retrieve();
+                  }
+                  static String guarded(String k) { if (k == null) { return null; } return k.isEmpty() ? null : "/b/one"; }
                   @GetMapping("/scope") Mono<String> scope(boolean f) {
                     if (f) { String url = "/b/one"; return c.get().uri(url).retrieve().bodyToMono(String.class); }
                     String url = "/b/three";
@@ -251,8 +266,21 @@ class WebClientRestClientTest {
                   Mono<String> call() { return rc.get().uri("/b/gw").retrieve().bodyToMono(String.class); }
                 }
                 """);
+        // Spring beans the stereotype list alone misses: a @Service subclass of an abstract base holding the client,
+        // a class registered by @Import, a class with a workspace meta-annotation carrying @Service
+        String fetch = "  public Mono<String> fetch(String u) { return wc.get().uri(u).retrieve().bodyToMono(String.class); }\n";
+        write(a.resolve("BaseClient.java"), "package a;\n" + imports
+                + "public abstract class BaseClient {\n  protected final WebClient wc;\n  protected BaseClient(WebClient wc) { this.wc = wc; }\n" + fetch + "}\n");
+        write(a.resolve("SubClient.java"), "package a;\n" + imports
+                + "@org.springframework.stereotype.Service public class SubClient extends BaseClient { public SubClient(WebClient wc) { super(wc); } }\n");
+        write(a.resolve("Registered.java"), "package a;\n" + imports
+                + "public class Registered {\n  private final WebClient wc;\n  public Registered(WebClient wc) { this.wc = wc; }\n" + fetch + "}\n");
+        write(a.resolve("MetaService.java"), "package a;\n@org.springframework.stereotype.Service public @interface MetaService {}\n");
+        write(a.resolve("MetaClient.java"), "package a;\n" + imports
+                + "@MetaService public class MetaClient {\n  private final WebClient wc;\n  public MetaClient(WebClient wc) { this.wc = wc; }\n" + fetch + "}\n");
         write(a.resolve("Config.java"), "package a;\n" + imports + """
                 @org.springframework.context.annotation.Configuration
+                @org.springframework.context.annotation.Import(Registered.class)
                 public class Config {
                   @org.springframework.context.annotation.Bean WebClient bClient() { return WebClient.create("http://svc-b"); }
                 }
@@ -291,7 +319,7 @@ class WebClientRestClientTest {
         Path b = root.resolve("svc-b/src/main/java/b");
         write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
         StringBuilder api = new StringBuilder("package b;\n@org.springframework.web.bind.annotation.RestController\npublic class Api {\n");
-        for (String p : List.of("one", "two", "three", "gw", "nested", "fmt")) {
+        for (String p : List.of("one", "two", "three", "gw", "nested", "fmt", "base", "reg", "meta")) {
             api.append("  @org.springframework.web.bind.annotation.GetMapping(\"/b/").append(p).append("\") public void ").append(p).append("() { }\n");
         }
         write(b.resolve("Api.java"), api.append("}\n").toString());
@@ -322,6 +350,15 @@ class WebClientRestClientTest {
         // #4 not a Spring bean: the client is unknown (a call site to ask about), not the service's only bean
         assertEquals(Set.of(), to.apply("/gw", "svc-b"));
         assertEquals(1, to.apply("/gw", "unresolved:").size(), g.toString());
+        // injected into Spring beans: abstract base built via super(..) by a @Service, @Import, meta-annotated @Service
+        for (String p : List.of("base", "reg", "meta")) {
+            assertEquals(Set.of("svc-b GET /b/" + p), to.apply("/" + p, ""), g.toString());
+        }
+        // a null return guard is no URL alternative
+        assertEquals(Set.of("svc-b GET /b/one"), to.apply("/guard", ""));
+        // a reassigned local: each use gets the value assigned last before it, one edge per call
+        assertEquals(List.of("svc-b GET /b/one", "svc-b GET /b/two"), g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /seq"))
+                .sorted(java.util.Comparator.comparingInt(e -> e.get("line").asInt())).map(e -> e.get("to").asText()).toList());
         // nested @ConfigurationProperties (clients.b.url) and String.format argument indexes
         assertEquals(Set.of("svc-b GET /b/nested"), to.apply("/nested", ""));
         assertEquals(Set.of("svc-b GET /b/fmt"), to.apply("/fmt", ""));
