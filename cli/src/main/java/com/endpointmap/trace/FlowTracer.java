@@ -233,7 +233,7 @@ public final class FlowTracer {
         Map<Key, Found> found = new LinkedHashMap<>();
         Set<String> lossyHere = new java.util.TreeSet<>();
         int backTo = Integer.MAX_VALUE;
-        // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
+        // flat walk: the if/loop/try structure around each call is read back from its site by FlowTree
         for (Expression call : body.get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
             // the same in every walk of m: a recursive cluster walks m once per argument combination
@@ -626,7 +626,16 @@ public final class FlowTracer {
 
     private String site(Expression call) {
         Node at = call instanceof MethodCallExpr mc ? mc.getName() : call;
-        return types.relPath(call) + ":" + at.getBegin().map(p -> p.line + ":" + p.column).orElse("0");
+        String s = types.relPath(call) + ":" + at.getBegin().map(p -> p.line + ":" + p.column).orElse("0");
+        siteNodes.put(s, call);
+        return s;
+    }
+
+    private final Map<String, Expression> siteNodes = new HashMap<>();
+
+    /** The call expression at a {@link Found#sites()} entry (for the flow tree). */
+    public Node siteNode(String site) {
+        return siteNodes.get(site);
     }
 
     private static int line(Expression call) {

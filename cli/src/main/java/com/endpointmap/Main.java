@@ -17,6 +17,7 @@ import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
 import com.endpointmap.resolutions.Resolutions;
 import com.endpointmap.trace.FlowTracer;
+import com.endpointmap.trace.FlowTree;
 import com.endpointmap.trace.OutboundDetector;
 import com.endpointmap.url.TargetMatcher;
 import com.endpointmap.url.UrlEvaluator;
@@ -125,6 +126,7 @@ public final class Main {
         Map<String, Map<String, Object>> targets = new HashMap<>();
         Map<String, Resolutions.Found> asked = new TreeMap<>();
         List<String> warnings = new ArrayList<>();
+        FlowTree flows = new FlowTree(tracer::siteNode);
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
             List<FlowTracer.Found> found;
@@ -157,6 +159,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
+                    flows.add(e.id(), e.decl(), f, edge);
                     continue;
                 }
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
@@ -178,6 +181,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
+                    flows.add(e.id(), e.decl(), f, edge);
                     continue;
                 }
                 TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
@@ -198,6 +202,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
+                    flows.add(e.id(), e.decl(), f, edge);
                     if (t.node() != null) {
                         targets.putIfAbsent(t.id(), t.node());
                     }
@@ -205,6 +210,9 @@ public final class Main {
             }
         }
         Map<String, Object> graph = GraphWriter.build(ws, endpoints, edges, targets.values());
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> written = (List<Map<String, Object>>) graph.get("edges");
+        graph.put("flows", flows.build(written));
         @SuppressWarnings("unchecked")
         List<Map<String, Object>> nodes = (List<Map<String, Object>>) graph.get("nodes");
         nodes.forEach(openapi::annotate);

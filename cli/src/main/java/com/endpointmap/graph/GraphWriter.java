@@ -62,7 +62,7 @@ public final class GraphWriter {
                 .thenComparing(e -> String.valueOf(e.get("via")))
                 .thenComparing(e -> (String) e.get("file"))
                 .thenComparing(e -> (Integer) e.get("line")));
-        // shortcut: flows (L3 tree) stay empty until M4; L1/L2 are rolled up from edges in the viewer
+        // flows are filled in by the caller (FlowTree), which needs the written edge order for its indexes
         return ordered("services", services, "nodes", new ArrayList<>(nodes.values()),
                 "edges", sortedEdges, "flows", Map.of());
     }

@@ -164,6 +164,7 @@ Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) an
 | Cross-service cycle (WebFlux) | search `GET /search/products/{sku}/similar` <-> analytics `GET /analytics/trending` |
 | Cross-service cycle (functional route + `@HttpExchange`) | loyalty `POST /loyalty/{userId}/simulate` <-> cart `GET /carts/{userId}/points-preview` |
 | Self-recursion | analytics-service `AnalyticsService.exportAll` |
+| Flow tree (`flows`, #13): classic `for (int i ...)`, `stream().map(..)`, self-recursion and a pure util in one method | temp fixture in `cli/.../FlowTreeTest` (not here, so this workspace's edges stay unchanged) |
 
 ### Deep call chains (controller -> handler -> service -> other services -> utils)
 | Case | Location |
