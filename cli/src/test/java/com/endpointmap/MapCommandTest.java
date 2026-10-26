@@ -203,7 +203,7 @@ class MapCommandTest {
     @Test
     void mapHtmlContainsUpstreamMultiSelectAndDepthControls() throws Exception {
         String html = Files.readString(out.resolve("map.html"));
-        for (String id : List.of("id=\"down\"", "id=\"up\"", "id=\"depth\"", "id=\"picks\"", "id=\"search\"")) {
+        for (String id : List.of("id=\"down\"", "id=\"up\"", "id=\"depth\"", "id=\"picks\"", "id=\"search\"", "id=\"l3\"", "id=\"flow\"")) {
             assertTrue(html.contains(id), id);
         }
         assertTrue(html.contains("'table ' + t"), "tables pickable as upstream start points");

@@ -73,6 +73,22 @@ function bigGraph() {
   assert((await ids('*')).length === both.length, 'depth "all" restores the map');
   await page.screenshot({ path: path.join(dir, 'viewer-downstream.png') });
 
+  // L3: flow tree per pick, a leaf click selects its edge, details show via chain
+  await page.click('#l3');
+  assert((await ids('*')).length === both.length, 'L3 graph = L2 map of the picks');
+  assert(await page.locator('#flow > details').count() === 2, 'L3 tree per pick');
+  const kws = await page.evaluate(() => [...new Set(Object.values(GRAPH.flows).flatMap(f =>
+    [...tree({ type: 'call', label: '', children: f.children }).querySelectorAll('.k')].map(k => k.textContent)))].sort());
+  assert(['if', 'loop', 'oneOf', 'parallel', 'try', 'fallback'].every(k => kws.includes(k)), 'L3 tree keywords: ' + kws.join(' '));
+  const leaf = page.locator('#flow button').first();
+  await leaf.click();
+  assert(await page.evaluate(() => cy.edges(':selected').length === 1), 'leaf click highlights its edge');
+  assert(/via: .*\nat: /.test(await page.textContent('#details')), 'leaf click shows via chain and file:line');
+  await page.locator('#flow > details > summary').first().click();
+  assert(!(await page.locator('#flow > details').first().evaluate(d => d.open)), 'tree collapses');
+  await page.screenshot({ path: path.join(dir, 'viewer-l3.png') });
+  await page.click('#l2');
+
   // upstream from a table and a Redis key
   await page.click('#clear');
   await page.click('#up');
@@ -117,8 +133,15 @@ function bigGraph() {
   const ms = { load: Date.now() - t };
   t = Date.now(); await pick('svc-07 GET /r1'); ms.pick = Date.now() - t;
   t = Date.now(); await page.click('#up'); ms.upstream = Date.now() - t;
+  await page.fill('#depth', '3'); await page.dispatchEvent('#depth', 'input');
+  assert(await page.textContent('#depthv') === '3', 'depth label follows the drag');
   t = Date.now(); await setDepth(2); ms.depth = Date.now() - t;
   t = Date.now(); await page.click('#clear'); await page.click('#l2'); ms.l2refused = Date.now() - t;
+  let alerts = 0; page.on('dialog', () => alerts++);
+  await page.click('#up'); await page.click('#clear');
+  assert(alerts === 0, 'big map: routine actions raise no alert');
+  await page.click('#l3');
+  assert(alerts === 1 && await page.evaluate(() => level) === 'L1', 'big map: whole-map L3 refused with one alert');
   console.log('     big map ms', JSON.stringify(ms));
   assert(await page.evaluate(() => level) === 'L1', 'big map: whole-map L2 is refused');
   assert(Object.values(ms).every(v => v < 5000), 'big map: every step under 5 s');

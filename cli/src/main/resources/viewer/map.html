@@ -29,6 +29,13 @@
   .hint { color: var(--muted); margin: 0 0 8px; }
   #picks label { display: flex; gap: 6px; align-items: baseline; font-size: 12px; word-break: break-all; cursor: pointer; }
   #depth { width: 90px; }
+  #flow { font: 12px/1.5 ui-monospace, Menlo, monospace; }
+  #flow details, #flow div.k { margin-left: 12px; }
+  #flow summary { cursor: pointer; }
+  #flow .k { color: #8250df; }
+  #flow button { display: block; margin-left: 12px; font: inherit; text-align: left; border: 0; background: none; padding: 0; cursor: pointer; color: #0969da; word-break: break-all; }
+  #flow button.cycle, #flow button.trunc { color: var(--muted); }
+  #flow button.unres { color: #a31515; }
   #details { white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, Menlo, monospace; }
 </style>
 </head>
@@ -36,7 +43,7 @@
 <header>
   <h1>endpoint-map</h1>
   <div class="seg" role="group" aria-label="Detail level">
-    <button id="l1" type="button">L1 services</button><button id="l2" type="button">L2 endpoints</button>
+    <button id="l1" type="button">L1 services</button><button id="l2" type="button">L2 endpoints</button><button id="l3" type="button">L3 code flow</button>
   </div>
   <div class="seg" role="group" aria-label="Direction">
     <button id="down" type="button">Downstream</button><button id="up" type="button">Upstream</button>
@@ -50,6 +57,7 @@
 <aside>
   <p class="hint">Tick start points (search above), or click an endpoint/service/table; shift-click adds. Upstream shows who reaches the selection.</p>
   <h2>Start from</h2><div id="picks"></div>
+  <div id="flowbox" hidden><h2>Code flow</h2><div id="flow"></div></div>
   <h2>Verbs</h2><div id="verbs"></div>
   <h2>Targets</h2><div id="kinds"></div>
   <h2>Services</h2><div id="services"></div>
@@ -116,7 +124,7 @@ function elements() {
     const k = from + '\u0000' + to;
     (pair[k] = pair[k] || { from, to, list: [] }).list.push(e);
   };
-  if (level === 'L2') {
+  if (level !== 'L1') {
     nodes.forEach(id => {
       const n = nodeById[id];
       if (n.service) add('svc:' + n.service, { label: n.service, color: colorOf[n.service] }, 'service');
@@ -177,21 +185,24 @@ const cy = cytoscape({
 });
 
 const BIG = 300;
-function render() {
-  if (level === 'L2' && !roots.size && endpoints.length > BIG) {
+// asked = the user clicked L2/L3 just now; other actions fall back to L1 silently
+function render(asked) {
+  if (level !== 'L1' && !roots.size && endpoints.length > BIG) {
+    if (asked) alert(`${endpoints.length} endpoints are too many to lay out at ${level} at once. Pick start points first.`);
     level = 'L1';
-    alert(`${endpoints.length} endpoints are too many to lay out at L2 at once. Pick start points first.`);
   }
   cy.elements().remove();
   cy.add(elements());
   cy.nodes().forEach(n => n.toggleClass('root', roots.has(n.id()) ||
     (level === 'L1' && [...roots].some(r => l1Of(nodeById[r]) === n.id()))));
   // shortcut: dagre takes seconds above ~400 edges; breadthfirst is fast but rougher. Upgrade with a web-worker layout if needed.
-  cy.layout(cy.edges().length > 400 ? { name: 'breadthfirst', directed: true, spacingFactor: 0.8 }
+  cy.layout(cy.edges().length > 400 ? { name: 'breadthfirst', directed: true, spacingFactor: 0.8, roots: cy.nodes('.root').length ? cy.nodes('.root') : undefined }
     : { name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
   cy.fit(undefined, 30);
   document.getElementById('l1').classList.toggle('on', level === 'L1');
   document.getElementById('l2').classList.toggle('on', level === 'L2');
+  document.getElementById('l3').classList.toggle('on', level === 'L3');
+  showFlow();
   document.getElementById('down').classList.toggle('on', dir === 'down');
   document.getElementById('up').classList.toggle('on', dir === 'up');
   document.getElementById('depthv').textContent = depth >= 11 ? 'all' : depth;
@@ -222,13 +233,55 @@ legend(document.getElementById('services'), GRAPH.services.map(s =>
   [s.name + (s.kind === 'library' ? ' (library)' : ''), { style: 'background:' + colorOf[s.name] }]));
 
 const details = document.getElementById('details');
+// L3: one tree per selected endpoint; a leaf click selects the graph edge carrying GRAPH.edges[i]
+const KW = { if: 'if', else: 'else', switch: 'switch', case: 'case', loop: 'loop', try: 'try', catch: 'catch',
+  parallel: 'parallel', fallback: 'fallback', retry: 'retry', oneOf: 'oneOf', call: '' };
+function showFlow() {
+  const box = document.getElementById('flow');
+  document.getElementById('flowbox').hidden = level !== 'L3';
+  box.textContent = '';
+  if (level !== 'L3') return;
+  const eps = [...roots].filter(id => GRAPH.flows[id]);
+  if (!eps.length) box.textContent = 'Pick an endpoint to see its code flow.';
+  eps.forEach(id => box.append(tree({ type: 'call', label: id, children: GRAPH.flows[id].children }, true)));
+}
+function tree(n, open) {
+  if (n.edge !== undefined) {
+    const b = document.createElement('button'), e = GRAPH.edges[n.edge];
+    b.type = 'button';
+    b.className = { cycle: 'cycle', truncated: 'trunc', unresolved: 'unres' }[n.type] || '';
+    b.textContent = n.type === 'cycle' ? n.label || '↻ ' + e.to : (n.type === 'truncated' ? '… more paths to ' : '→ ') + e.to;
+    b.onclick = () => selectEdge(n.edge);
+    return b;
+  }
+  if (!n.children) { const t = document.createElement('div'); t.className = 'k'; t.textContent = n.label || n.type; return t; }
+  const d = document.createElement('details'), s = document.createElement('summary'), k = document.createElement('span');
+  d.open = true;
+  k.className = 'k';
+  k.textContent = KW[n.type] === undefined ? n.type : KW[n.type];
+  s.append(k, (k.textContent ? ' ' : '') + (n.label || ''));
+  d.append(s, ...(n.children || []).map(c => tree(c)));
+  return d;
+}
+function selectEdge(i) {
+  const e = GRAPH.edges[i];
+  cy.elements().unselect();
+  const el = cy.edges().filter(x => x.data('edges').includes(e));
+  el.select();
+  details.textContent = edgeText([e]);
+}
+const edgeText = list => list.map(e =>
+    `${e.from}\n  -> ${e.to}\nclient: ${e.client} (${e.kind})${e.confidence ? ', confidence ' + e.confidence : ''}\n` +
+    (e.transport ? `transport: ${e.transport}\n` : '') +
+    (e.repoMethod ? `${e.op ? e.op + ': ' : ''}${e.repoMethod}\n` : '') +
+    `via: ${(e.via || []).join(' -> ')}\nat: ${e.file}:${e.line}`).join('\n\n');
 cy.on('tap', 'node', ev => {
   const d = ev.target.data();
   if (d.kind === 'endpoint') {
     details.textContent = `${d.id}\n\nhandler: ${d.handler}\nfile: ${d.file}:${d.line}\nsource: ${d.source}` +
       (d.alsoHandledBy || []).map(h => `\nalso handled by: ${h.handler} (${h.file}:${h.line})`).join('');
   } else if (d.kind) {
-    details.textContent = `${d.id}\n\n${d.reason || d.kind}${d.tech ? " (" + d.tech + ")" : ""}` + (d.missing ? `\nmissing: ${d.missing}` : '');
+    details.textContent = `${d.id}\n\n${d.reason || d.kind}${d.tech ? " (" + d.tech + ")" : ""}${d.table ? '\ntable: ' + d.table : ''}` + (d.missing ? `\nmissing: ${d.missing}` : '');
   } else {
     details.textContent = d.label;
   }
@@ -240,11 +293,7 @@ cy.on('tap', 'node', ev => {
   render();
 });
 cy.on('tap', 'edge', ev => {
-  details.textContent = ev.target.data('edges').map(e =>
-    `${e.from}\n  -> ${e.to}\nclient: ${e.client} (${e.kind})${e.confidence ? ', confidence ' + e.confidence : ''}\n` +
-    (e.transport ? `transport: ${e.transport}\n` : '') +
-    (e.repoMethod ? `${e.op ? e.op + ': ' : ''}${e.repoMethod}\n` : '') +
-    `via: ${e.via.join(' -> ')}\nat: ${e.file}:${e.line}`).join('\n\n');
+  details.textContent = edgeText(ev.target.data('edges'));
 });
 const search = document.getElementById('search');
 // shortcut: list caps at 50 matches, refine the search to reach the rest
@@ -275,9 +324,11 @@ search.addEventListener('input', () => { showPicks(); dim(); });
 document.getElementById('down').onclick = () => { dir = 'down'; render(); };
 document.getElementById('up').onclick = () => { dir = 'up'; render(); };
 // onchange: one relayout when the slider is released, not one per step dragged
+document.getElementById('depth').oninput = ev => { document.getElementById('depthv').textContent = +ev.target.value >= 11 ? 'all' : ev.target.value; };
 document.getElementById('depth').onchange = ev => { depth = +ev.target.value; render(); };
 document.getElementById('l1').onclick = () => { level = 'L1'; render(); };
-document.getElementById('l2').onclick = () => { level = 'L2'; render(); };
+document.getElementById('l2').onclick = () => { level = 'L2'; render(true); };
+document.getElementById('l3').onclick = () => { level = 'L3'; render(true); };
 document.getElementById('clear').onclick = () => { roots = new Set(); details.textContent = 'Nothing selected.'; render(); };
 render();
 </script>
