@@ -74,9 +74,26 @@ public final class TargetMatcher {
             }
         }
         sharedPorts.forEach(serviceByPort::remove); // two services on one port: can't tell them apart
+        addEndpoints(endpoints);
+    }
+
+    /** More match targets, such as the {@code openapi-only} endpoints found after construction. */
+    public void addEndpoints(List<Endpoint> endpoints) {
         for (Endpoint e : endpoints) {
             endpointsByService.computeIfAbsent(e.service(), k -> new java.util.ArrayList<>()).add(e);
         }
+    }
+
+    /** The service an absolute URL names (by host or localhost port), null when none. */
+    public String service(String url) {
+        Matcher u = URL.matcher(url.trim());
+        return u.matches() ? service(u) : null;
+    }
+
+    /** True when an absolute URL names no service and is not localhost: the same rule outbound calls go by. */
+    public boolean isExternal(String url) {
+        Matcher u = URL.matcher(url.trim());
+        return u.matches() && !LOCAL.contains(u.group(2)) && service(u) == null;
     }
 
     /**
@@ -214,7 +231,7 @@ public final class TargetMatcher {
         return !host.contains(".") || INTERNAL_SUFFIXES.contains(host.substring(host.lastIndexOf('.') + 1));
     }
 
-    static boolean samePath(String template, String path) {
+    public static boolean samePath(String template, String path) {
         String[] a = template.split("/", -1);
         String[] b = path.split("/", -1);
         if (a.length != b.length) {

@@ -6,6 +6,7 @@ import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.endpoints.Endpoint;
 import com.endpointmap.endpoints.RouterEndpointDetector;
 import com.endpointmap.graph.GraphWriter;
+import com.endpointmap.openapi.OpenApi;
 import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
 import com.endpointmap.outbound.RestTemplateDetector;
@@ -36,8 +37,8 @@ public final class Main {
 
     static final String USAGE = """
             Usage:
-              endpoint-map discover --root <dir> --profile <p> [--resolutions resolutions.yml]
-              endpoint-map map --root <dir> --profile <p> [--resolutions resolutions.yml] --out <dir>
+              endpoint-map discover --root <dir> --profile <p> [--resolutions resolutions.yml] [--openapi-dir <dir>]
+              endpoint-map map --root <dir> --profile <p> [--resolutions resolutions.yml] [--openapi-dir <dir>] --out <dir>
             discover writes resolutions.yml (edit it) and discover-report.md next to it; map applies it.
             """;
     private static final Set<String> OPTIONS = Set.of("--root", "--profile", "--resolutions", "--out", "--openapi-dir");
@@ -69,6 +70,10 @@ public final class Main {
             err.println("--root must be an existing directory");
             return 2;
         }
+        if (opts.containsKey("--openapi-dir") && !Files.isDirectory(Path.of(opts.get("--openapi-dir")))) {
+            err.println("--openapi-dir must be an existing directory");
+            return 2;
+        }
         try {
             return args[0].equals("map") ? map(opts, out, err) : discover(opts, out);
         } catch (Exception e) {
@@ -79,7 +84,8 @@ public final class Main {
 
     /** Everything one run found: the graph, and every key resolutions.yml is asked about. */
     private record Scan(Workspace ws, Map<String, Object> graph, Map<String, Resolutions.Found> asked,
-                        List<String> configWarnings, List<String> traceWarnings, List<String> routesNotUnderstood) {
+                        List<String> configWarnings, List<String> traceWarnings, List<String> routesNotUnderstood,
+                        OpenApi openapi) {
 
         /** "id: reason" of every unresolved node. */
         List<String> unresolved() {
@@ -106,6 +112,10 @@ public final class Main {
                 new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
+        OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher);
+        List<Endpoint> openapiOnly = openapi.crossCheck(endpoints);
+        endpoints.addAll(openapiOnly);
+        matcher.addEndpoints(openapiOnly); // calls to an endpoint only OpenAPI knows still reach it
         List<Map<String, Object>> edges = new ArrayList<>();
         Map<String, Map<String, Object>> targets = new HashMap<>();
         Map<String, Resolutions.Found> asked = new TreeMap<>();
@@ -113,7 +123,7 @@ public final class Main {
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
             List<FlowTracer.Found> found;
-            if (e.decl() == null) { // a route handler the walker couldn't read: listed under routes not understood
+            if (e.decl() == null) { // openapi-only, or a route handler the walker couldn't read (listed in the report)
                 continue;
             }
             if (tracer.bodiless(e.decl(), repo)) {
@@ -156,8 +166,9 @@ public final class Main {
                 }
             }
         }
+        targets.values().forEach(openapi::annotate);
         return new Scan(ws, GraphWriter.build(ws, endpoints, edges, targets.values()), asked, detector.warnings(), warnings,
-                routes.notUnderstood());
+                routes.notUnderstood(), openapi);
     }
 
     private static int discover(Map<String, String> opts, PrintStream out) throws Exception {
@@ -168,7 +179,7 @@ public final class Main {
         Resolutions.Stats stats = old.write(file, scan.asked().values());
         Path report = file.resolveSibling("discover-report.md");
         DiscoverReport.write(report, scan.ws(), scan.graph(), scan.asked().values(), old, scan.configWarnings(),
-                scan.traceWarnings(), scan.routesNotUnderstood(), stats);
+                scan.traceWarnings(), scan.routesNotUnderstood(), scan.openapi(), stats);
         summary(scan, out);
         out.printf("resolutions: %d entries, %d blank, %d new, %d stale, %d host: blank (kept external) -> %s%n",
                 stats.entries(), stats.blank(), stats.added(), stats.stale(), stats.hostBlank(), file);

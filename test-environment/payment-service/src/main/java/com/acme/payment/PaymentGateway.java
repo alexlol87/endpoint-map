@@ -45,6 +45,8 @@ public class PaymentGateway {
     }
 
     public void refund(long orderId) {
+        // GET /v1/charges/{id} is not in the trimmed docs/external/openapi-stripe.json: reported as not in its OpenAPI
+        restTemplate.getForObject(stripeHost + "/v1/charges/{id}", Map.class, orderId);
         restTemplate.execute(stripeHost + "/v1/refunds?charge={id}", HttpMethod.POST, null, null, orderId);
     }
 }

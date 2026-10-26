@@ -84,7 +84,9 @@ class RouterEndpointsTest {
         String section = report.substring(report.indexOf("## Routes not understood"));
         assertTrue(section.contains("`search-service/src/main/java/com/acme/search/SearchRoutes.java:60`: router method facetRouter"),
                 section);
-        assertFalse(nodes.keySet().stream().anyMatch(id -> id.contains("/search/facets")), "loop paths are not guessed");
+        // loop paths are not guessed by the walker; they come only from search-service's OpenAPI (#9)
+        assertTrue(nodes.entrySet().stream().filter(n -> n.getKey().contains("/search/facets"))
+                .allMatch(n -> n.getValue().get("source").asText().equals("openapi-only")), "loop paths are not guessed");
     }
 
     @Test
