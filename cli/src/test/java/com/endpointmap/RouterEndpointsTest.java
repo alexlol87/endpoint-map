@@ -114,6 +114,39 @@ class RouterEndpointsTest {
     }
 
     @Test
+    void aGenericImplementationDoesNotHideTheConcreteOnes(@TempDir Path root) throws Exception {
+        Path d = root.resolve("svc/src/main/java/g");
+        Files.createDirectories(d);
+        Files.writeString(d.resolve("App.java"), "package g;\n@org.springframework.boot.autoconfigure.SpringBootApplication class App {}\n");
+        Files.writeString(d.resolve("Handler.java"), "package g;\npublic interface Handler<T> { String handle(T t); }\n");
+        for (String[] c : new String[][] {{"LoggingHandler<T>", "Handler<T>", "T", "audit"}, {"OrderHandler", "Handler<Order>", "Order", "orders"},
+                {"PaymentHandler", "Handler<Payment>", "Payment", "pay"}}) {
+            Files.writeString(d.resolve(c[0].replace("<T>", "") + ".java"), "package g;\npublic class " + c[0] + " implements " + c[1] + " {\n"
+                    + "  private final org.springframework.web.client.RestClient web = org.springframework.web.client.RestClient.create(\"https://"
+                    + c[3] + ".example.com\");\n  public String handle(" + c[2] + " x) { return web.get().uri(\"/" + c[3]
+                    + "\").retrieve().body(String.class); }\n}\n");
+        }
+        Files.writeString(d.resolve("Order.java"), "package g;\npublic class Order {}\n");
+        Files.writeString(d.resolve("Payment.java"), "package g;\npublic class Payment {}\n");
+        Files.writeString(d.resolve("Ctl.java"), """
+                package g;
+                @org.springframework.web.bind.annotation.RestController
+                public class Ctl {
+                  private final Handler<Order> h;
+                  Ctl(Handler<Order> h) { this.h = h; }
+                  @org.springframework.web.bind.annotation.GetMapping("/g") String g() { return h.handle(new Order()); }
+                }
+                """);
+        run(root, "map", "--out", root.resolve("out").toString());
+        List<String> to = new ArrayList<>();
+        JSON.readTree(root.resolve("out/graph.json").toFile()).get("edges").forEach(e -> to.add(e.get("to").asText()));
+        // shortcut: no generic-argument narrowing yet (#15), so every implementation is an alternative
+        for (String impl : List.of("LoggingHandler", "OrderHandler", "PaymentHandler")) {
+            assertTrue(to.stream().anyMatch(t -> t.contains(impl + ".handle")), to.toString());
+        }
+    }
+
+    @Test
     void unreadablePartsAreReportedWithFileAndLine(@TempDir Path root) throws Exception {
         Path f = root.resolve("svc/src/main/java/demo/Routes.java");
         Files.createDirectories(f.getParent());

@@ -309,15 +309,19 @@ public final class FlowTracer {
             return List.of(m);
         }
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
+        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; per class, by arity
+        // only when none of its methods matches the parameter types as written (generic parameters: handle(Order) for handle(T))
         List<MethodDeclaration> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
                 .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
-                .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream())
-                .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                .flatMap(c -> {
+                    List<MethodDeclaration> arity = c.getMethodsByName(m.getNameAsString()).stream()
+                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                            .toList();
+                    List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
+                    return (same.isEmpty() ? arity : same).stream();
+                })
                 .toList();
-        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; by arity only
-        // when no parameter types match as written (generic parameters)
-        List<MethodDeclaration> same = impls.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
-        return impls.isEmpty() ? List.of(m) : same.isEmpty() ? impls : same;
+        return impls.isEmpty() ? List.of(m) : impls;
     }
 
     /** Fallback when the solver fails: methods of the scope's type (and its supertypes) with that name and arity. */
