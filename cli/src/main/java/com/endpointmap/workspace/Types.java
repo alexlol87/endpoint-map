@@ -49,13 +49,43 @@ public final class Types {
 
     /** The declaration a type reference (extends/implements/field type) points to. */
     public Optional<TypeDeclaration<?>> resolve(ClassOrInterfaceType type) {
+        return resolveExact(type).or(() -> bySimpleNameNear(type.getNameAsString(), type));
+    }
+
+    /** Like {@link #resolve}, by the solver or Java's import/package rules only: no simple-name guess. */
+    public Optional<TypeDeclaration<?>> resolveExact(ClassOrInterfaceType type) {
         String qualifiedName;
         try {
             qualifiedName = type.resolve().asReferenceType().getQualifiedName();
         } catch (RuntimeException | StackOverflowError e) {
-            return bySimpleNameNear(type.getNameAsString(), type);
+            return byImports(type.getNameWithScope(), type);
         }
         return pick(byQualifiedName.get(qualifiedName), type); // a JDK type, say: not ours
+    }
+
+    /**
+     * A workspace type named {@code name} ({@code Http}, {@code Outer.Inner}) as Java finds it from {@code context}:
+     * a single-type import, the same package, then on-demand imports. Empty when none of those is a workspace type.
+     */
+    public Optional<TypeDeclaration<?>> byImports(String name, Node context) {
+        Optional<CompilationUnit> cu = context.findCompilationUnit();
+        if (cu.isEmpty()) {
+            return Optional.empty();
+        }
+        int dot = name.indexOf('.');
+        String first = dot < 0 ? name : name.substring(0, dot);
+        String rest = dot < 0 ? "" : name.substring(dot);
+        List<String> candidates = new ArrayList<>();
+        cu.get().findAll(TypeDeclaration.class, t -> t.getNameAsString().equals(first)).stream().findFirst()
+                .flatMap(TypeDeclaration::getFullyQualifiedName).ifPresent(q -> candidates.add(q + rest));
+        cu.get().getImports().stream().filter(i -> !i.isStatic() && !i.isAsterisk() && i.getName().getIdentifier().equals(first))
+                .forEach(i -> candidates.add(i.getNameAsString() + rest));
+        String pkg = cu.get().getPackageDeclaration().map(p -> p.getNameAsString() + ".").orElse("");
+        candidates.add(pkg + name);
+        cu.get().getImports().stream().filter(i -> !i.isStatic() && i.isAsterisk())
+                .forEach(i -> candidates.add(i.getNameAsString() + "." + name));
+        return candidates.stream().map(byQualifiedName::get).filter(l -> l != null && !l.isEmpty()).findFirst()
+                .flatMap(l -> pick(l, context));
     }
 
     /**
@@ -74,9 +104,9 @@ public final class Types {
         }
     }
 
-    // shortcut: name fallback ignores imports and packages; mark results confidence "low" once edges carry it
+    /** By imports and package first ({@link #byImports}), else a guess by simple name, same repo first. */
     public Optional<TypeDeclaration<?>> bySimpleNameNear(String simpleName, Node context) {
-        return pick(bySimpleName.get(simpleName), context);
+        return byImports(simpleName, context).or(() -> pick(bySimpleName.get(simpleName), context));
     }
 
     /**

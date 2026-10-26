@@ -46,13 +46,16 @@ public final class WebClientDetector implements OutboundDetector {
         String verb = verbCall.getNameAsString().equals("method")
                 ? verbCall.getArguments().isEmpty() ? "ANY" : urls.verb(verbCall.getArgument(0), env)
                 : verbCall.getNameAsString().toUpperCase(Locale.ROOT);
-        String base = urls.client(client, env).text();
-        String path = urls.string(uriExpression(uri.getArgument(0)), env).text();
-        UrlEvaluator.Resolved r = UrlEvaluator.toCall(base, path, site.config());
-        // the URL template as a hint; the code itself when the whole URI is built at runtime
-        String source = path.startsWith(UrlEvaluator.ANY) ? uri.getArgument(0).toString() : "\"" + r.raw() + "\"";
-        return List.of(new OutboundCall(type.get().toLowerCase(Locale.ROOT), verb, r.baseUrl(), r.path(), r.key(),
-                source, type.get() + "." + verbCall.getNameAsString()));
+        // a ternary or helper with several returns: one call per possible URL
+        return urls.each(env, e -> {
+            String base = urls.client(client, e).text();
+            String path = urls.string(uriExpression(uri.getArgument(0)), e).text();
+            UrlEvaluator.Resolved r = UrlEvaluator.toCall(base, path, site.config());
+            // the URL template as a hint; the code itself when the whole URI is built at runtime
+            String source = path.startsWith(UrlEvaluator.ANY) ? uri.getArgument(0).toString() : "\"" + r.raw() + "\"";
+            return new OutboundCall(type.get().toLowerCase(Locale.ROOT), verb, r.baseUrl(), r.path(), r.key(),
+                    source, type.get() + "." + verbCall.getNameAsString());
+        }).stream().distinct().toList();
     }
 
     /** {@code uri(b -> b.path("/x").build())}: the builder chain; a block lambda: its return. */

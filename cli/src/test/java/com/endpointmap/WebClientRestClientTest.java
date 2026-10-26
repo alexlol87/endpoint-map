@@ -195,6 +195,138 @@ class WebClientRestClientTest {
         assertTrue(text.contains("    # used by the nightly import too\n    # hint: ask the platform team\n    # used by Api.prop"), text);
     }
 
+    @Test
+    void scopesBranchesInjectionNestedPropertiesAndFormatIndexes(@TempDir Path root) throws Exception {
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(root.resolve("svc-a/src/main/resources/application.yml"), "clients:\n  b:\n    url: http://svc-b\n");
+        write(a.resolve("Api.java"), """
+                package a;
+                import org.springframework.web.bind.annotation.*;
+                import org.springframework.web.reactive.function.client.WebClient;
+                import reactor.core.publisher.Mono;
+                @RestController
+                public class Api {
+                  private final WebClient c = WebClient.create("http://svc-b");
+                  private final String url = "/b/two";
+                  private final P p = new P();
+                  private final Q q = new Q();
+                  private final Props props;
+                  Api(Props props) { this.props = props; }
+                  @GetMapping("/scope") Mono<String> scope(boolean f) {
+                    if (f) { String url = "/b/one"; return c.get().uri(url).retrieve().bodyToMono(String.class); }
+                    String url = "/b/three";
+                    return c.get().uri(url).retrieve().bodyToMono(String.class);
+                  }
+                  @GetMapping("/shadow") void shadow() {
+                    c.get().uri(url).retrieve();
+                    String url = "/b/one";
+                    c.get().uri(url).retrieve();
+                  }
+                  @GetMapping("/recv") Mono<String> recv(boolean f) {
+                    if (f) { P x = p; return x.go("/b/one"); } else { Q x = q; return x.go("/b/two"); }
+                  }
+                  @GetMapping("/ternary") void ternary(boolean v2) { c.get().uri(v2 ? "/b/one" : "/b/two").retrieve(); }
+                  @GetMapping("/returns") void returns(boolean v2) { c.get().uri(path(v2)).retrieve(); }
+                  @GetMapping("/assigned") void assigned(boolean v2) {
+                    String u;
+                    if (v2) { u = "/b/one"; } else { u = "/b/two"; }
+                    c.get().uri(u).retrieve();
+                  }
+                  @GetMapping("/gw") Mono<String> gw() { Gw gw = new Gw(WebClient.create("https://ext.example.com")); return gw.call(); }
+                  @GetMapping("/nested") void nested() { c.get().uri(props.getB().getUrl() + "/b/nested").retrieve(); }
+                  @GetMapping("/fmt") void fmt() { c.get().uri(String.format("%2$s%1$s", "/b/fmt", "http://svc-b")).retrieve(); }
+                  static String path(boolean v2) { if (v2) { return "/b/one"; } return "/b/two"; }
+                }
+                """);
+        String go = "  Mono<String> go(String u) { return WebClient.create(\"http://svc-b\").get().uri(u).retrieve().bodyToMono(String.class); }\n";
+        String imports = "import org.springframework.web.reactive.function.client.WebClient;\nimport reactor.core.publisher.Mono;\n";
+        write(a.resolve("P.java"), "package a;\n" + imports + "public class P {\n" + go + "}\n");
+        write(a.resolve("Q.java"), "package a;\n" + imports + "public class Q {\n" + go.replace(".uri(u)", ".uri(\"/b/three\")") + "}\n");
+        // a plain wrapper built with new: its constructor argument is not the service's WebClient bean
+        write(a.resolve("Gw.java"), "package a;\n" + imports + """
+                public class Gw {
+                  private final WebClient rc;
+                  public Gw(WebClient rc) { this.rc = rc; }
+                  Mono<String> call() { return rc.get().uri("/b/gw").retrieve().bodyToMono(String.class); }
+                }
+                """);
+        write(a.resolve("Config.java"), "package a;\n" + imports + """
+                @org.springframework.context.annotation.Configuration
+                public class Config {
+                  @org.springframework.context.annotation.Bean WebClient bClient() { return WebClient.create("http://svc-b"); }
+                }
+                """);
+        write(a.resolve("Props.java"), """
+                package a;
+                @org.springframework.boot.context.properties.ConfigurationProperties("clients")
+                public class Props {
+                  private B b;
+                  public B getB() { return b; }
+                  public static class B { private String url; public String getUrl() { return url; } }
+                }
+                """);
+        // two classes named Http: the import decides; without one the guess is low confidence
+        String http = imports + "public class Http {\n  public static Mono<String> send() { return WebClient.create(\"http://svc-b\")"
+                + ".get().uri(\"%s\").retrieve().bodyToMono(String.class); }\n}\n";
+        write(a.resolve("Http.java"), "package a;\n" + http.formatted("/b/one"));
+        write(a.resolve("lib/Http.java"), "package a.lib;\n" + http.formatted("/b/two"));
+        write(a.resolve("x/Imported.java"), """
+                package a.x;
+                import a.lib.Http;
+                import reactor.core.publisher.Mono;
+                @org.springframework.web.bind.annotation.RestController
+                public class Imported {
+                  @org.springframework.web.bind.annotation.GetMapping("/imported") Mono<String> imported() { return Http.send(); }
+                }
+                """);
+        write(a.resolve("y/Guessed.java"), """
+                package a.y;
+                import reactor.core.publisher.Mono;
+                @org.springframework.web.bind.annotation.RestController
+                public class Guessed {
+                  @org.springframework.web.bind.annotation.GetMapping("/guessed") Mono<String> guessed() { return Http.send(); }
+                }
+                """);
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        StringBuilder api = new StringBuilder("package b;\n@org.springframework.web.bind.annotation.RestController\npublic class Api {\n");
+        for (String p : List.of("one", "two", "three", "gw", "nested", "fmt")) {
+            api.append("  @org.springframework.web.bind.annotation.GetMapping(\"/b/").append(p).append("\") public void ").append(p).append("() { }\n");
+        }
+        write(b.resolve("Api.java"), api.append("}\n").toString());
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        List<JsonNode> g = map(root, "prod", res, root.resolve("out"));
+        java.util.function.BiFunction<String, String, Set<String>> to = (from, prefix) -> {
+            Set<String> out = new TreeSet<>();
+            g.stream().filter(e -> e.get("from").asText().equals("svc-a GET " + from)).map(e -> e.get("to").asText())
+                    .filter(t -> t.startsWith(prefix)).forEach(out::add);
+            return out;
+        };
+        // #1 block scope: the local of the use's own branch, a field read before a same-named local
+        assertEquals(Set.of("svc-b GET /b/one", "svc-b GET /b/three"), to.apply("/scope", ""));
+        assertEquals(Set.of("svc-b GET /b/one", "svc-b GET /b/two"), to.apply("/shadow", ""));
+        // #2 receiver typed by its scoped declaration: P.go and Q.go, certain
+        assertEquals(Set.of("svc-b GET /b/one", "svc-b GET /b/three"), to.apply("/recv", ""));
+        assertTrue(g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /recv")).noneMatch(e -> e.has("confidence")), g.toString());
+        // #2 static scope: the imported class, certain; no import: a guess by simple name, low
+        assertEquals(Set.of("svc-b GET /b/two"), to.apply("/imported", ""));
+        assertFalse(g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /imported")).findFirst().orElseThrow().has("confidence"));
+        assertTrue(g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /guessed"))
+                .allMatch(e -> e.path("confidence").asText().equals("low")), g.toString());
+        // #3 every possible path: ternary, several returns, if/else assignment
+        for (String from : List.of("/ternary", "/returns", "/assigned")) {
+            assertEquals(Set.of("svc-b GET /b/one", "svc-b GET /b/two"), to.apply(from, ""), from);
+        }
+        // #4 not a Spring bean: the client is unknown (a call site to ask about), not the service's only bean
+        assertEquals(Set.of(), to.apply("/gw", "svc-b"));
+        assertEquals(1, to.apply("/gw", "unresolved:").size(), g.toString());
+        // nested @ConfigurationProperties (clients.b.url) and String.format argument indexes
+        assertEquals(Set.of("svc-b GET /b/nested"), to.apply("/nested", ""));
+        assertEquals(Set.of("svc-b GET /b/fmt"), to.apply("/fmt", ""));
+    }
+
     // --- helpers ---
 
     private static JsonNode edge(String from, String to) {

@@ -1,10 +1,10 @@
 package com.endpointmap.trace;
 
+import com.endpointmap.workspace.Names;
 import com.endpointmap.workspace.Types;
 import com.endpointmap.workspace.Workspace;
 import com.endpointmap.workspace.Workspace.Repo;
 import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
@@ -13,7 +13,6 @@ import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
-import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
@@ -24,6 +23,7 @@ import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -37,7 +37,8 @@ import java.util.stream.Stream;
  * Walks method bodies from a handler down through any number of calls (services, static utils, library code) and
  * asks every {@link OutboundDetector} to classify each call. A classified call ends that branch; any other call
  * into workspace code is followed. An interface/abstract method is followed into each implementation.
- * Calls the symbol solver can't resolve fall back to name + arity matching, low confidence when several match.
+ * Calls the symbol solver can't resolve fall back to name + arity matching, low confidence when several match or
+ * the receiver's type was a guess by simple name.
  * Each method keeps one result per call site and target, so repeated calls and diamonds don't multiply paths.
  */
 public final class FlowTracer {
@@ -47,6 +48,10 @@ public final class FlowTracer {
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
+    }
+
+    /** A receiver's static type; {@code exact} when found by the solver, a scoped declaration or Java's import rules. */
+    private record Typed(TypeDeclaration<?> type, boolean exact) {
     }
 
     /** {@code backTo}: stack depth of the shallowest method a recursive call jumped back to, MAX_VALUE if none. */
@@ -91,7 +96,7 @@ public final class FlowTracer {
     private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
                         Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Result> partial) {
         Map<Map<String, ArgValue>, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
-                .computeIfAbsent(m, k -> new java.util.HashMap<>());
+                .computeIfAbsent(m, k -> new HashMap<>());
         if (done.containsKey(args)) {
             return new Result(done.get(args), Integer.MAX_VALUE);
         }
@@ -114,7 +119,7 @@ public final class FlowTracer {
             List<TypeDeclaration<?>> receiver = receiverTypes(call);
             boolean classified = false;
             // one detection per callee, so via names the right one; a framework call (WebClient...) has none
-            for (MethodDeclaration callee : c.methods().isEmpty() ? java.util.Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
+            for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
                 List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
                         callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
                 for (OutboundCall o : out) {
@@ -169,7 +174,7 @@ public final class FlowTracer {
     private List<TypeDeclaration<?>> receiverTypes(Expression call) {
         Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope()
                 : Optional.of(((MethodReferenceExpr) call).getScope());
-        return scope.flatMap(this::scopeType)
+        return scope.flatMap(this::scopeType).map(Typed::type)
                 .map(t -> Stream.concat(Stream.of(t), supertypes(t).stream()).toList()).orElse(List.of());
     }
 
@@ -179,9 +184,8 @@ public final class FlowTracer {
             return new Callees(r.toAst(MethodDeclaration.class).map(d -> List.of(types.canonical(d))).orElse(List.of()), false);
         } catch (RuntimeException | StackOverflowError e) {
             // the solver fails on any signature naming a type outside the workspace (every Mono-returning method):
-            // one method of that name and arity on the receiver's declared type is still certain
-            List<MethodDeclaration> byName = byName(call);
-            return new Callees(byName, byName.size() > 1);
+            // one method of that name and arity is still certain when the receiver's type itself was not a guess
+            return byName(call);
         }
     }
 
@@ -201,7 +205,7 @@ public final class FlowTracer {
     }
 
     /** Fallback when the solver fails: methods of the scope's type (and its supertypes) with that name and arity. */
-    private List<MethodDeclaration> byName(Expression call) {
+    private Callees byName(Expression call) {
         String name;
         Optional<Expression> scope;
         int args;
@@ -215,17 +219,18 @@ public final class FlowTracer {
             scope = Optional.of(ref.getScope());
             args = -1; // a method reference does not show its arity
         }
-        Optional<TypeDeclaration<?>> owner = scope.isEmpty() ? enclosingType(call) : scopeType(scope.get());
-        return owner.stream().flatMap(o -> Stream.concat(Stream.of(o), supertypes(o).stream()))
+        Optional<Typed> owner = scope.isEmpty() ? enclosingType(call).map(t -> new Typed(t, true)) : scopeType(scope.get());
+        List<MethodDeclaration> ms = owner.stream().flatMap(o -> Stream.concat(Stream.of(o.type()), supertypes(o.type()).stream()))
                 .flatMap(t -> t.getMethodsByName(name).stream())
                 .filter(m -> args < 0 || m.getParameters().size() == args
                         || m.getParameters().stream().anyMatch(Parameter::isVarArgs))
                 .distinct().toList();
+        return new Callees(ms, ms.size() > 1 || !ms.isEmpty() && owner.filter(Typed::exact).isEmpty());
     }
 
-    private Optional<TypeDeclaration<?>> scopeType(Expression scope) {
+    private Optional<Typed> scopeType(Expression scope) {
         if (scope instanceof ThisExpr) {
-            return enclosingType(scope);
+            return enclosingType(scope).map(t -> new Typed(t, true));
         }
         if (scope instanceof TypeExpr t) { // "inventory::release" parses as a type; a variable of that name wins
             return variableType(t.getType().asString(), scope).or(() -> typeOf(t.getType()));
@@ -234,46 +239,35 @@ public final class FlowTracer {
             return fieldType(fa.getNameAsString(), scope);
         }
         if (scope instanceof NameExpr n) {
-            Optional<TypeDeclaration<?>> variable = variableType(n.getNameAsString(), scope);
-            // not a variable: a static call on a class (UrlUtils.join)
-            return variable.isPresent() ? variable : types.bySimpleNameNear(n.getNameAsString(), scope);
+            Optional<Typed> variable = variableType(n.getNameAsString(), scope);
+            // not a variable: a static call on a class (UrlUtils.join), exact only through imports or the package
+            return variable.isPresent() ? variable : types.byImports(n.getNameAsString(), scope).map(t -> new Typed(t, true))
+                    .or(() -> types.bySimpleNameNear(n.getNameAsString(), scope).map(t -> new Typed(t, false)));
         }
         return Optional.empty();
     }
 
-    /** Declared type of a parameter, local variable or field visible from {@code at}, innermost first. */
-    private Optional<TypeDeclaration<?>> variableType(String name, Node at) {
-        for (Node n = at; n != null; n = n.getParentNode().orElse(null)) {
-            List<Parameter> params = n instanceof CallableDeclaration<?> cd ? cd.getParameters()
-                    : n instanceof LambdaExpr l ? l.getParameters() : List.of();
-            for (Parameter p : params) {
-                if (p.getNameAsString().equals(name)) {
-                    return typeOf(p.getType());
-                }
-            }
-            if (n instanceof CallableDeclaration<?>) {
-                for (VariableDeclarator v : n.findAll(VariableDeclarator.class)) {
-                    if (v.getNameAsString().equals(name) && !(v.getParentNode().orElse(null) instanceof FieldDeclaration)) {
-                        return typeOf(v.getType());
-                    }
-                }
-            }
-            if (n instanceof TypeDeclaration<?>) {
-                return fieldType(name, at);
-            }
+    /** Declared type of a parameter, local variable or field visible from {@code at}, by scope (see {@link Names}). */
+    private Optional<Typed> variableType(String name, Node at) {
+        Optional<Node> decl = Names.declaration(name, at);
+        if (decl.isEmpty() || decl.get() instanceof VariableDeclarator v && v.getParentNode().orElse(null) instanceof FieldDeclaration) {
+            return fieldType(name, at); // fields of supertypes too
         }
-        return Optional.empty();
+        return typeOf(decl.get() instanceof Parameter p ? p.getType() : ((VariableDeclarator) decl.get()).getType());
     }
 
-    private Optional<TypeDeclaration<?>> fieldType(String name, Node at) {
+    private Optional<Typed> fieldType(String name, Node at) {
         Optional<TypeDeclaration<?>> owner = enclosingType(at);
         return owner.stream().flatMap(o -> Stream.concat(Stream.of(o), supertypes(o).stream()))
                 .flatMap(t -> t.getFieldByName(name).stream())
                 .findFirst().flatMap(f -> typeOf(f.getVariable(0).getType()));
     }
 
-    private Optional<TypeDeclaration<?>> typeOf(Type type) {
-        return type instanceof ClassOrInterfaceType ct ? types.resolve(ct) : Optional.empty();
+    private Optional<Typed> typeOf(Type type) {
+        if (!(type instanceof ClassOrInterfaceType ct)) {
+            return Optional.empty();
+        }
+        return types.resolveExact(ct).map(t -> new Typed(t, true)).or(() -> types.resolve(ct).map(t -> new Typed(t, false)));
     }
 
     private static Optional<TypeDeclaration<?>> enclosingType(Node n) {

@@ -4,6 +4,7 @@ import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.trace.ArgValue;
 import com.endpointmap.trace.ArgumentBinder;
 import com.endpointmap.trace.CallSite;
+import com.endpointmap.workspace.Names;
 import com.endpointmap.workspace.Types;
 import com.endpointmap.workspace.Workspace;
 import com.endpointmap.workspace.Workspace.Repo;
@@ -47,6 +48,7 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
+import java.util.function.Function;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -63,27 +65,73 @@ public final class UrlEvaluator implements ArgumentBinder {
 
     public static final String ANY = "{*}";
     private static final int MAX_DEPTH = 12;
+    public static final int MAX_ALTERNATIVES = 4;
     private static final Set<String> CLIENTS = Set.of("WebClient", "RestClient");
     /** Parameter types whose arguments are bound (clients, URLs, verbs); others are never URL parts. */
     private static final Set<String> BOUND = Set.of("String", "CharSequence", "Object", "URI", "HttpMethod",
             "WebClient", "RestClient");
+    private static final Set<String> STEREOTYPES = Set.of("Component", "Service", "Repository", "Controller",
+            "RestController", "Configuration", "ConfigurationProperties", "SpringBootApplication");
     private static final Set<String> URI_BUILDERS = Set.of("UriComponentsBuilder", "ServletUriComponentsBuilder");
     private static final Set<String> URI_PASS = Set.of("queryParam", "queryParams", "queryParamIfPresent",
             "replaceQueryParam", "fragment", "encode", "build", "buildAndExpand", "expand", "toUriString", "toUri",
             "toString", "uriVariables", "normalize");
-    private static final Pattern FORMAT = Pattern.compile("%(%|n|[-#+ 0,(<]*\\d*(?:\\.\\d+)?[a-zA-Z])");
+    private static final Pattern FORMAT = Pattern.compile("%(%|n|(?:(\\d+)\\$)?[-#+ 0,(<]*\\d*(?:\\.\\d+)?[a-zA-Z])");
     private static final Pattern ORIGIN = Pattern.compile("^([a-zA-Z][\\w+.-]*://[^/?#]*)(.*)$");
 
     /** Where an expression is evaluated: the walked method and its bound arguments, the calling service's config. */
-    public record Env(MethodDeclaration method, Map<String, ArgValue> args, Repo service, Map<String, String> config) {
+    public record Env(MethodDeclaration method, Map<String, ArgValue> args, Repo service, Map<String, String> config,
+                      Choices choices) {
 
         public static Env of(CallSite site) {
-            return new Env(site.method(), site.args(), site.service(), site.config());
+            return new Env(site.method(), site.args(), site.service(), site.config(), null);
         }
 
         /** Code outside the walk (field initializer, constructor, @Bean method): nothing bound. */
         Env outside() {
-            return new Env(null, Map.of(), service, config);
+            return new Env(null, Map.of(), service, config, choices);
+        }
+
+        Env in(MethodDeclaration m, Map<String, ArgValue> boundArgs) {
+            return new Env(m, boundArgs, service, config, choices);
+        }
+
+        /** Of {@code n} possible values the one this run takes; without choices -1: the caller picks the likeliest. */
+        int pick(int n) {
+            return choices == null || n < 2 ? -1 : choices.pick(n);
+        }
+    }
+
+    /**
+     * The branch taken at each undecidable choice point (ternary, several returns or assignments) during one run of
+     * {@link #each}; the next run advances them like an odometer, so every combination is seen once.
+     */
+    public static final class Choices {
+        private final List<int[]> points = new ArrayList<>(); // {picked, arity}
+        private int at;
+        private boolean exhausted;
+
+        int pick(int n) {
+            if (exhausted) {
+                return n; // past the cap: no branch, the value is unknown
+            }
+            if (at == points.size()) {
+                points.add(new int[] {0, n});
+            }
+            return points.get(at++)[0];
+        }
+
+        /** Advances to the next combination; false when every one has been taken. */
+        private boolean next() {
+            at = 0;
+            while (!points.isEmpty()) {
+                int[] last = points.get(points.size() - 1);
+                if (++last[0] < last[1]) {
+                    return true;
+                }
+                points.remove(points.size() - 1); // later points may differ under another branch: found again
+            }
+            return false;
         }
     }
 
@@ -111,6 +159,24 @@ public final class UrlEvaluator implements ArgumentBinder {
                 });
     }
 
+    /**
+     * Every value {@code eval} gives when each undecidable ternary, method with several returns and variable with
+     * several assignments takes each of its branches (PLAN: every possible path), in a stable order. Past
+     * {@link #MAX_ALTERNATIVES} combinations the rest is one more value with those parts unknown ({@code {*}}).
+     */
+    public <T> List<T> each(Env env, Function<Env, T> eval) {
+        Choices c = new Choices();
+        Env e = new Env(env.method(), env.args(), env.service(), env.config(), c);
+        List<T> out = new ArrayList<>();
+        do {
+            if (out.size() == MAX_ALTERNATIVES) {
+                c.exhausted = true;
+            }
+            out.add(eval.apply(e));
+        } while (!c.exhausted && c.next());
+        return out;
+    }
+
     // --- argument binding (called by the tracer for every call it follows) ---
 
     @Override
@@ -128,8 +194,13 @@ public final class UrlEvaluator implements ArgumentBinder {
                 continue; // varargs fill template variables, they are never the URL itself
             }
             Expression a = args.get(i);
-            ArgValue v = CLIENTS.contains(type) ? client(a, env, depth + 1)
-                    : type.equals("HttpMethod") ? verbValue(a, env, depth + 1) : string(a, env, depth + 1);
+            int d = depth + 1;
+            List<ArgValue> vs = CLIENTS.contains(type) ? List.of(client(a, env, d))
+                    : type.equals("HttpMethod") ? List.of(verbValue(a, env, d))
+                    : env.choices() != null ? List.of(string(a, env, d)) : each(env, e -> string(a, e, d));
+            // shortcut: an argument with several possible values is left unbound (a callSites entry), not walked once
+            // per value; walk per value if that shows up
+            ArgValue v = vs.stream().map(ArgValue::text).distinct().count() == 1 ? vs.get(0) : any();
             if (v.text() != null && !v.text().equals(ANY) && v.hops() < MAX_HOPS) {
                 out.put(p.getNameAsString(), new ArgValue(v.text(), v.hops() + 1));
             }
@@ -172,8 +243,10 @@ public final class UrlEvaluator implements ArgumentBinder {
         }
         if (e instanceof ConditionalExpr c) {
             Optional<Boolean> test = condition(c.getCondition(), env, d);
-            return test.isPresent() ? string(test.get() ? c.getThenExpr() : c.getElseExpr(), env, d)
-                    : best(string(c.getThenExpr(), env, d), string(c.getElseExpr(), env, d));
+            if (test.isPresent()) {
+                return string(test.get() ? c.getThenExpr() : c.getElseExpr(), env, d);
+            }
+            return choose(List.of(c.getThenExpr(), c.getElseExpr()), env, d);
         }
         if (e instanceof NameExpr || e instanceof FieldAccessExpr) {
             Optional<String> constant = constants.eval(e, e);
@@ -257,7 +330,7 @@ public final class UrlEvaluator implements ArgumentBinder {
         };
     }
 
-    /** {@code String.format}: each conversion takes the next argument. */
+    /** {@code String.format}: each conversion takes the next argument, or the one {@code %2$s} names. */
     private ArgValue format(ArgValue fmt, List<Expression> args, Env env, int d) {
         if (fmt.text() == null) {
             return any();
@@ -273,7 +346,8 @@ public final class UrlEvaluator implements ArgumentBinder {
             } else if (m.group(1).equals("n")) {
                 piece = "\n";
             } else {
-                ArgValue a = next < args.size() ? string(args.get(next++), env, d) : any();
+                int index = m.group(2) != null ? Integer.parseInt(m.group(2)) - 1 : next++;
+                ArgValue a = index >= 0 && index < args.size() ? string(args.get(index), env, d) : any();
                 hops = Math.max(hops, a.hops());
                 piece = a.text();
             }
@@ -330,32 +404,61 @@ public final class UrlEvaluator implements ArgumentBinder {
 
     /**
      * A getter of a {@code @ConfigurationProperties} class or a record accessor: {@code ${prefix.kebab-name}},
-     * with the field's initializer as default.
+     * with the field's initializer as default. A getter of a nested properties object ({@code props.getB().getUrl()})
+     * adds its own name to the prefix ({@code clients.b.url}).
      */
     private Optional<ArgValue> configProperty(MethodCallExpr mc, Env env) {
-        if (!mc.getArguments().isEmpty() || mc.getScope().isEmpty()) {
+        Optional<Props> props = mc.getArguments().isEmpty() ? mc.getScope().flatMap(this::properties) : Optional.empty();
+        Optional<String> name = props.flatMap(p -> propertyName(p.type(), mc.getNameAsString()));
+        if (name.isEmpty()) {
             return Optional.empty();
         }
-        Optional<TypeDeclaration<?>> type = declaration(mc.getScope().get()).flatMap(this::declaredType);
-        if (type.isEmpty() || !Workspace.hasAnnotation(type.get(), "ConfigurationProperties")) {
-            return Optional.empty();
-        }
-        List<String> prefix = annotationValues(type.get(), "ConfigurationProperties", "value", "prefix");
-        String name = mc.getNameAsString();
-        if (!(type.get() instanceof RecordDeclaration)) {
-            Matcher g = Pattern.compile("^(?:get|is)([A-Z].*)$").matcher(name);
-            if (!g.matches()) {
-                return Optional.empty();
-            }
-            name = Character.toLowerCase(g.group(1).charAt(0)) + g.group(1).substring(1);
-        }
-        String p = prefix.isEmpty() ? "" : prefix.get(0) + ".";
-        String kebab = p + name.replaceAll("([a-z0-9])([A-Z])", "$1-$2").toLowerCase();
-        String key = !env.config().containsKey(kebab) && env.config().containsKey(p + name) ? p + name : kebab;
-        String field = name;
-        Optional<String> def = type.get().getFieldByName(field).flatMap(f -> f.getVariable(0).getInitializer())
+        String p = props.get().prefix();
+        String kebab = p + kebab(name.get());
+        String key = !env.config().containsKey(kebab) && env.config().containsKey(p + name.get()) ? p + name.get() : kebab;
+        Optional<String> def = props.get().type().getFieldByName(name.get()).flatMap(f -> f.getVariable(0).getInitializer())
                 .flatMap(i -> constants.eval(i, i));
         return Optional.of(known("${" + key + def.map(v -> ":" + v).orElse("") + "}"));
+    }
+
+    /** A {@code @ConfigurationProperties} object (or a nested object of one) and the key prefix of its properties. */
+    private record Props(TypeDeclaration<?> type, String prefix) {
+    }
+
+    private Optional<Props> properties(Expression e) {
+        if (e instanceof MethodCallExpr mc && mc.getArguments().isEmpty() && mc.getScope().isPresent()) {
+            Optional<Props> outer = properties(mc.getScope().get());
+            Optional<String> name = outer.flatMap(o -> propertyName(o.type(), mc.getNameAsString()));
+            return name.flatMap(n -> propertyType(outer.get().type(), n)).filter(ClassOrInterfaceType.class::isInstance)
+                    .flatMap(t -> types.resolve((ClassOrInterfaceType) t))
+                    .map(t -> new Props(t, outer.get().prefix() + kebab(name.get()) + "."));
+        }
+        Optional<TypeDeclaration<?>> type = declaration(e).flatMap(this::declaredType)
+                .filter(t -> Workspace.hasAnnotation(t, "ConfigurationProperties"));
+        return type.map(t -> {
+            List<String> prefix = annotationValues(t, "ConfigurationProperties", "value", "prefix");
+            return new Props(t, prefix.isEmpty() ? "" : prefix.get(0) + ".");
+        });
+    }
+
+    /** {@code getBaseUrl} -> {@code baseUrl}; a record accessor is the name itself. */
+    private static Optional<String> propertyName(TypeDeclaration<?> type, String method) {
+        if (type instanceof RecordDeclaration) {
+            return Optional.of(method);
+        }
+        Matcher g = Pattern.compile("^(?:get|is)([A-Z].*)$").matcher(method);
+        return g.matches() ? Optional.of(Character.toLowerCase(g.group(1).charAt(0)) + g.group(1).substring(1)) : Optional.empty();
+    }
+
+    private static Optional<Type> propertyType(TypeDeclaration<?> type, String name) {
+        if (type instanceof RecordDeclaration r) {
+            return r.getParameterByName(name).map(Parameter::getType);
+        }
+        return type.getFieldByName(name).map(f -> f.getVariable(0).getType());
+    }
+
+    private static String kebab(String name) {
+        return name.replaceAll("([a-z0-9])([A-Z])", "$1-$2").toLowerCase();
     }
 
     // --- clients ---
@@ -452,6 +555,13 @@ public final class UrlEvaluator implements ArgumentBinder {
         return hit.size() == 1 ? returned(hit.get(0).method(), env.outside(), d, true) : unknown();
     }
 
+    /** The class holding {@code n} is created by Spring: a stereotype or a {@code @Bean} method returning it. */
+    private boolean springBean(Node n) {
+        Optional<TypeDeclaration<?>> t = n.findAncestor(TypeDeclaration.class).map(x -> (TypeDeclaration<?>) x);
+        return t.filter(c -> STEREOTYPES.stream().anyMatch(a -> Workspace.hasAnnotation(c, a))
+                || beans.stream().anyMatch(b -> b.type().equals(c.getNameAsString()))).isPresent();
+    }
+
     // --- shared: variables, fields, helper methods ---
 
     /** Value of a parameter, local or field, as a URL string or (asClient) a client base. */
@@ -468,13 +578,17 @@ public final class UrlEvaluator implements ArgumentBinder {
             if (asClient && simpleName(p.getType()).equals("Builder")) {
                 return known(""); // the WebClient.Builder Spring Boot injects has no base URL
             }
-            // a constructor or @Bean method parameter is injected by Spring
-            boolean injected = owner.filter(o -> o instanceof ConstructorDeclaration
+            // a @Bean method parameter, or a constructor parameter of a Spring bean, is injected by Spring; a class built
+            // with new X(client) gets whatever the caller passes (unknown here)
+            boolean injected = owner.filter(o -> o instanceof ConstructorDeclaration c && springBean(c)
                     || o instanceof MethodDeclaration m && Workspace.hasAnnotation(m, "Bean")).isPresent();
             return asClient && injected ? bean(p.getType(), p, p.getNameAsString(), env, d) : asClient ? unknown() : any();
         }
         VariableDeclarator v = (VariableDeclarator) decl;
         if (!(v.getParentNode().orElse(null) instanceof FieldDeclaration f)) {
+            if (v.getInitializer().isEmpty() && !asClient) {
+                return choose(assignments(v), env, d); // String url; if (..) url = a; else url = b;
+            }
             return v.getInitializer().map(i -> asClient ? client(i, env, d) : string(i, env, d))
                     .orElse(asClient ? unknown() : any());
         }
@@ -503,7 +617,17 @@ public final class UrlEvaluator implements ArgumentBinder {
             }
         }
         // shortcut: only the first constructor assignment that tells anything is used; this(..) chains are not followed
-        return asClient ? bean(f.getElementType(), f, name, env, d) : any();
+        return asClient && springBean(f) ? bean(f.getElementType(), f, name, env, d) : asClient ? unknown() : any();
+    }
+
+    /** Values assigned ({@code x = ..}) to a local declared without one, except those that read it back. */
+    private List<Expression> assignments(VariableDeclarator v) {
+        String name = v.getNameAsString();
+        return v.findAncestor(Node.class, n -> n instanceof CallableDeclaration || n instanceof LambdaExpr).map(n -> n.findAll(AssignExpr.class,
+                        a -> a.getOperator() == AssignExpr.Operator.ASSIGN && a.getTarget() instanceof NameExpr t
+                                && t.getNameAsString().equals(name) && declaration(t).filter(x -> x == v).isPresent()
+                                && a.getValue().findFirst(NameExpr.class, r -> r.getNameAsString().equals(name)).isEmpty()))
+                .orElse(List.of()).stream().map(AssignExpr::getValue).toList();
     }
 
     /** A workspace method called with these arguments: the value it returns. Empty when it isn't one. */
@@ -513,21 +637,30 @@ public final class UrlEvaluator implements ArgumentBinder {
             return Optional.empty();
         }
         Map<String, ArgValue> args = bind(m.get(), mc.getArguments(), env, d);
-        return Optional.of(returned(m.get(), new Env(m.get(), args, env.service(), env.config()), d, asClient));
+        return Optional.of(returned(m.get(), env.in(m.get(), args), d, asClient));
     }
 
-    /** The returned value of a method body; of several returns the most complete one. */
+    /** The returned value of a method body: of several returns, each in turn (see {@link #each}). */
     private ArgValue returned(MethodDeclaration m, Env env, int d, boolean asClient) {
-        ArgValue out = asClient ? unknown() : any();
-        for (ReturnStmt r : m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class)
-                .map(l -> !m.isAncestorOf(l)).orElse(true))) {
-            if (r.getExpression().isEmpty()) {
-                continue;
-            }
-            ArgValue v = asClient ? client(r.getExpression().get(), env, d) : string(r.getExpression().get(), env, d);
-            out = asClient ? (out.text() == null ? v : out) : best(out, v);
+        List<Expression> values = m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class)
+                .map(l -> !m.isAncestorOf(l)).orElse(true)).stream().flatMap(r -> r.getExpression().stream()).toList();
+        if (!asClient) {
+            return choose(values, env, d);
         }
-        return out;
+        // shortcut: a client from several returns is the first one known; clients built per branch are rare
+        return values.stream().map(v -> client(v, env, d)).filter(v -> v.text() != null).findFirst().orElse(unknown());
+    }
+
+    /** One of several possible values: the one this run of {@link #each} takes, else the most complete one. */
+    private ArgValue choose(List<Expression> values, Env env, int d) {
+        if (values.isEmpty()) {
+            return any();
+        }
+        int i = env.pick(values.size());
+        if (i >= 0) {
+            return i < values.size() ? string(values.get(i), env, d) : any();
+        }
+        return values.stream().map(v -> string(v, env, d)).reduce(UrlEvaluator::best).orElseThrow();
     }
 
     private Optional<MethodDeclaration> resolve(MethodCallExpr mc) {
@@ -667,7 +800,7 @@ public final class UrlEvaluator implements ArgumentBinder {
                 : decl instanceof VariableDeclarator v ? Optional.of(v.getType()) : Optional.empty();
     }
 
-    /** The parameter, local variable or field a name (or {@code this.name}) refers to, innermost first. */
+    /** The parameter, local variable or field a name (or {@code this.name}) refers to, by scope. */
     private Optional<Node> declaration(Expression e) {
         String name;
         if (e instanceof NameExpr ne) {
@@ -677,30 +810,7 @@ public final class UrlEvaluator implements ArgumentBinder {
         } else {
             return Optional.empty();
         }
-        for (Node n = e; n != null; n = n.getParentNode().orElse(null)) {
-            List<Parameter> params = n instanceof CallableDeclaration<?> cd ? cd.getParameters()
-                    : n instanceof LambdaExpr l ? l.getParameters() : List.of();
-            for (Parameter p : params) {
-                if (p.getNameAsString().equals(name)) {
-                    return Optional.of(p);
-                }
-            }
-            if (n instanceof CallableDeclaration<?> || n instanceof LambdaExpr) {
-                Optional<VariableDeclarator> local = n.findFirst(VariableDeclarator.class, v -> v.getNameAsString().equals(name)
-                        && !(v.getParentNode().orElse(null) instanceof FieldDeclaration));
-                if (local.isPresent()) {
-                    return Optional.of(local.get());
-                }
-            }
-            if (n instanceof TypeDeclaration<?> td) {
-                Optional<Node> f = td.getFieldByName(name).map(fd -> fd.getVariables().stream()
-                        .filter(v -> v.getNameAsString().equals(name)).findFirst().orElseThrow());
-                if (f.isPresent()) {
-                    return f;
-                }
-            }
-        }
-        return Optional.empty();
+        return Names.declaration(name, e);
     }
 
     private static Optional<Node> field(String name, Node at) {
