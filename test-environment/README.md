@@ -117,6 +117,8 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 ### Database and Redis
 Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too. Explicit names are kept as written minus quotes/backticks, with `@Table(schema)` as `schema.table`. A custom fragment method (`OrderRepositoryCustom`) is no repository call: its `*Impl` is walked instead. `<Name>Impl` is looked up by name only for a Spring Data repository or a fragment one extends, in the same repo. An entity given as a generic service's type variable (`CrudSvc<E>`) is the one the caller's receiver binds (`OrderSvc extends CrudSvc<Order>`); when nothing on the path binds it, each subclass's entity, low confidence when there are several (covered by `RepositoryTablesTest` temp fixtures).
 
+Redis (#12): template ops give a `redis:<keyPattern>` node, the key cut at its first part not known from code (`"cart:" + id` -> `cart:*`, nothing known -> `*`); edge op `value.set`, `hash.put`, `expire`, `delete`... Cache annotations on a method the flow calls give `redis:<cacheName>::*` (Spring's default Redis cache key) with op `cache.get/put/evict`, and the method is still traced.
+
 Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) and JPQL (entity names map to the entity's table) give their tables and op from the statement: the leading verb's op on its target table (`UPDATE x`, `INSERT INTO x`, `DELETE FROM x`), read on every other `FROM/JOIN` table. Same for `EntityManager.createQuery/createNativeQuery`, `DatabaseClient.sql(..)`, `JdbcTemplate`/`JdbcClient`; `EntityManager.persist/merge/remove/find` and `R2dbcEntityTemplate` take the entity's table. SQL is evaluated like a URL (constants, text blocks, arguments passed into utils). A table name built at runtime gives an unresolved db target, never a guess.
 
 | Case | Location |
@@ -138,6 +140,7 @@ Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) an
 | `ReactiveRedisTemplate` opsForHash / expire / delete / opsForValue | cart-service |
 | `ReactiveStringRedisTemplate` opsForList / opsForValue.increment / opsForZSet | analytics-service |
 | `ReactiveStringRedisTemplate` opsForSet / opsForHash + `@Cacheable` on a Mono method | warehouse-service |
+| Deep chain controller -> `SessionHandler` -> `SessionService` (`@CacheConfig` default name, `@Caching` with two `@CacheEvict`, one name from a constant) -> `SessionStore` (`HashOperations` variable, keys from the `SessionKeys` util and its constant prefix, `opsForSet().remove`, a key with two possible prefixes -> `guest:*` and `session:*`, a key passed in whole -> `redis:*` (listed in discover-report.md), `@Cacheable current(..)` called on `this` -> no cache edge) | customer-service `GET/DELETE /customers/{id}/session` |
 
 ### Control flow
 | Case | Location |

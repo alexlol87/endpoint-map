@@ -20,4 +20,14 @@ public record OutboundCall(String client, String verb, String baseUrl, String pa
     public static OutboundCall db(String tech, String table, String op, String repoMethod, boolean low) {
         return new OutboundCall(tech, null, null, null, null, null, repoMethod, table, op, low);
     }
+
+    /** A Redis call: client redis, the key pattern in {@code table}, a cache annotation's cache name in {@code source}. */
+    public static OutboundCall redis(String keyPattern, String cache, String op, String label, boolean low) {
+        return new OutboundCall("redis", null, null, null, null, cache, label, keyPattern, op, low);
+    }
+
+    /** A cache annotation on the method called: the call is still walked into. */
+    public boolean cache() {
+        return op != null && op.startsWith("cache.");
+    }
 }

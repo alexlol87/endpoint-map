@@ -11,6 +11,7 @@ import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
 import com.endpointmap.outbound.RepositoryDetector;
 import com.endpointmap.outbound.SqlDetector;
+import com.endpointmap.outbound.RedisDetector;
 import com.endpointmap.outbound.RestTemplateDetector;
 import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
@@ -112,7 +113,8 @@ public final class Main {
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
         RepositoryDetector repos = new RepositoryDetector(ws, types, constants);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
-                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), repos, new SqlDetector(repos, urls, types));
+                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), repos, new SqlDetector(repos, urls, types),
+                new RedisDetector(urls, constants));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher, configs);
@@ -145,6 +147,18 @@ public final class Main {
                 // the method holding the call: the one entered before the client method, or the handler itself
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
                 String callSite = at + ":" + f.line();
+                if (f.call().client().equals("redis")) {
+                    String id = "redis:" + f.call().table();
+                    targets.putIfAbsent(id, f.call().source() == null ? GraphWriter.ordered("id", id, "kind", "redis", "keyPattern", f.call().table())
+                            : GraphWriter.ordered("id", id, "kind", "redis", "keyPattern", f.call().table(), "cache", f.call().source()));
+                    Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", id, "kind", "redis", "client", "redis",
+                            "op", f.call().op(), "via", f.via(), "file", f.file(), "line", f.line());
+                    if (f.lowConfidence()) {
+                        edge.put("confidence", "low");
+                    }
+                    edges.add(edge);
+                    continue;
+                }
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
                     // no table (SQL or entity not known from code): one node per call site, saying why (listed in the report)
                     String id = f.call().table() != null ? "db:" + e.service() + ":" + f.call().table()
