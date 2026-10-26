@@ -249,7 +249,8 @@ public final class FlowTree {
             // keyed at the method's end: after what its body reaches
             Node m = a.getParentNode().orElse(a);
             k.add(m.getEnd().map(p -> String.format("%06d:%06d", p.line, p.column)).orElse(pos(a)) + ":fallback:" + pos(a));
-            j.add(node("fallback", "@" + a.getNameAsString()));
+            j.add(node("fallback", "@" + a.getNameAsString() + a.findFirst(com.github.javaparser.ast.expr.MemberValuePair.class,
+                    p -> p.getNameAsString().equals("name")).map(p -> "(" + text(p) + ")").orElse("")));
         } else if (ch instanceof MethodDeclaration md) { // retried as a whole: outside everything in its body
             for (AnnotationExpr a : md.getAnnotations().reversed()) {
                 if (a.getName().getIdentifier().equals("Retry") || a.getName().getIdentifier().equals("Retryable")) {

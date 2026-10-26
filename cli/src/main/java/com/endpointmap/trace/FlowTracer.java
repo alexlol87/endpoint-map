@@ -337,8 +337,9 @@ public final class FlowTracer {
         }
         // resilience fallbacks run when m fails: walked as calls made at the annotation naming them
         if (m instanceof MethodDeclaration md) {
-            for (Map.Entry<AnnotationExpr, List<MethodDeclaration>> e : fallbacks(md).entrySet()) {
-                for (MethodDeclaration fb : e.getValue()) {
+            for (Map.Entry<AnnotationExpr, List<Fallback>> e : fallbacks(md).entrySet()) {
+                for (Fallback t : e.getValue()) {
+                    MethodDeclaration fb = t.method();
                     Integer at = stack.get(fb);
                     if (at != null) {
                         backTo = Math.min(backTo, at);
@@ -347,7 +348,7 @@ public final class FlowTracer {
                     Result r = walk(fb, fallbackArgs(md, fb, args), service, config, stack, partial);
                     backTo = Math.min(backTo, r.backTo());
                     lossyHere.addAll(r.lossy());
-                    r.found().forEach(f -> enter(found, f, fb, e.getKey(), false, m));
+                    r.found().forEach(f -> enter(found, f, fb, e.getKey(), t.low(), m));
                 }
             }
         }
@@ -386,34 +387,46 @@ public final class FlowTracer {
      * Spring {@code @Retryable}: the {@code @Recover} methods of the class returning m's type and taking m's parameters
      * after an optional exception, or the one its {@code recover} attribute names.
      */
-    private static Map<AnnotationExpr, List<MethodDeclaration>> fallbacks(MethodDeclaration m) {
-        Map<AnnotationExpr, List<MethodDeclaration>> out = new LinkedHashMap<>();
+    private record Fallback(MethodDeclaration method, boolean low) {
+    }
+
+    private Map<AnnotationExpr, List<Fallback>> fallbacks(MethodDeclaration m) {
+        Map<AnnotationExpr, List<Fallback>> out = new LinkedHashMap<>();
+        Set<MethodDeclaration> seen = Collections.newSetFromMap(new IdentityHashMap<>()); // two annotations naming one fallback: one node
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
         if (owner.isEmpty()) {
             return out;
         }
+        // the class's own methods, then inherited ones (a base class holding shared fallbacks)
+        List<MethodDeclaration> methods = Stream.concat(Stream.of(owner.get()), supertypes(owner.get()).stream())
+                .flatMap(t -> t.getMethods().stream()).toList();
         List<String> params = m.getParameters().stream().map(p -> unqualified(p.getType().asString())).toList();
         for (AnnotationExpr a : m.getAnnotations()) {
             String name = a.getName().getIdentifier();
             Optional<String> fb = attribute(a, FALLBACK_ANNOTATIONS.contains(name) ? "fallbackMethod" : name.equals("Retryable") ? "recover" : null);
             List<MethodDeclaration> to;
+            boolean low = false;
             if (FALLBACK_ANNOTATIONS.contains(name)) {
                 if (fb.isEmpty()) {
                     continue;
                 }
-                List<MethodDeclaration> named = owner.get().getMethodsByName(fb.get());
+                List<MethodDeclaration> named = methods.stream().filter(f -> f.getNameAsString().equals(fb.get())).toList();
                 to = named.stream().filter(f -> f.getParameters().size() == params.size() + 1 && types(f, 0, params.size()).equals(params)).toList();
-                to = to.isEmpty() ? named : to; // shortcut: types compared as written, so a mismatch falls back to the name alone
+                // shortcut: types compared as written, so a mismatch falls back to the name alone, low confidence
+                low = to.isEmpty();
+                to = low ? named : to;
             } else if (name.equals("Retryable")) {
-                to = owner.get().getMethods().stream().filter(f -> f.isAnnotationPresent("Recover") && fb.map(f.getNameAsString()::equals).orElse(true)
+                to = methods.stream().filter(f -> f.isAnnotationPresent("Recover") && fb.map(f.getNameAsString()::equals).orElse(true)
                         && unqualified(f.getType().asString()).equals(unqualified(m.getType().asString()))
                         && (types(f, 0, f.getParameters().size()).equals(params) || f.getParameters().size() == params.size() + 1
                         && types(f, 1, params.size() + 1).equals(params))).toList();
             } else {
                 continue;
             }
-            if (!to.isEmpty()) {
-                out.put(a, to);
+            boolean l = low;
+            List<Fallback> fresh = to.stream().filter(seen::add).map(f -> new Fallback(f, l)).toList();
+            if (!fresh.isEmpty()) {
+                out.put(a, fresh);
             }
         }
         return out;
@@ -436,6 +449,9 @@ public final class FlowTracer {
         int shift = fb.getParameters().size() > m.getParameters().size() && !fb.isAnnotationPresent("Recover") ? 0
                 : fb.getParameters().size() - m.getParameters().size();
         for (int i = 0; i < m.getParameters().size() && i + shift < fb.getParameters().size(); i++) {
+            if (i + shift < 0) { // a by-name fallback with fewer parameters: nothing lines up
+                continue;
+            }
             ArgValue v = args.get(m.getParameter(i).getNameAsString());
             if (v != null) {
                 out.put(fb.getParameter(i + shift).getNameAsString(), v);

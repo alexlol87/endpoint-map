@@ -44,12 +44,12 @@ class ResilienceFlowTest {
     @Test
     void circuitBreakerFallbackIsTracedUnderAFallbackNode() {
         String p = "call PriceService.price > call PriceService.taxRate > ";
-        has("pricing-service GET /prices/{sku}", p + "fallback @CircuitBreaker > call PriceService.defaultTaxRate > edge tax-service GET /tax-api/tax/rates");
+        has("pricing-service GET /prices/{sku}", p + "fallback @CircuitBreaker(name = \"tax\") > call PriceService.defaultTaxRate > edge tax-service GET /tax-api/tax/rates");
         assertTrue(edge("pricing-service GET /prices/{sku}", "tax-service GET /tax-api/tax/rates", "PriceService.defaultTaxRate"));
         // a fallback reaching a repository query: findLastPriceForSku
         assertTrue(edge("order-service POST /api/orders", "db:order-service:order_lines", "OrderRepository.findLastPriceForSku"));
         assertTrue(paths(graph, "order-service POST /api/orders").stream().anyMatch(s -> s.endsWith(
-                "call OrderService.priceOf > fallback @CircuitBreaker > call OrderService.priceFallback > edge db:order-service:order_lines")));
+                "call OrderService.priceOf > fallback @CircuitBreaker(name = \"pricing\") > call OrderService.priceFallback > edge db:order-service:order_lines")));
     }
 
     @Test
@@ -75,7 +75,7 @@ class ResilienceFlowTest {
                 public class Api {
                   private final Ext ext;
                   Api(Ext ext) { this.ext = ext; }
-                  @GetMapping("/b") @Bulkhead(name = "b", fallbackMethod = "fb") public String b(String id) { return ext.a(); }
+                  @GetMapping("/b") @Bulkhead(fallbackMethod = "fb") public String b(String id) { return ext.a(); }
                   String fb(String id, IllegalStateException e) { return ext.b(); }
                   String fb(String id, RuntimeException e) { return ext.c(); }
                   String fb(Long id, Throwable e) { return ext.d(); }
@@ -100,5 +100,63 @@ class ResilienceFlowTest {
         assertEquals(List.of("edge " + x + "a", "fallback @Bulkhead > call Api.fb > edge " + x + "b",
                 "fallback @Bulkhead > call Api.fb > edge " + x + "c"), paths(g, "rs-service GET /b"));
         assertEquals(List.of("retry @Retryable > edge " + x + "a", "fallback @Retryable > call Api.rec > edge " + x + "b"), paths(g, "rs-service GET /r"));
+    }
+
+    @Test
+    void inheritedFewerParamsAndRepeatedFallbacks(@TempDir Path root) throws Exception {
+        Path c = root.resolve("rs-service/src/main/java/r");
+        RepositoryTablesTest.write(c.resolve("App.java"), "package r;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        RepositoryTablesTest.write(c.resolve("Base.java"), """
+                package r;
+                public abstract class Base {
+                  protected Ext ext;
+                  String sup(String id, Throwable t) { return ext.d(); }
+                  @org.springframework.retry.annotation.Recover String rec(Exception e, String id) { return ext.c(); }
+                }
+                """);
+        RepositoryTablesTest.write(c.resolve("Api.java"), """
+                package r;
+                import io.github.resilience4j.circuitbreaker.annotation.CircuitBreaker;
+                import io.github.resilience4j.retry.annotation.Retry;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class Api extends Base {
+                  @GetMapping("/sup") @CircuitBreaker(name = "x", fallbackMethod = "sup") public String s(String id) { return ext.a(); }
+                  @GetMapping("/rq") @org.springframework.retry.annotation.Retryable public String rq(String id) { return ext.a(); }
+                  @CircuitBreaker(name = "x", fallbackMethod = "few") public String n(String id, String y) { return ext.a(); }
+                  String few(Throwable t) { return ext.b(); }
+                  @GetMapping("/neg") public String neg() { return n("a", "b"); }
+                  @GetMapping("/dup") @CircuitBreaker(name = "x", fallbackMethod = "f") @Retry(name = "x", fallbackMethod = "f")
+                  public String dup(String id) { return ext.a(); }
+                  String f(String id, Throwable t) { return ext.b(); }
+                }
+                """);
+        RepositoryTablesTest.write(c.resolve("Ext.java"), """
+                package r;
+                import org.springframework.web.bind.annotation.GetMapping;
+                @org.springframework.cloud.openfeign.FeignClient(name = "ext", url = "https://api.example.com")
+                public interface Ext { @GetMapping("/a") String a(); @GetMapping("/b") String b(); @GetMapping("/c") String c(); @GetMapping("/d") String d(); }
+                """);
+        Path out = root.resolve("out");
+        String res = out.resolve("resolutions.yml").toString();
+        RepositoryTablesTest.run("discover", root, "--resolutions", res);
+        RepositoryTablesTest.run("map", root, "--resolutions", res, "--out", out.toString());
+        JsonNode g = new ObjectMapper().readTree(out.resolve("graph.json").toFile());
+        String x = "external:https://api.example.com GET /";
+        // fallback and @Recover declared in a superclass
+        assertEquals(List.of("edge " + x + "a", "fallback @CircuitBreaker(name = \"x\") > call Base.sup > edge " + x + "d"), paths(g, "rs-service GET /sup"));
+        assertEquals(List.of("retry @org.springframework.retry.annotation.Retryable > edge " + x + "a",
+                "fallback @org.springframework.retry.annotation.Retryable > call Base.rec > edge " + x + "c"), paths(g, "rs-service GET /rq"));
+        // a same-name fallback whose parameters don't match: traced without crashing, low confidence
+        assertEquals(List.of("call Api.n > edge " + x + "a", "call Api.n > fallback @CircuitBreaker(name = \"x\") > call Api.few > edge " + x + "b"),
+                paths(g, "rs-service GET /neg"));
+        for (JsonNode e : g.get("edges")) {
+            if (e.get("from").asText().equals("rs-service GET /neg")) {
+                assertEquals(e.get("to").asText().endsWith("/b"), e.has("confidence"), e.toString());
+            }
+        }
+        // two annotations naming one fallback: one fallback node
+        assertEquals(List.of("retry @Retry(name = \"x\", fallbackMethod = \"f\") > edge " + x + "a",
+                "fallback @CircuitBreaker(name = \"x\") > call Api.f > edge " + x + "b"), paths(g, "rs-service GET /dup"));
     }
 }
