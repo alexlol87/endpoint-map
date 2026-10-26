@@ -139,14 +139,16 @@ public final class FlowTracer {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
-                Map<String, ArgValue> calleeArgs = call instanceof MethodCallExpr mc
-                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : Map.of();
-                Result r = walk(callee, calleeArgs, service, config, stack, partial);
-                backTo = Math.min(backTo, r.backTo());
-                for (Found f : r.found()) {
-                    List<String> via = new ArrayList<>(List.of(label(callee)));
-                    via.addAll(f.via());
-                    add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low()));
+                List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : List.of(Map.of());
+                for (Map<String, ArgValue> calleeArgs : bound) {
+                    Result r = walk(callee, calleeArgs, service, config, stack, partial);
+                    backTo = Math.min(backTo, r.backTo());
+                    for (Found f : r.found()) {
+                        List<String> via = new ArrayList<>(List.of(label(callee)));
+                        via.addAll(f.via());
+                        add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low()));
+                    }
                 }
             }
         }

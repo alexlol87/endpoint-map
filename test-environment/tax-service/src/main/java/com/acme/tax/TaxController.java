@@ -1,5 +1,6 @@
 package com.acme.tax;
 
+import com.acme.libs.common.TaxRatesApi;
 import java.util.Map;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
@@ -10,7 +11,7 @@ import org.springframework.web.bind.annotation.RestController;
 
 @RestController
 @RequestMapping("/tax")
-public class TaxController {
+public class TaxController implements TaxRatesApi {
 
     private final TaxService service;
 
@@ -23,7 +24,8 @@ public class TaxController {
         return service.allRates();
     }
 
-    @GetMapping("/rates/{region}")
+    /** Mapping inherited from the library's @HttpExchange interface. */
+    @Override
     public Map<String, Object> rate(@PathVariable String region) {
         return Map.of("region", region, "rate", service.rate(region));
     }

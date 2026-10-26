@@ -6,6 +6,8 @@ import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.endpoints.Endpoint;
 import com.endpointmap.graph.GraphWriter;
 import com.endpointmap.outbound.FeignDetector;
+import com.endpointmap.outbound.HttpExchangeDetector;
+import com.endpointmap.outbound.RestTemplateDetector;
 import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
 import com.endpointmap.resolutions.Resolutions;
@@ -97,7 +99,8 @@ public final class Main {
         Types types = new Types(ws);
         ConstantEvaluator constants = new ConstantEvaluator(types);
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
-        List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls));
+        List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
+                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         List<Map<String, Object>> edges = new ArrayList<>();
