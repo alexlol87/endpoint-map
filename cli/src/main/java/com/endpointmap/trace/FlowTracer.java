@@ -143,9 +143,13 @@ public final class FlowTracer {
         return result;
     }
 
-    /** First path found wins (deterministic), except that a certain path replaces a low-confidence one. */
+    /**
+     * A certain path beats a low-confidence one, then the shorter {@code via} wins (a memoized result reached through
+     * a cycle can carry a longer, looping chain), then the first found.
+     */
     private static void add(Map<Key, Found> found, Found f) {
-        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> a.lowConfidence() && !b.lowConfidence() ? b : a);
+        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> a.lowConfidence() != b.lowConfidence()
+                ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a);
     }
 
     /** Static type of the call's receiver and its supertypes; empty when it has no scope or it can't be told. */

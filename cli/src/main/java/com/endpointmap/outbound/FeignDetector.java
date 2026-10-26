@@ -50,7 +50,9 @@ public final class FeignDetector implements OutboundDetector {
             String name = attr(feign.get(), site, "name", "value").orElse("?");
             Optional<String> rawUrl = attrRaw(feign.get(), "url").filter(u -> !u.isBlank());
             String url = rawUrl.map(u -> ConfigResolver.resolve(u, site.config())).orElse(null);
-            String key = rawUrl.isEmpty() ? "feign:" + name : url.contains("{*}") ? rawUrl.get() : null;
+            // a url the evaluator can't read (a constant from a jar) leaves nothing to name: the call site is the key
+            String key = rawUrl.isPresent() ? (url.contains("{*}") ? rawUrl.get() : null)
+                    : hasAttr(feign.get(), "url") ? null : "feign:" + name;
             String prefix = attr(feign.get(), site, "path").orElse("");
             for (String verb : mapping.get().verbs()) {
                 for (String path : mapping.get().paths()) {
@@ -65,6 +67,10 @@ public final class FeignDetector implements OutboundDetector {
 
     private Optional<String> attr(AnnotationExpr a, CallSite site, String... names) {
         return attrRaw(a, names).map(v -> ConfigResolver.resolve(v, site.config()));
+    }
+
+    private static boolean hasAttr(AnnotationExpr a, String name) {
+        return a instanceof NormalAnnotationExpr n && n.getPairs().stream().anyMatch(p -> p.getNameAsString().equals(name));
     }
 
     private Optional<String> attrRaw(AnnotationExpr a, String... names) {

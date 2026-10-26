@@ -18,18 +18,21 @@ public class NotificationController {
     private final Notifier smsNotifier;          // narrowed by @Qualifier
     private final List<Notifier> allNotifiers;   // every implementation, in a loop
     private final UserProfileClient profiles;
+    private final LoyaltyClient loyalty;
 
     public NotificationController(Notifier primaryNotifier, @Qualifier("sms") Notifier smsNotifier,
-                                  List<Notifier> allNotifiers, UserProfileClient profiles) {
+                                  List<Notifier> allNotifiers, UserProfileClient profiles, LoyaltyClient loyalty) {
         this.primaryNotifier = primaryNotifier;
         this.smsNotifier = smsNotifier;
         this.allNotifiers = allNotifiers;
         this.profiles = profiles;
+        this.loyalty = loyalty;
     }
 
     @PostMapping("/{userId}")
     public void notifyUser(@PathVariable String userId, @RequestBody Map<String, String> body) {
         Map<String, Object> profile = profiles.getProfile(userId);
+        Map<String, Object> tier = loyalty.getTier(userId);
         if (Boolean.TRUE.equals(profile.get("smsOptIn"))) {
             smsNotifier.notify(userId, body.get("text")).block();
         } else {

@@ -68,6 +68,9 @@ class FeignTraceTest {
         // ${inventory.base-url} from application-prod.yml: http://inventory-service.prod.svc.cluster.local
         assertEquals(List.of("OrderService.create", "InventoryFeignClient.getStock"),
                 strings(env.edge(CREATE, "inventory-service GET /inventory/{sku}").get("via")));
+        // internal DNS that looks public stays external until resolutions.yml says otherwise (ResolutionsLoopTest)
+        env.edge("notification-service POST /notifications/{userId}",
+                "external:https://loyalty-service.prod.acme.io GET /loyalty/{userId}/tier");
     }
 
     @Test

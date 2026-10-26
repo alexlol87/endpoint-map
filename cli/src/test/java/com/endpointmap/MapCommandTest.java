@@ -339,10 +339,11 @@ class MapCommandTest {
     }
 
     @Test
-    void usageAndDiscoverStub() {
+    void usageAndDiscoverStub() throws Exception {
         assertEquals(2, run().code);
         assertEquals(2, run("map", "--root", TEST_ENV.toString(), "--bogus", "x").code);
-        assertEquals(0, run("discover", "--root", TEST_ENV.toString(), "--profile", "prod").code);
+        Path res = Files.createTempDirectory("em").resolve("resolutions.yml");
+        assertEquals(0, run("discover", "--root", TEST_ENV.toString(), "--profile", "prod", "--resolutions", res.toString()).code);
     }
 
     // --- helpers ---
