@@ -62,9 +62,8 @@ public final class GraphWriter {
                 .thenComparing(e -> String.valueOf(e.get("via")))
                 .thenComparing(e -> (String) e.get("file"))
                 .thenComparing(e -> (Integer) e.get("line")));
-        // flows are filled in by the caller (FlowTree), which needs the written edge order for its indexes
         return ordered("services", services, "nodes", new ArrayList<>(nodes.values()),
-                "edges", sortedEdges, "flows", Map.of());
+                "edges", sortedEdges); // the caller adds "flows" (FlowTree): its leaves index these edges
     }
 
     public static String toJson(Map<String, Object> graph) {

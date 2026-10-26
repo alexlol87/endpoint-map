@@ -60,15 +60,18 @@ class FlowTreeTest {
         n.get("children").forEach(c -> walk(graph, c, here + " > ", out));
     }
 
+    /** Contract: every edge is a leaf at least once, maybe under several paths, never twice under one parent. */
     @Test
-    void everyEdgeIsOneLeafOfItsEndpointsFlow() {
+    void everyEdgeIsALeafOfItsEndpointsFlowAndNoLeafRepeatsUnderOneParent() {
         List<JsonNode> edges = list(graph.get("edges"));
         Set<Integer> seen = new TreeSet<>();
         graph.get("flows").fields().forEachRemaining(f -> collect(f.getValue(), f.getKey(), edges, seen));
-        assertEquals(edges.size(), seen.size()); // L1/L2 (the edges) and the flow leaves are the same set
+        assertEquals(edges.size(), seen.size()); // the leaf set equals the edge set (L1/L2)
     }
 
     private static void collect(JsonNode n, String endpoint, List<JsonNode> edges, Set<Integer> seen) {
+        Set<String> kids = new java.util.HashSet<>();
+        n.path("children").forEach(c -> assertTrue(kids.add(c.toString()), "repeated under one parent in " + endpoint + ": " + c));
         if (n.has("edge")) {
             int i = n.get("edge").asInt();
             assertEquals(endpoint, edges.get(i).get("from").asText());
@@ -83,11 +86,11 @@ class FlowTreeTest {
         List<String> p = paths(graph, "order-service POST /api/orders/{id}/checkout");
         // controller -> handler impl -> service -> pricing -> tax (ternary else) -> utils; MoneyUtils leads to no edge
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call OrderPricingService.finalTotal"
-                + " > call OrderTaxService.rateFor > else > call TaxRestUtils.fetchRate > edge tax-service GET /tax-api/tax/rates/{region}"), p.toString());
+                + " > call OrderTaxService.rateFor > else \"XX\".equals(region) > call TaxRestUtils.fetchRate > edge tax-service GET /tax-api/tax/rates/{region}"), p.toString());
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call FulfilmentService.payAndShip"
                 + " > if express > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments/express"), p.toString());
         assertTrue(p.contains("call CheckoutHandlerImpl.handle > call CheckoutService.checkout > call FulfilmentService.payAndShip"
-                + " > else > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments"), p.toString());
+                + " > else express > unresolved unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments"), p.toString());
         assertFalse(p.toString().contains("MoneyUtils"), p.toString());
     }
 
@@ -97,7 +100,7 @@ class FlowTreeTest {
         assertTrue(p.contains("call OrderService.create > loop for (String sku : request.skus())"
                 + " > if ((Number) stock.get(\"available\")).intValue() > 0 > edge inventory-service PUT /inventory/{sku}/reserve"), p.toString());
         assertTrue(p.contains("call OrderService.create > loop for (String sku : request.skus())"
-                + " > else > edge inventory-service PATCH /inventory/{sku}/quantity"), p.toString());
+                + " > else ((Number) stock.get(\"available\")).intValue() > 0 > edge inventory-service PATCH /inventory/{sku}/quantity"), p.toString());
         assertTrue(p.contains("call OrderService.create > try > call PaymentClient.charge"
                 + " > unresolved unresolved:order-service:${PAYMENT_SERVICE_URL} POST /payments/charge"), p.toString());
         assertTrue(p.contains("call OrderService.create > catch FeignException > loop request.skus().forEach"
@@ -115,6 +118,25 @@ class FlowTreeTest {
                 + " > loop while (updated == 0 && repository.existsBySku(sku)) > edge db:inventory-service:stock_item"));
         assertTrue(paths(graph, "report-service GET /reports/{type}").contains("call ReportService.build"
                 + " > loop do ... while (!chunk.isEmpty()) > edge db:report-service:report_rows"));
+    }
+
+    @Test
+    void aCallReachedFromBothBranchesIsUnderBoth() {
+        List<String> p = paths(graph, "notification-service POST /notifications/{userId}");
+        String cond = "Boolean.TRUE.equals(profile.get(\"smsOptIn\"))";
+        assertTrue(p.contains("if " + cond + " > call SmsNotifier.notify > edge notification-service POST /notifications/sms"), p.toString());
+        assertTrue(p.contains("else " + cond + " > call PushNotifier.notify > edge external:https://fcm.googleapis.com POST /v1/projects/acme/messages:send"), p.toString());
+        // one edge, two places: the stream loop and the direct call in ReportService.build
+        List<String> r = paths(graph, "report-service GET /reports/{type}");
+        assertTrue(r.contains("call ReportService.build > loop rows.stream().filter(r -> r.get(\"orderId\") != null).forEach"
+                + " > call InternalRestTemplateClient.fetch > edge order-service GET /api/orders/{id}"), r.toString());
+        assertTrue(r.contains("call ReportService.build > call InternalRestTemplateClient.fetch > edge order-service GET /api/orders/{id}"), r.toString());
+    }
+
+    @Test
+    void elseOfAPrunedIfStillCarriesTheCondition() {
+        assertTrue(paths(graph, "pricing-service GET /prices/{sku}").contains("call PriceService.price > else \"EUR\".equals(currency)"
+                + " > call PriceService.convert > edge external:https://api.exchangerate.host GET /convert"));
     }
 
     @Test
@@ -152,6 +174,8 @@ class FlowTreeTest {
                     Util.pure(n);
                     for (int i = 0; i < n; i++) { ext.a(); }
                     if (n > 0) { run(ids, n - 1); }
+                    ids.parallelStream().map(id -> ext.b()).toList();
+                    reactor.core.publisher.Flux.fromStream(ids.stream()).map(id -> ext.a());
                     return ids.stream().map(id -> ext.b()).toList();
                   }
                 }
@@ -168,7 +192,10 @@ class FlowTreeTest {
         run("discover", root, "--resolutions", res);
         run("map", root, "--resolutions", res, "--out", out.toString());
         JsonNode g = new ObjectMapper().readTree(out.resolve("graph.json").toFile());
+        // Flux.fromStream(..).map is no Java stream loop
         assertEquals(List.of("call Svc.run > loop for (int i = 0; i < n; i++) > edge external:https://api.example.com GET /a",
+                        "call Svc.run > loop ids.parallelStream().map > edge external:https://api.example.com GET /b",
+                        "call Svc.run > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.stream().map > edge external:https://api.example.com GET /b"),
                 paths(g, "flow-service GET /f"));
     }

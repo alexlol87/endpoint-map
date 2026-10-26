@@ -50,8 +50,15 @@ public final class FlowTree {
         this.sites = sites;
     }
 
-    /** Records the path of {@code f} (traced from {@code handler}) to the graph edge {@code edge} it produced. */
+    /**
+     * Records every path of {@code f} (traced from {@code handler}) to the graph edge {@code edge} it produced: an edge
+     * reached from several places (an if and its else, two callers of one util) is a leaf under each of them.
+     */
     public void add(String endpoint, Node handler, FlowTracer.Found f, Map<String, Object> edge) {
+        f.paths().forEach(p -> add(endpoint, handler, p, edge));
+    }
+
+    private void add(String endpoint, Node handler, FlowTracer.CallPath f, Map<String, Object> edge) {
         List<String> keys = new ArrayList<>();
         List<Map<String, Object>> json = new ArrayList<>();
         String last = "";
@@ -63,7 +70,7 @@ public final class FlowTree {
         for (int i = 0; i < f.sites().size(); i++) {
             Node call = sites.apply(f.sites().get(i));
             if (call == null) {
-                break; // never happens: every site comes from FlowTracer.site
+                throw new IllegalStateException("no call recorded at " + f.sites().get(i));
             }
             controls(call, handler, keys, json);
             last = pos(call);
@@ -89,7 +96,7 @@ public final class FlowTree {
             for (Leaf l : ls) {
                 Integer idx = index.get(l.edge());
                 if (idx == null) {
-                    continue;
+                    throw new IllegalStateException("flow leaf for an edge not in graph.json: " + l.edge());
                 }
                 Step at = root;
                 for (int i = 0; i < l.keyPath().size(); i++) {
@@ -152,7 +159,8 @@ public final class FlowTree {
                 label = text(p instanceof IfStmt s ? s.getCondition() : ((ConditionalExpr) p).getCondition());
             } else if (p instanceof IfStmt s && s.getElseStmt().filter(e -> e == child).isPresent()
                     || p instanceof ConditionalExpr c && ch == c.getElseExpr()) {
-                type = "else";
+                type = "else"; // the condition it is the else of: the if side may hold no edge and be left out
+                label = text(p instanceof IfStmt s ? s.getCondition() : ((ConditionalExpr) p).getCondition());
             } else if (p instanceof SwitchEntry e && !e.getLabels().contains(ch)) {
                 type = "case";
                 label = e.getLabels().isEmpty() ? "default" : e.getLabels().stream().map(FlowTree::text).collect(Collectors.joining(", "));
@@ -189,7 +197,7 @@ public final class FlowTree {
             } else if (p instanceof MethodCallExpr m && streamLoop(m) && (ch instanceof LambdaExpr || ch instanceof MethodReferenceExpr)
                     && m.getArguments().contains(ch)) {
                 type = "loop";
-                label = m.getScope().map(s -> text(s) + ".").orElse("") + m.getNameAsString();
+                label = m.getScope().map(s -> text(s).replaceAll("\\s+\\.", ".") + ".").orElse("") + m.getNameAsString();
             }
             if (type != null) {
                 k.add(0, pos(at) + ":" + type + ":" + label);
@@ -204,9 +212,21 @@ public final class FlowTree {
     /** {@code x.forEach(..)}, or {@code map/flatMap} on a Java stream: each element runs the lambda. */
     private static boolean streamLoop(MethodCallExpr m) {
         String name = m.getNameAsString();
-        return name.equals("forEach") || name.equals("forEachOrdered")
-                || (name.equals("map") || name.equals("flatMap")) && m.getScope().map(FlowTree::text)
-                .filter(s -> s.contains("stream()") || s.contains("Stream.")).isPresent();
+        if (name.equals("forEach") || name.equals("forEachOrdered")) {
+            return true;
+        }
+        if (!name.equals("map") && !name.equals("flatMap")) {
+            return false;
+        }
+        // a Java stream somewhere up the chain: list.stream(), parallelStream(), Stream.of(..); not Flux.fromStream(..)
+        for (Node n = m.getScope().orElse(null); n instanceof MethodCallExpr c; n = c.getScope().orElse(null)) {
+            String cn = c.getNameAsString();
+            if (cn.equals("stream") || cn.equals("parallelStream")
+                    || c.getScope().filter(sc -> sc.toString().matches("(Int|Long|Double)?Stream")).isPresent()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static Map<String, Object> node(String type, String label) {
