@@ -306,7 +306,7 @@ public final class FlowTracer {
                 run = run.stream().filter(i -> kept.stream().anyMatch(k -> k == i.on())).toList();
             }
             if (run.size() > 1) { // the flow tree groups the implementations under one oneOf node
-                oneOf.put(site(call), c.methods().get(0).findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString()).orElse(""));
+                oneOf.put(service.name() + " " + site(call), c.methods().get(0).findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString()).orElse(""));
             }
             for (Impl impl : run) {
                 MethodDeclaration callee = impl.method();
@@ -615,6 +615,7 @@ public final class FlowTracer {
                 && l.getParentNode().orElse(null) instanceof MethodCallExpr each && each.getNameAsString().equals("forEach")
                 && each.getScope().isPresent() && !(each.getScope().get() instanceof MethodCallExpr)) {
             // notifiers.forEach(n -> ..) over a List<Notifier>: n is its element type
+            // shortcut: only variable/field.forEach(lambda); getX().forEach, stream().forEach, method refs, wildcards are not typed
             String owner = each.getScope().get() instanceof FieldAccessExpr fa ? fa.getNameAsString() : each.getScope().get().toString();
             return declared(owner, each).filter(ClassOrInterfaceType.class::isInstance).map(ClassOrInterfaceType.class::cast)
                     .flatMap(ClassOrInterfaceType::getTypeArguments).filter(a -> a.size() == 1).map(a -> a.get(0));
@@ -688,9 +689,12 @@ public final class FlowTracer {
         return byName(call).methods().stream().map(m -> m.getType().asString()).toList();
     }
 
-    /** The interface called at a {@link Found#sites()} entry when it dispatches to several implementations, else null. */
-    public String oneOf(String site) {
-        return oneOf.get(site);
+    /**
+     * The interface called at a {@link Found#sites()} entry when, traced for {@code service} (its config and beans), it
+     * dispatches to several implementations; else null. A library call site can dispatch differently per service.
+     */
+    public String oneOf(String service, String site) {
+        return oneOf.get(service + " " + site);
     }
 
     /** The call expression at a {@link Found#sites()} entry (for the flow tree). */

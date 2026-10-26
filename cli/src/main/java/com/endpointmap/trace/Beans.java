@@ -114,8 +114,8 @@ final class Beans {
         Set<String> out = new HashSet<>(values(c, "Qualifier", "value"));
         c.getAnnotations().stream().filter(a -> STEREOTYPES.contains(a.getName().getIdentifier()))
                 .forEach(a -> out.addAll(values(a, "value")));
-        String n = c.getNameAsString(); // Spring's default: PushNotifier -> pushNotifier, URLApi stays
-        out.add(n.length() > 1 && Character.isUpperCase(n.charAt(1)) ? n : Character.toLowerCase(n.charAt(0)) + n.substring(1));
+        String n = c.getNameAsString(); // Spring's default for a scanned class: PushNotifier -> pushNotifier, URLApi stays
+        if (c.getAnnotations().stream().anyMatch(a -> STEREOTYPES.contains(a.getName().getIdentifier()))) out.add(n.length() > 1 && Character.isUpperCase(n.charAt(1)) ? n : Character.toLowerCase(n.charAt(0)) + n.substring(1));
         creators(c, visible).forEach(b -> out.addAll(b.names()));
         return out;
     }
@@ -125,8 +125,10 @@ final class Beans {
     }
 
     private static List<BeanMethod> creators(ClassOrInterfaceDeclaration c, List<BeanMethod> visible) {
-        return visible.stream().filter(b -> b.method().findAll(ObjectCreationExpr.class).stream()
-                .anyMatch(o -> o.getType().getNameAsString().equals(c.getNameAsString()))).toList();
+        // only what the method returns: new FooInterceptor() inside a RestTemplate @Bean is no FooInterceptor bean
+        return visible.stream().filter(b -> b.method().findAll(com.github.javaparser.ast.stmt.ReturnStmt.class).stream()
+                .anyMatch(r -> r.getExpression().filter(ObjectCreationExpr.class::isInstance)
+                        .map(o -> ((ObjectCreationExpr) o).getType().getNameAsString().equals(c.getNameAsString())).orElse(false))).toList();
     }
 
     /** {@code @ConditionalOnProperty} on the class, checked against the service's config (prefix, name/value, havingValue, matchIfMissing). */

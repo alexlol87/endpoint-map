@@ -137,4 +137,79 @@ class PolymorphismTest {
         assertTrue(low.stream().allMatch(e -> e.path("confidence").asText().equals("low")), low.toString());
         g.get("edges").forEach(e -> assertTrue(e.get("from").asText().equals("svc-a GET /low") || !e.has("confidence"), e.toString()));
     }
+
+    @Test
+    void libraryCallSiteIsOneOfOnlyWhereSeveralImplementationsLeadToEdges(@TempDir Path root) throws Exception {
+        // a library facade loops over List<Pay>; CardPay is on only where card.on=true, CashPay makes no call
+        Path l = root.resolve("lib-pay/src/main/java/l");
+        String imports = "import org.springframework.web.reactive.function.client.WebClient;\nimport reactor.core.publisher.Mono;\n";
+        String call = "{ return WebClient.create(\"http://svc-b\").get().uri(\"/b/%s\").retrieve().bodyToMono(String.class); }";
+        write(l.resolve("Pay.java"), "package l;\nimport reactor.core.publisher.Mono;\npublic interface Pay { Mono<String> pay(); }\n");
+        write(l.resolve("CardPay.java"), "package l;\n" + imports + "@org.springframework.stereotype.Component "
+                + "@org.springframework.boot.autoconfigure.condition.ConditionalOnProperty(name = \"card.on\", havingValue = \"true\")\n"
+                + "public class CardPay implements Pay {\n  public Mono<String> pay() " + call.formatted("card") + "\n}\n");
+        write(l.resolve("WirePay.java"), "package l;\n" + imports + "@org.springframework.stereotype.Component\n"
+                + "public class WirePay implements Pay {\n  public Mono<String> pay() " + call.formatted("wire") + "\n}\n");
+        write(l.resolve("CashPay.java"), "package l;\nimport reactor.core.publisher.Mono;\n@org.springframework.stereotype.Component\n"
+                + "public class CashPay implements Pay {\n  public Mono<String> pay() { return Mono.just(\"cash\"); }\n}\n");
+        write(l.resolve("Facade.java"), """
+                package l;
+                import java.util.List;
+                @org.springframework.stereotype.Component
+                public class Facade {
+                  private final List<Pay> pays;
+                  public Facade(List<Pay> pays) { this.pays = pays; }
+                  public void all() { pays.forEach(p -> p.pay().block()); }
+                }
+                """);
+        for (String svc : List.of("svc-a", "svc-c")) {
+            Path a = root.resolve(svc + "/src/main/java/" + svc.replace("-", ""));
+            String pkg = svc.replace("-", "");
+            write(a.resolve("App.java"), "package " + pkg + ";\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+            write(a.resolve("Api.java"), "package " + pkg + ";\n@org.springframework.web.bind.annotation.RestController\npublic class Api {\n"
+                    + "  private final l.Facade facade;\n  public Api(l.Facade facade) { this.facade = facade; }\n"
+                    + "  @org.springframework.web.bind.annotation.GetMapping(\"/pay\") void pay() { facade.all(); }\n}\n");
+        }
+        write(root.resolve("svc-a/src/main/resources/application.yml"), "card:\n  on: \"true\"\n");
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("Api.java"), "package b;\n@org.springframework.web.bind.annotation.RestController\npublic class Api {\n"
+                + "  @org.springframework.web.bind.annotation.GetMapping(\"/b/card\") public void card() { }\n"
+                + "  @org.springframework.web.bind.annotation.GetMapping(\"/b/wire\") public void wire() { }\n}\n");
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        run("map", root, "--resolutions", res.toString(), "--out", root.resolve("out").toString());
+        JsonNode g = new ObjectMapper().readTree(root.resolve("out/graph.json").toFile());
+        String pre = "call Facade.all > loop pays.forEach > ";
+        // two implementations reach an edge: oneOf; CashPay reaches none, so it is not a branch
+        assertEquals(List.of(pre + "oneOf Pay > call CardPay.pay > edge svc-b GET /b/card", pre + "oneOf Pay > call WirePay.pay > edge svc-b GET /b/wire"),
+                paths(g, "svc-a GET /pay"));
+        // same library call site, card.on unset: only WirePay leads to an edge, a plain call, no "one of 1"
+        assertEquals(List.of(pre + "call WirePay.pay > edge svc-b GET /b/wire"), paths(g, "svc-c GET /pay"));
+    }
+
+    @Test
+    void everyEdgeIsALeafAndNoParentRepeatsOne() {
+        // #13 contract on the whole env: `unresolved` leaves count too; one edge under two parents (two paths) is fine
+        Set<Integer> leaves = new TreeSet<>();
+        env.get("flows").forEach(f -> leaves(f, leaves));
+        for (int i = 0; i < env.get("edges").size(); i++) {
+            assertTrue(leaves.contains(i), "edge " + i + " is no flow leaf: " + env.get("edges").get(i));
+        }
+    }
+
+    private static void leaves(JsonNode n, Set<Integer> out) {
+        List<String> kids = new ArrayList<>();
+        // two calls of one method at two lines are separate children; one edge twice under one parent is not
+        n.path("children").forEach(c -> {
+            if (c.has("edge")) {
+                kids.add(c.get("type").asText() + c.get("edge").asText());
+            }
+        });
+        assertEquals(kids.size(), new TreeSet<>(kids).size(), "duplicate edge leaves: " + n);
+        if (n.has("edge")) {
+            out.add(n.get("edge").asInt());
+        }
+        n.path("children").forEach(c -> leaves(c, out));
+    }
 }

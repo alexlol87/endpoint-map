@@ -159,7 +159,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
-                    flows.add(e.id(), e.decl(), f, edge);
+                    flows.add(e.id(), repo.name(), e.decl(), f, edge);
                     continue;
                 }
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
@@ -181,7 +181,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
-                    flows.add(e.id(), e.decl(), f, edge);
+                    flows.add(e.id(), repo.name(), e.decl(), f, edge);
                     continue;
                 }
                 TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
@@ -202,7 +202,7 @@ public final class Main {
                         edge.put("confidence", "low");
                     }
                     edges.add(edge);
-                    flows.add(e.id(), e.decl(), f, edge);
+                    flows.add(e.id(), repo.name(), e.decl(), f, edge);
                     if (t.node() != null) {
                         targets.putIfAbsent(t.id(), t.node());
                     }
