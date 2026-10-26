@@ -15,6 +15,7 @@ import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
+import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import java.util.ArrayList;
 import java.util.List;
@@ -53,7 +54,9 @@ public final class RedisDetector implements OutboundDetector {
             return List.of();
         }
         if (site.callees().size() == 1) {
-            return cache(site.callees().get(0));
+            // a call on this (or no scope) bypasses Spring's cache proxy: no cache is touched
+            boolean self = mc.getScope().map(ThisExpr.class::isInstance).orElse(true);
+            return self ? List.of() : cache(site.callees().get(0));
         }
         ClassOrInterfaceType t = site.receiverType();
         if (t == null || !site.receiverTypes().isEmpty() || !Types.fromPackage(t, "org.springframework.data.redis.")) {
@@ -62,27 +65,26 @@ public final class RedisDetector implements OutboundDetector {
         String type = t.getNameAsString();
         String name = mc.getNameAsString();
         if (TEMPLATES.contains(type) && KEY_OPS.contains(name) && !mc.getArguments().isEmpty()) {
-            return List.of(key(mc.getArgument(0), name, type + "." + name, site));
+            return key(mc.getArgument(0), name, type + "." + name, site);
         }
         // redis.opsForHash().put(key, ..): detected at opsForHash, whose parent call is the op
         if (TEMPLATES.contains(type) && STRUCTURES.containsKey(name) && mc.getParentNode().orElse(null) instanceof MethodCallExpr op
                 && op.getScope().orElse(null) == mc && !op.getArguments().isEmpty()) {
-            return List.of(key(op.getArgument(0), STRUCTURES.get(name) + "." + op.getNameAsString(),
-                    type + "." + name + "." + op.getNameAsString(), site));
+            return key(op.getArgument(0), STRUCTURES.get(name) + "." + op.getNameAsString(),
+                    type + "." + name + "." + op.getNameAsString(), site);
         }
         String structure = type.replaceFirst("^Reactive", "").replaceFirst("Operations$", "");
         String ops = "opsFor" + structure.replace("Zset", "ZSet");
         if (type.endsWith("Operations") && STRUCTURES.containsKey(ops) && !mc.getArguments().isEmpty()) {
-            return List.of(key(mc.getArgument(0), STRUCTURES.get(ops) + "." + name, type + "." + name, site));
+            return key(mc.getArgument(0), STRUCTURES.get(ops) + "." + name, type + "." + name, site);
         }
         return List.of();
     }
 
-    private OutboundCall key(Expression e, String op, String label, CallSite site) {
-        List<String> patterns = urls.each(Env.of(site), env -> pattern(urls.string(e, env).text())).stream().distinct().toList();
-        // shortcut: several possible keys keep only the first; list them all if a real service builds keys by branches
-        String p = patterns.isEmpty() ? "*" : patterns.get(0);
-        return OutboundCall.redis(p, null, op, label, false); // redis:* itself says the key is unknown
+    /** One call per distinct key pattern the key may take (branches, profiles), sorted; redis:* says it is unknown. */
+    private List<OutboundCall> key(Expression e, String op, String label, CallSite site) {
+        List<String> patterns = urls.each(Env.of(site), env -> pattern(urls.string(e, env).text())).stream().distinct().sorted().toList();
+        return (patterns.isEmpty() ? List.of("*") : patterns).stream().map(p -> OutboundCall.redis(p, null, op, label, false)).toList();
     }
 
     /** The key's literal prefix up to the first part not known from code, then {@code *}. */
@@ -95,8 +97,8 @@ public final class RedisDetector implements OutboundDetector {
         return cut == key.length() ? key : key.substring(0, cut) + "*";
     }
 
-    // shortcut: the cache manager is assumed to be Redis and self-invocation (no proxy) still counts; check the
-    // CacheManager bean and the receiver when a service mixes cache stores
+    // shortcut: the cache manager is assumed to be Redis, and only the called declaration's annotations are read (not
+    // those of the implementations walked below an interface); check the CacheManager bean / impls when real code needs it
     private List<OutboundCall> cache(MethodDeclaration m) {
         TypeDeclaration<?> owner = m.findAncestor(TypeDeclaration.class).orElse(null);
         String label = (owner == null ? "" : owner.getNameAsString() + ".") + m.getNameAsString();
@@ -105,13 +107,13 @@ public final class RedisDetector implements OutboundDetector {
         List<OutboundCall> out = new ArrayList<>();
         for (AnnotationExpr top : m.getAnnotations()) {
             for (AnnotationExpr a : top.findAll(AnnotationExpr.class)) {
-                String op = CACHE_OPS.get(a.getNameAsString());
+                String op = CACHE_OPS.get(a.getName().getIdentifier());
                 if (op == null) {
                     continue;
                 }
                 List<String> names = names(a);
                 for (String n : names.isEmpty() ? defaults : names) {
-                    out.add(OutboundCall.redis(n + "::*", n, op, "@" + a.getNameAsString() + " " + label, false));
+                    out.add(OutboundCall.redis(n.equals("*") ? "*" : n + "::*", n.equals("*") ? null : n, op, "@" + a.getName().getIdentifier() + " " + label, false));
                 }
             }
         }
@@ -130,7 +132,7 @@ public final class RedisDetector implements OutboundDetector {
         List<String> out = new ArrayList<>();
         for (Expression v : values) {
             for (Expression e : v instanceof ArrayInitializerExpr arr ? arr.getValues() : List.of(v)) {
-                out.add(constants.eval(e, a).orElse(e.toString()));
+                out.add(constants.eval(e, a).orElse("*")); // not known from code: redis:*, listed in the report
             }
         }
         return out;

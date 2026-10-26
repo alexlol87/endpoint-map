@@ -140,7 +140,7 @@ Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) an
 | `ReactiveRedisTemplate` opsForHash / expire / delete / opsForValue | cart-service |
 | `ReactiveStringRedisTemplate` opsForList / opsForValue.increment / opsForZSet | analytics-service |
 | `ReactiveStringRedisTemplate` opsForSet / opsForHash + `@Cacheable` on a Mono method | warehouse-service |
-| Deep chain controller -> `SessionHandler` -> `SessionService` (`@CacheConfig` default name, `@Caching` with two `@CacheEvict`, one name from a constant) -> `SessionStore` (`HashOperations` variable, keys from the `SessionKeys` util and its constant prefix, `opsForSet().remove`, a key passed in whole -> `redis:*`) | customer-service `GET/DELETE /customers/{id}/session` |
+| Deep chain controller -> `SessionHandler` -> `SessionService` (`@CacheConfig` default name, `@Caching` with two `@CacheEvict`, one name from a constant) -> `SessionStore` (`HashOperations` variable, keys from the `SessionKeys` util and its constant prefix, `opsForSet().remove`, a key with two possible prefixes -> `guest:*` and `session:*`, a key passed in whole -> `redis:*` (listed in discover-report.md), `@Cacheable current(..)` called on `this` -> no cache edge) | customer-service `GET/DELETE /customers/{id}/session` |
 
 ### Control flow
 | Case | Location |

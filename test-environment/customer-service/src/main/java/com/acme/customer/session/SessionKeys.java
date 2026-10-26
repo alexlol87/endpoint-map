@@ -5,6 +5,7 @@ public final class SessionKeys {
 
     public static final String PREFIX = "session:";
     public static final String ACTIVE = PREFIX + "active";
+    public static final String GUEST = "guest:";
     public static final String TOKENS_CACHE = "session-tokens";
 
     private SessionKeys() {

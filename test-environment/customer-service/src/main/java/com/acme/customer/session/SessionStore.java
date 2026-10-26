@@ -24,7 +24,8 @@ public class SessionStore {
     }
 
     public void remove(long customerId, String token) {
-        redis.delete(SessionKeys.session(customerId));
+        // a guest (negative id) and a customer have different keys: both are possible
+        redis.delete(customerId < 0 ? SessionKeys.GUEST + customerId : SessionKeys.session(customerId));
         redis.opsForSet().remove(SessionKeys.ACTIVE, String.valueOf(customerId));
         redis.delete(token); // the token is the whole key: nothing known from code
     }

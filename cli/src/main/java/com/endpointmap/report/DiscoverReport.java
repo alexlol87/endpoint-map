@@ -42,6 +42,9 @@ public final class DiscoverReport {
                 .map(f -> "`" + f.service() + "` -> `" + f.key().substring(5) + "`: "
                         + valueOrBlank(resolutions.value(f.service(), f.key())) + ". " + f.hint()).toList());
         section(md, "Unresolved targets", unresolved.stream().map(u -> "`" + u.replaceFirst(": ", "`: ")).toList());
+        section(md, "Redis keys not known from code (`redis:*`)", ((List<?>) graph.get("edges")).stream().map(e -> (Map<?, ?>) e)
+                .filter(e -> "redis:*".equals(e.get("to"))).map(e -> "`" + e.get("from") + "`: " + e.get("op") + " at "
+                        + e.get("file") + ":" + e.get("line")).distinct().toList());
         section(md, "Endpoints mapped by more than one handler", nodes.stream().filter(n -> n.containsKey("alsoHandledBy"))
                 .map(n -> "`" + n.get("id") + "`: " + n.get("handler") + ", " + n.get("alsoHandledBy")).toList());
         section(md, "Tracing problems", traceWarnings);

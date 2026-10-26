@@ -25,6 +25,9 @@ public class SessionService {
 
     @Caching(evict = {@CacheEvict(key = "#customerId"), @CacheEvict(cacheNames = SessionKeys.TOKENS_CACHE, allEntries = true)})
     public void logout(long customerId, String token) {
+        if (current(customerId).isEmpty()) { // self-invocation: no proxy, so no cache, but the store is read
+            return;
+        }
         store.remove(customerId, token);
     }
 }
