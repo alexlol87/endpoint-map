@@ -54,7 +54,34 @@ public final class FlowTracer {
      * other arguments, so its URL may belong to another path through the same call site.
      */
     public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites,
-                        String wrapper, boolean lossy) {
+                        String wrapper, boolean lossy, List<CallPath> paths) {
+    }
+
+    /**
+     * One distinct way to reach a Found's call (for the flow tree): its {@code via} and {@code sites}. A Found keeps at
+     * most {@link #MAX_FLOW_PATHS}, the first ones in walk order; the edge itself is one whatever the count. {@code cut}:
+     * a marker that more paths went on from the end of {@code sites} (the method they were dropped in) and are not listed.
+     */
+    public record CallPath(List<String> via, List<String> sites, boolean cut) {
+    }
+
+    /** shortcut: paths beyond this per call and method are dropped from the flow tree (not from edges), leaving a cut marker. */
+    public static final int MAX_FLOW_PATHS = 64;
+
+    private static List<CallPath> union(List<CallPath> a, List<CallPath> b) {
+        List<CallPath> all = new LinkedHashSet<>(Stream.concat(a.stream(), b.stream()).toList()).stream().toList();
+        List<CallPath> real = all.stream().filter(p -> !p.cut()).toList();
+        List<CallPath> out = new ArrayList<>(real.stream().limit(MAX_FLOW_PATHS).toList());
+        all.stream().filter(CallPath::cut).limit(MAX_FLOW_PATHS).forEach(out::add);
+        if (real.size() > MAX_FLOW_PATHS && !out.contains(new CallPath(List.of(), List.of(), true))) {
+            out.add(new CallPath(List.of(), List.of(), true));
+        }
+        return out;
+    }
+
+    private static List<CallPath> prepend(List<CallPath> paths, String via, String site) {
+        return paths.stream().map(p -> new CallPath(Stream.concat(Stream.ofNullable(via), p.via().stream()).toList(),
+                Stream.concat(Stream.ofNullable(site), p.sites().stream()).toList(), p.cut())).toList();
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
@@ -151,7 +178,7 @@ public final class FlowTracer {
                 Result ri = walk(impl.method(), ownTypeArgs(impl.on(), Map.of()), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
                 lossyAll.addAll(ri.lossy());
                 ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl.method())), f.via().stream()).toList(),
-                        f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy())));
+                        f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy(), prepend(f.paths(), label(impl.method()), null))));
             }
             r = new Result(all, Integer.MAX_VALUE, Set.copyOf(lossyAll));
         }
@@ -175,7 +202,8 @@ public final class FlowTracer {
             String eg = site.stream().filter(f -> f.call().baseUrl() != null).findFirst().orElse(first).call().source();
             add(out, new Found(new OutboundCall(c.client(), verb, null, "{*}", null,
                     "one of " + site.size() + " combinations, e.g. " + eg, c.label()), first.via(), first.file(),
-                    first.line(), first.lowConfidence(), first.sites(), first.wrapper(), first.lossy()));
+                    first.line(), first.lowConfidence(), first.sites(), first.wrapper(), first.lossy(),
+                    site.stream().map(Found::paths).reduce(List.of(), FlowTracer::union)));
         }
         return List.copyOf(out.values());
     }
@@ -216,7 +244,7 @@ public final class FlowTracer {
             Set<String> names = new java.util.TreeSet<>(c.lossy());
             names.add(cluster);
             return new Result(c.found().stream().map(f -> new Found(f.call(), f.via(), f.file(), f.line(), f.lowConfidence(),
-                    f.sites(), f.wrapper(), true)).toList(), c.backTo(), Set.copyOf(names));
+                    f.sites(), f.wrapper(), true, f.paths())).toList(), c.backTo(), Set.copyOf(names));
         }
         Optional<? extends Node> body = m instanceof LambdaExpr l ? Optional.of(l.getBody()) : ((MethodDeclaration) m).getBody();
         if (body.isEmpty()) {
@@ -233,7 +261,7 @@ public final class FlowTracer {
         Map<Key, Found> found = new LinkedHashMap<>();
         Set<String> lossyHere = new java.util.TreeSet<>();
         int backTo = Integer.MAX_VALUE;
-        // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
+        // flat walk: the if/loop/try structure around each call is read back from its site by FlowTree
         for (Expression call : body.get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
             // the same in every walk of m: a recursive cluster walks m once per argument combination
@@ -251,7 +279,8 @@ public final class FlowTracer {
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
                     String wrapper = RAW_CLIENTS.contains(o.client()) && library(call)
                             ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
-                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low() || o.low(), List.of(site(call)), wrapper, false));
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low() || o.low(), List.of(site(call)), wrapper, false,
+                            List.of(new CallPath(List.of(label), List.of(site(call)), false))));
                 }
                 classified |= out.stream().anyMatch(o -> !o.cache());
             }
@@ -295,7 +324,7 @@ public final class FlowTracer {
                         String wrapper = f.wrapper() != null && library(callee) && !library(m)
                                 ? enclosingType(callee).map(TypeDeclaration::getNameAsString).orElse(f.wrapper()) : f.wrapper();
                         add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low(),
-                                List.copyOf(sites), wrapper, f.lossy()));
+                                List.copyOf(sites), wrapper, f.lossy(), prepend(f.paths(), label(callee), site(call))));
                     }
                 }
             }
@@ -322,8 +351,9 @@ public final class FlowTracer {
         found.merge(new Key(c.low() ? new OutboundCall(c.client(), c.verb(), c.baseUrl(), c.path(), c.unresolvedKey(), c.source(),
                 c.label(), c.table(), c.op(), false) : c, f.file(), f.line()), f, (a, b) -> {
             Found w = a.lowConfidence() != b.lowConfidence() ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a;
-            return a.lossy() || b.lossy() // lossy if either path was, so the capped grouping still sees it
-                    ? new Found(w.call(), w.via(), w.file(), w.line(), w.lowConfidence(), w.sites(), w.wrapper(), true) : w;
+            // lossy if either path was, so the capped grouping still sees it; the flow tree keeps both paths
+            return new Found(w.call(), w.via(), w.file(), w.line(), w.lowConfidence(), w.sites(), w.wrapper(), a.lossy() || b.lossy(),
+                    union(a.paths(), b.paths()));
         });
     }
 
@@ -626,7 +656,16 @@ public final class FlowTracer {
 
     private String site(Expression call) {
         Node at = call instanceof MethodCallExpr mc ? mc.getName() : call;
-        return types.relPath(call) + ":" + at.getBegin().map(p -> p.line + ":" + p.column).orElse("0");
+        String s = types.relPath(call) + ":" + at.getBegin().map(p -> p.line + ":" + p.column).orElse("0");
+        siteNodes.put(s, call);
+        return s;
+    }
+
+    private final Map<String, Expression> siteNodes = new HashMap<>();
+
+    /** The call expression at a {@link Found#sites()} entry (for the flow tree). */
+    public Node siteNode(String site) {
+        return siteNodes.get(site);
     }
 
     private static int line(Expression call) {

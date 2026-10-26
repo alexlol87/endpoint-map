@@ -62,9 +62,8 @@ public final class GraphWriter {
                 .thenComparing(e -> String.valueOf(e.get("via")))
                 .thenComparing(e -> (String) e.get("file"))
                 .thenComparing(e -> (Integer) e.get("line")));
-        // shortcut: flows (L3 tree) stay empty until M4; L1/L2 are rolled up from edges in the viewer
         return ordered("services", services, "nodes", new ArrayList<>(nodes.values()),
-                "edges", sortedEdges, "flows", Map.of());
+                "edges", sortedEdges); // the caller adds "flows" (FlowTree): its leaves index these edges
     }
 
     public static String toJson(Map<String, Object> graph) {
