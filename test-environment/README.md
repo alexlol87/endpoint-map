@@ -99,7 +99,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | `@HttpExchange` client via `WebClientAdapter`, inline and through a factory bean | recommendation-service `ExchangeConfig`, loyalty-service `CartClientConfig` |
 | `@HttpExchange` interface shared from a library | lib-reactive-clients `ShippingExchange`, used by warehouse-service |
 | `@HttpExchange` client via `RestTemplateAdapter`; the library interface is implemented by another service's controller (still an outbound call) | order-service `RestClientsConfig` + `RestockService` -> lib-common-clients `TaxRatesApi` -> tax-service `TaxController` |
-| Library wrapper, URL/verb passed as parameters (edge `client` = the wrapper class) | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service, warehouse-service -> `ReactiveHttp` |
+| Library wrapper, URL/verb passed as parameters (edge `client` = the outermost library class the service calls, `transport` = the client underneath) | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service, warehouse-service -> `ReactiveHttp` |
 | Wrapper objects built with `new`: in a constructor (`new ReactiveHttp(WebClient.create(url))`), as a `@Bean`, inline `new ReactiveHttp(url).post(..)` through a `this(..)` constructor | warehouse-service `RestockCoordinator` / `WarehouseHttpConfig` (`POST /warehouse/restock/{sku}`) |
 | Parameter chain: through 3 calls resolves (`threeLevels`), through 4 (`fourLevels`) or more (`level1`) -> callSites | billing-service `syncTenant` -> `DeepChainCaller` |
 | `static final` constants, constant concatenation | lib-http-clients `HttpPaths`, used by pricing-service and billing-service |

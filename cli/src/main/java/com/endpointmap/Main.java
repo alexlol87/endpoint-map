@@ -132,7 +132,8 @@ public final class Main {
                 }
                 for (TargetMatcher.Target t : matcher.match(f.call(), e.service(), callSite)) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),
-                            "client", f.call().client(), "via", f.via(), "file", f.file(), "line", f.line());
+                            "client", f.wrapper() != null ? f.wrapper() : f.call().client(), "transport", f.call().client(),
+                            "via", f.via(), "file", f.file(), "line", f.line());
                     if (f.lowConfidence()) {
                         edge.put("confidence", "low");
                     }

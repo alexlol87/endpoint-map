@@ -189,6 +189,7 @@ cy.on('tap', 'node', ev => {
 cy.on('tap', 'edge', ev => {
   details.textContent = ev.target.data('edges').map(e =>
     `${e.from}\n  -> ${e.to}\nclient: ${e.client} (${e.kind})${e.confidence ? ', confidence ' + e.confidence : ''}\n` +
+    (e.transport ? `transport: ${e.transport}\n` : '') +
     `via: ${e.via.join(' -> ')}\nat: ${e.file}:${e.line}`).join('\n\n');
 });
 document.getElementById('search').addEventListener('input', ev => {

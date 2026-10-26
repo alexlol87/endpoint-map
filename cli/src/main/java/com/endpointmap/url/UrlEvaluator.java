@@ -95,6 +95,8 @@ public final class UrlEvaluator implements ArgumentBinder {
     private static final Pattern FORMAT = Pattern.compile("%(%|n|(?:(\\d+)\\$)?[-#+ 0,(<]*\\d*(?:\\.\\d+)?[a-zA-Z])");
     /** Key prefix of an object's field in bound arguments ({@code this.webClient}). */
     private static final String THIS = "this.";
+    /** Key suffix of an object in bound arguments ({@code gw#obj}); its fields follow as {@code gw.this.<field>}. */
+    private static final String OBJ = "#obj";
     private static final Pattern ORIGIN = Pattern.compile("^([a-zA-Z][\\w+.-]*://[^/?#]*)(.*)$");
 
     /** Where an expression is evaluated: the walked method and its bound arguments, the calling service's config. */
@@ -174,6 +176,7 @@ public final class UrlEvaluator implements ArgumentBinder {
     private final Map<String, List<ClassOrInterfaceDeclaration>> declared = new HashMap<>();
     /** Every {@code new X(..)} in the workspace by the simple name of X, {@code @Bean} methods included. */
     private final Map<String, List<ObjectCreationExpr>> creations = new HashMap<>();
+    private final Map<TypeDeclaration<?>, Boolean> wraps = new java.util.IdentityHashMap<>();
 
     public UrlEvaluator(Workspace ws, Types types, ConstantEvaluator constants) {
         this.types = types;
@@ -258,6 +261,15 @@ public final class UrlEvaluator implements ArgumentBinder {
                 varargs(p, args.subList(i, args.size()), env, depth + 1, out);
                 continue;
             }
+            Optional<TypeDeclaration<?>> w = isClient || BOUND.contains(type) ? Optional.empty() : wrapper(p.getType());
+            if (w.isPresent()) { // a wrapper object: what the caller built, up to MAX_HOPS calls on
+                String name = p.getNameAsString();
+                object(w.get(), args.get(i), env, depth + 1).filter(o -> o.get(OBJ).hops() < MAX_HOPS).ifPresent(o -> {
+                    store(out, name, o);
+                    out.put(name + OBJ, new ArgValue("", o.get(OBJ).hops() + 1));
+                });
+                continue;
+            }
             if (!BOUND.contains(type) && !isClient) {
                 continue;
             }
@@ -299,11 +311,8 @@ public final class UrlEvaluator implements ArgumentBinder {
     }
 
     /**
-     * Fields of the object {@code call} is made on, when code shows how it was built: {@code new X(..).m()}, a local or
-     * field initialized (or constructor-assigned) with {@code new X(..)}; for any other receiver of a class that is not
-     * a component, every {@code new X(..)} in the calling service or a library, one per run of {@link #each}. The
-     * constructor's arguments are bound like a call's and its {@code this.f = ..} assignments (through {@code this(..)})
-     * evaluated. A call on the same object ({@code m()}, {@code this.m()}) keeps the caller's fields.
+     * Fields of the object {@code call} is made on (see {@link #object}); a call on the same object ({@code m()},
+     * {@code this.m()}) keeps the caller's fields.
      */
     private Map<String, ArgValue> receiver(CallableDeclaration<?> callee, MethodCallExpr call, Env env, int d) {
         Map<String, ArgValue> out = new HashMap<>();
@@ -320,40 +329,132 @@ public final class UrlEvaluator implements ArgumentBinder {
             return out;
         }
         Optional<TypeDeclaration<?>> owner = callee.findAncestor(TypeDeclaration.class).map(t -> (TypeDeclaration<?>) t);
-        if (callee.isStatic() || owner.isEmpty() || d > MAX_DEPTH) {
-            return out;
+        if (callee.isStatic() || owner.isEmpty() || d > MAX_DEPTH || stereotyped(owner.get(), new HashSet<>())) {
+            return out; // a component is built by Spring: its fields are injected (see variable)
         }
-        Optional<ObjectCreationExpr> made = Optional.empty();
-        Env at = env;
-        Optional<Node> decl = declaration(scope);
-        if (scope instanceof ObjectCreationExpr o) {
-            made = Optional.of(o);
-        } else if (decl.orElse(null) instanceof VariableDeclarator v) {
-            boolean field = v.getParentNode().orElse(null) instanceof FieldDeclaration;
-            at = field ? env.outside() : env;
-            made = v.getInitializer().filter(ObjectCreationExpr.class::isInstance).map(ObjectCreationExpr.class::cast);
-            if (made.isEmpty() && field) { // this.catalog = new ReactiveHttp(..) in a constructor
-                made = v.findAncestor(TypeDeclaration.class).stream().flatMap(t -> ((TypeDeclaration<?>) t).getConstructors().stream())
-                        .flatMap(c -> c.findAll(AssignExpr.class, a -> assigns(a, v.getNameAsString())).stream())
-                        .map(AssignExpr::getValue).filter(ObjectCreationExpr.class::isInstance).map(ObjectCreationExpr.class::cast).findFirst();
+        object(owner.get(), scope, env, d + 1).ifPresent(o -> o.forEach((k, v) -> {
+            if (k.startsWith(THIS)) {
+                out.put(k, v);
+            }
+        }));
+        return out;
+    }
+
+    /**
+     * The {@code type} object an expression evaluates to, as what its constructor stored ({@code this.<field>}) plus
+     * {@link #OBJ} (text "", hops: the calls it was passed through); empty when unknown. Followed: {@code new X(..)},
+     * a factory method's return ({@code Presets.p1()}), a local or field initialized (or constructor-assigned) with
+     * one, a parameter bound to the caller's argument and a field of an object built with {@code new}. An injected
+     * object or an unbound parameter is a {@link #guess}.
+     */
+    private Optional<Map<String, ArgValue>> object(TypeDeclaration<?> type, Expression e, Env env, int d) {
+        while (e instanceof EnclosedExpr || e instanceof CastExpr) {
+            e = e instanceof EnclosedExpr en ? en.getInner() : ((CastExpr) e).getExpression();
+        }
+        if (d > MAX_DEPTH) {
+            return Optional.empty();
+        }
+        if (e instanceof ObjectCreationExpr o) {
+            if (o.getAnonymousClassBody().isPresent() || types.resolve(o.getType()).filter(t -> t == type).isEmpty()) {
+                return Optional.empty();
+            }
+            Map<String, ArgValue> out = construct(type, o.getArguments(), env, d + 1, new HashMap<>());
+            out.put(OBJ, known(""));
+            return Optional.of(out);
+        }
+        if (e instanceof MethodCallExpr mc) {
+            Optional<MethodDeclaration> m = resolve(mc);
+            return m.isEmpty() || m.get().getBody().isEmpty() ? Optional.empty()
+                    : pick(type, returns(m.get()), env.in(m.get(), bind(m.get(), mc, env, d)), d);
+        }
+        Node decl = declaration(e).orElse(null);
+        if (decl instanceof Parameter p) {
+            Optional<Node> owner = p.getParentNode();
+            Optional<Map<String, ArgValue>> bound = owner.orElse(null) == env.method() ? stored(env.args(), p.getNameAsString()) : Optional.empty();
+            return bound.isPresent() ? bound : guess(type, env, d, owner.filter(o -> o instanceof ConstructorDeclaration c && springBean(c)
+                    || o instanceof MethodDeclaration m && Workspace.hasAnnotation(m, "Bean")).isPresent());
+        }
+        if (!(decl instanceof VariableDeclarator v)) {
+            return Optional.empty();
+        }
+        if (!(v.getParentNode().orElse(null) instanceof FieldDeclaration)) {
+            return v.getInitializer().isPresent() ? object(type, v.getInitializer().get(), env, d + 1) : guess(type, env, d, false);
+        }
+        Optional<Map<String, ArgValue>> built = stored(env.args(), THIS + v.getNameAsString());
+        if (built.isPresent()) {
+            return built;
+        }
+        Optional<Expression> init = v.getInitializer().or(() -> v.findAncestor(TypeDeclaration.class).stream()
+                .flatMap(t -> ((TypeDeclaration<?>) t).getConstructors().stream())
+                .flatMap(c -> c.findAll(AssignExpr.class, a -> assigns(a, v.getNameAsString())).stream())
+                .map(AssignExpr::getValue).filter(x -> x instanceof ObjectCreationExpr || x instanceof MethodCallExpr).findFirst());
+        // this.gw = gw from a constructor parameter: injected into a component, unknown in a class built with new
+        return init.isPresent() ? object(type, init.get(), env.outside(), d + 1) : guess(type, env, d, springBean(v));
+    }
+
+    /**
+     * An object code doesn't show: one of the calling service's {@code @Bean}s of the type, followed through its
+     * return; when injected and the service has none, a library's (auto-configuration) {@code @Bean} - a library
+     * {@code @ConditionalOnMissingBean} default never counts next to the service's own. Not injected (a parameter
+     * nobody bound): the service's beans and its own {@code new X(..)}, never another service's or a library's.
+     * One per run of {@link #each}; empty when there is none.
+     */
+    private Optional<Map<String, ArgValue>> guess(TypeDeclaration<?> type, Env env, int d, boolean injected) {
+        List<Expression> own = new ArrayList<>();
+        List<Expression> lib = new ArrayList<>();
+        for (Bean b : beans) {
+            Repo r = types.repo(b.method());
+            // of the type, or of a supertype built here (@Bean Notifier sms() { return new SmsNotifier(url); })
+            if (b.type().equals(type.getNameAsString()) || !b.method().findAll(ObjectCreationExpr.class,
+                    o -> o.getType().getNameAsString().equals(type.getNameAsString())).isEmpty()) {
+                (r == env.service() ? own : r != null && r.kind() == Workspace.Kind.library ? lib : new ArrayList<Expression>())
+                        .addAll(returns(b.method()));
             }
         }
-        if (made.isPresent()) {
-            return types.resolve(made.get().getType()).filter(t -> t == owner.get()).isPresent()
-                    ? construct(owner.get(), made.get().getArguments(), at, d + 1, out) : out;
+        if (!injected) {
+            creations.getOrDefault(type.getNameAsString(), List.of()).stream()
+                    .filter(o -> types.repo(o) == env.service() && !inBean(o)).forEach(own::add);
         }
-        if (stereotyped(owner.get(), new HashSet<>())) {
-            return out; // Spring builds it: its fields are injected (see variable)
+        // shortcut: no @Qualifier/@Primary narrowing between the service's own beans of one wrapper type: each is an alternative
+        return pick(type, own.isEmpty() && injected ? lib : own, env.outside(), d);
+    }
+
+    /** Of several expressions that may give the object, the one this run of {@link #each} takes. */
+    private Optional<Map<String, ArgValue>> pick(TypeDeclaration<?> type, List<Expression> all, Env env, int d) {
+        List<Expression> values = all.stream().filter(v -> !(v instanceof NullLiteralExpr)).toList();
+        int i = values.size() == 1 ? 0 : env.pick(values.size());
+        return i >= 0 && i < values.size() ? object(type, values.get(i), env, d + 1) : Optional.empty();
+    }
+
+    /** {@code key}'s object as {@link #store} put it in bound arguments, keys relative to it. */
+    private static Optional<Map<String, ArgValue>> stored(Map<String, ArgValue> args, String key) {
+        if (!args.containsKey(key + OBJ)) {
+            return Optional.empty();
         }
-        // shortcut: an injected or passed-in object is taken to be any one built in the service, one run each
-        List<ObjectCreationExpr> all = creations.getOrDefault(owner.get().getNameAsString(), List.of()).stream()
-                .filter(o -> o.getAnonymousClassBody().isEmpty() && types.resolve(o.getType()).filter(t -> t == owner.get()).isPresent())
-                .filter(o -> types.repo(o) == env.service() || types.repo(o) != null && types.repo(o).kind() == Workspace.Kind.library)
-                .toList();
-        List<ObjectCreationExpr> asBeans = all.stream().filter(UrlEvaluator::inBean).toList();
-        all = asBeans.isEmpty() ? all : asBeans; // an injected object is one of the @Bean ones
-        int i = all.size() == 1 ? 0 : env.pick(all.size());
-        return i >= 0 && i < all.size() ? construct(owner.get(), all.get(i).getArguments(), env.outside(), d + 1, out) : out;
+        Map<String, ArgValue> out = new HashMap<>();
+        out.put(OBJ, args.get(key + OBJ));
+        args.forEach((k, v) -> {
+            if (k.startsWith(key + ".")) {
+                out.put(k.substring(key.length() + 1), v);
+            }
+        });
+        return Optional.of(out);
+    }
+
+    /** An object under {@code key} ("gw" a parameter, "this.w" a field): {@code key#obj}, {@code key.this.<field>}. */
+    private static void store(Map<String, ArgValue> out, String key, Map<String, ArgValue> object) {
+        object.forEach((k, v) -> out.put(k.equals(OBJ) ? key + OBJ : key + "." + k, v));
+    }
+
+    /** A workspace class, not a component, holding a client in a field, directly or through another such class. */
+    private Optional<TypeDeclaration<?>> wrapper(Type t) {
+        return t instanceof ClassOrInterfaceType ct ? types.resolve(ct).filter(c -> wraps.computeIfAbsent(c, k -> wraps(k, new HashSet<>())))
+                : Optional.empty();
+    }
+
+    private boolean wraps(TypeDeclaration<?> c, Set<TypeDeclaration<?>> seen) {
+        return seen.add(c) && !stereotyped(c, new HashSet<>()) && c.getFields().stream().anyMatch(f -> clientIn(simpleName(f.getElementType()), f).isPresent()
+                || f.getElementType() instanceof ClassOrInterfaceType ft && types.resolve(ft).filter(x -> wraps(x, seen)).isPresent());
     }
 
     /** {@code type}'s constructor taking {@code args}: what it stores in fields, as {@code this.<field>}, into {@code out}. */
@@ -377,6 +478,11 @@ public final class UrlEvaluator implements ArgumentBinder {
             }
             Type t = f.get().getElementType();
             boolean isClient = clientIn(simpleName(t), f.get()).isPresent();
+            Optional<TypeDeclaration<?>> w = isClient || BOUND.contains(simpleName(t)) ? Optional.empty() : wrapper(t);
+            if (w.isPresent()) { // this.w = new W2(..) / a wrapper passed to the constructor
+                object(w.get(), a.getValue(), in, d + 1).ifPresent(o -> store(out, THIS + name, o));
+                continue;
+            }
             if (!isClient && !BOUND.contains(simpleName(t))) {
                 continue;
             }
@@ -1022,13 +1128,18 @@ public final class UrlEvaluator implements ArgumentBinder {
 
     /** The returned value of a method body: of several returns, each in turn (see {@link #each}). */
     private ArgValue returned(MethodDeclaration m, Env env, int d, boolean asClient) {
-        List<Expression> values = m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class)
-                .map(l -> !m.isAncestorOf(l)).orElse(true)).stream().flatMap(r -> r.getExpression().stream()).toList();
+        List<Expression> values = returns(m);
         if (!asClient) {
             return choose(values, env, d);
         }
         // shortcut: a client from several returns is the first one known; clients built per branch are rare
         return values.stream().map(v -> client(v, env, d)).filter(v -> v.text() != null).findFirst().orElse(unknown());
+    }
+
+    /** The expressions a method body returns, those of lambdas inside it left out. */
+    private static List<Expression> returns(MethodDeclaration m) {
+        return m.findAll(ReturnStmt.class, r -> r.findAncestor(LambdaExpr.class).map(l -> !m.isAncestorOf(l)).orElse(true))
+                .stream().flatMap(r -> r.getExpression().stream()).toList();
     }
 
     /** One of several possible values: the one this run of {@link #each} takes, else the most complete one. */

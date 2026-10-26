@@ -47,9 +47,12 @@ public final class FlowTracer {
 
     /**
      * An outbound call reached from a method: {@code via} lists every method entered on the way, client method last;
-     * {@code sites} the position (file:line:column) of each call on that path, the client call last.
+     * {@code sites} the position (file:line:column) of each call on that path, the client call last. {@code wrapper}:
+     * for a raw client call made in library code, the outermost library class the service code called
+     * (PLAN: client "&lt;wrapper class&gt;"); null otherwise.
      */
-    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites) {
+    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites,
+                        String wrapper) {
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
@@ -71,6 +74,8 @@ public final class FlowTracer {
     private final List<OutboundDetector> detectors;
     private final ArgumentBinder binder;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
+    private final Map<Expression, Callees> callees = new IdentityHashMap<>();
+    private final Map<Expression, List<TypeDeclaration<?>>> receivers = new IdentityHashMap<>();
     // per service: detectors resolve placeholders with the calling service's config, so library results differ;
     // per argument values: a util called with another WebClient bean or URL reaches another target
     private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, List<Found>>>> memo = new IdentityHashMap<>();
@@ -95,10 +100,19 @@ public final class FlowTracer {
      */
     public static final int MAX_URLS_PER_CALL_SITE = 4;
 
+    /** Methods walked per handler before cut-short recursive results are reused whatever their arguments. */
+    static final int MAX_WALKS = 100;
+    private int walks;
+
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
+        walks = 0;
         List<Found> all = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        // past the walk budget recursive results were reused across arguments: their URLs are capped per client call
+        // site, not per path, so a mixed-up pairing never stands as a confident edge
+        boolean over = walks > MAX_WALKS;
         Map<List<String>, List<Found>> byPath = new LinkedHashMap<>();
-        all.forEach(f -> byPath.computeIfAbsent(f.sites(), k -> new ArrayList<>()).add(f));
+        all.forEach(f -> byPath.computeIfAbsent(over ? List.of(f.sites().get(f.sites().size() - 1)) : f.sites(),
+                k -> new ArrayList<>()).add(f));
         Map<Key, Found> out = new LinkedHashMap<>(); // several capped paths to one site give the same {*} edge
         for (List<Found> site : byPath.values()) {
             if (site.size() <= MAX_URLS_PER_CALL_SITE) {
@@ -112,7 +126,7 @@ public final class FlowTracer {
             String eg = site.stream().filter(f -> f.call().baseUrl() != null).findFirst().orElse(first).call().source();
             add(out, new Found(new OutboundCall(c.client(), verb, null, "{*}", null,
                     "one of " + site.size() + " combinations, e.g. " + eg, c.label()), first.via(), first.file(),
-                    first.line(), first.lowConfidence(), first.sites()));
+                    first.line(), first.lowConfidence(), first.sites(), first.wrapper()));
         }
         return List.copyOf(out.values());
     }
@@ -129,10 +143,14 @@ public final class FlowTracer {
         if (done.containsKey(args)) {
             return new Result(done.get(args), Integer.MAX_VALUE);
         }
-        Result cut = partial.getOrDefault(m, Map.of()).get(args); // a cut-short result holds for the same arguments only
+        Map<Map<String, ArgValue>, Result> cuts = partial.getOrDefault(m, Map.of());
+        // a cut-short result holds for the same arguments only; past the budget any one is reused, else every simple
+        // path through a mutually recursive cluster is walked (exponential)
+        Result cut = cuts.get(args) != null || walks <= MAX_WALKS ? cuts.get(args) : cuts.values().stream().findFirst().orElse(null);
         if (cut != null) {
             return cut;
         }
+        walks++;
         if (m.getBody().isEmpty()) {
             return new Result(List.of(), Integer.MAX_VALUE);
         }
@@ -143,19 +161,21 @@ public final class FlowTracer {
         // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
         for (Expression call : m.getBody().get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
-            Callees c = callees(call);
-            List<TypeDeclaration<?>> receiver = receiverTypes(call);
+            // the same in every walk of m: a recursive cluster walks m once per argument combination
+            Callees c = callees.computeIfAbsent(call, this::callees);
+            List<TypeDeclaration<?>> receiver = receivers.computeIfAbsent(call, this::receiverTypes);
             boolean classified = false;
             // one detection per callee, so via names the right one; a framework call (WebClient...) has none
             for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
                 List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
                         callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
-                for (OutboundCall raw : out) {
-                    OutboundCall o = wrapped(raw, call);
+                for (OutboundCall o : out) {
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
-                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call))));
+                    String wrapper = RAW_CLIENTS.contains(o.client()) && library(call)
+                            ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call)), wrapper));
                 }
                 classified |= !out.isEmpty();
             }
@@ -178,8 +198,11 @@ public final class FlowTracer {
                         via.addAll(f.via());
                         List<String> sites = new ArrayList<>(List.of(site(call)));
                         sites.addAll(f.sites());
+                        // entering library code from the service's: that library class is the client the service calls
+                        String wrapper = f.wrapper() != null && library(callee) && !library(m)
+                                ? enclosingType(callee).map(TypeDeclaration::getNameAsString).orElse(f.wrapper()) : f.wrapper();
                         add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low(),
-                                List.copyOf(sites)));
+                                List.copyOf(sites), wrapper));
                     }
                 }
             }
@@ -191,7 +214,7 @@ public final class FlowTracer {
             done.put(args, result.found());
             return new Result(result.found(), Integer.MAX_VALUE);
         }
-        partial.computeIfAbsent(m, k -> new HashMap<>()).put(args, result);
+        partial.computeIfAbsent(m, k -> new LinkedHashMap<>()).put(args, result);
         return result;
     }
 
@@ -330,17 +353,9 @@ public final class FlowTracer {
         return new ArrayList<>(out);
     }
 
-    /**
-     * A raw client call made inside a library class (ApiGateway, ReactiveHttp...) is named after that wrapper class:
-     * the class the service code calls, not the client it hides (PLAN: client "&lt;wrapper class&gt;").
-     */
-    private OutboundCall wrapped(OutboundCall o, Expression call) {
-        Optional<TypeDeclaration<?>> holder = enclosingType(call);
-        Repo repo = types.repo(call);
-        if (!RAW_CLIENTS.contains(o.client()) || holder.isEmpty() || repo == null || repo.kind() != Workspace.Kind.library) {
-            return o;
-        }
-        return new OutboundCall(holder.get().getNameAsString(), o.verb(), o.baseUrl(), o.path(), o.unresolvedKey(), o.source(), o.label());
+    private boolean library(Node n) {
+        Repo r = types.repo(n);
+        return r != null && r.kind() == Workspace.Kind.library;
     }
 
     private static final Set<String> RAW_CLIENTS = Set.of("webclient", "restclient", "resttemplate");
