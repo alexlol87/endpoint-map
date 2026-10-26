@@ -400,6 +400,8 @@ public final class FlowTracer {
         // the class's own methods, then inherited ones (a base class holding shared fallbacks)
         List<MethodDeclaration> methods = Stream.concat(Stream.of(owner.get()), supertypes(owner.get()).stream())
                 .flatMap(t -> t.getMethods().stream()).toList();
+        Set<String> sigs = new java.util.HashSet<>(); // an override hides the inherited method it replaces
+        methods = methods.stream().filter(f -> sigs.add(f.getNameAsString() + types(f, 0, f.getParameters().size()))).toList();
         List<String> params = m.getParameters().stream().map(p -> unqualified(p.getType().asString())).toList();
         for (AnnotationExpr a : m.getAnnotations()) {
             String name = a.getName().getIdentifier();

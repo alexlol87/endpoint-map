@@ -112,6 +112,8 @@ class ResilienceFlowTest {
                   protected Ext ext;
                   String sup(String id, Throwable t) { return ext.d(); }
                   @org.springframework.retry.annotation.Recover String rec(Exception e, String id) { return ext.c(); }
+                  String f(String id, Throwable t) { return ext.d(); }
+                  @org.springframework.retry.annotation.Recover Integer rec2(Exception e, String id) { ext.d(); return 0; }
                 }
                 """);
         RepositoryTablesTest.write(c.resolve("Api.java"), """
@@ -129,6 +131,8 @@ class ResilienceFlowTest {
                   @GetMapping("/dup") @CircuitBreaker(name = "x", fallbackMethod = "f") @Retry(name = "x", fallbackMethod = "f")
                   public String dup(String id) { return ext.a(); }
                   String f(String id, Throwable t) { return ext.b(); }
+                  @GetMapping("/rq2") @org.springframework.retry.annotation.Retryable public Integer rq2(String id) { ext.a(); return 1; }
+                  @org.springframework.retry.annotation.Recover Integer rec2(Exception e, String id) { ext.c(); return 0; }
                 }
                 """);
         RepositoryTablesTest.write(c.resolve("Ext.java"), """
@@ -158,5 +162,9 @@ class ResilienceFlowTest {
         // two annotations naming one fallback: one fallback node
         assertEquals(List.of("retry @Retry(name = \"x\", fallbackMethod = \"f\") > edge " + x + "a",
                 "fallback @CircuitBreaker(name = \"x\") > call Api.f > edge " + x + "b"), paths(g, "rs-service GET /dup"));
+        // overridden fallback (f above) and @Recover: the base versions (calling /d) are not traced
+        assertEquals(List.of("retry @org.springframework.retry.annotation.Retryable > edge " + x + "a"), paths(g, "rs-service GET /rq2").subList(0, 1));
+        assertEquals(List.of("fallback @org.springframework.retry.annotation.Retryable > call Api.rec2 > edge " + x + "c"),
+                paths(g, "rs-service GET /rq2").subList(1, paths(g, "rs-service GET /rq2").size()));
     }
 }
