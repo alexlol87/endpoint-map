@@ -114,7 +114,7 @@ class FlowTreeTest {
         assertTrue(paths(graph, "order-service POST /api/orders/{id}/cancel").contains("call OrderService.cancel > switch order.getStatus()"
                 + " > case \"PAID\" > call PaymentClient.refund > unresolved unresolved:order-service:${PAYMENT_SERVICE_URL} POST /payments/{*}/refund"));
         assertTrue(paths(graph, "pricing-service POST /prices/quote").contains("call PriceService.quote > switch String.valueOf(coupon)"
-                + " > case \"VIP\" > call PriceService.taxRate > edge tax-service GET /tax-api/tax/rates/{region}"));
+                + " > case \"VIP\" > call PriceService.taxRate > retry @Retry(name = \"tax\") > edge tax-service GET /tax-api/tax/rates/{region}"));
         assertTrue(paths(graph, "inventory-service PUT /inventory/{sku}/reserve").contains("call StockService.reserve"
                 + " > loop while (updated == 0 && repository.existsBySku(sku)) > edge db:inventory-service:stock_item"));
         assertTrue(paths(graph, "report-service GET /reports/{type}").contains("call ReportService.build"
