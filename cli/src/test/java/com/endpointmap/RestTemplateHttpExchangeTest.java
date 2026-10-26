@@ -67,9 +67,9 @@ class RestTemplateHttpExchangeTest {
         // library wrapper: put(url) and exchange(HttpMethod.PUT passed in by the caller, url)
         assertEquals(List.of("ReportService.export", "InternalRestTemplateClient.exchange", "RestTemplate.exchange"),
                 strings(edge("report-service POST /reports/export", "unresolved:report-service:${REPORT_EXPORT_URL} PUT /{*}/x").get("via")));
-        // known limit (#5's evaluator): UrlTemplates.join(taxUrl, "tax", "rates", s) varargs are not joined, the right
-        // value is /tax-api/tax/rates/{*}; this pins today's lossy output so a fix shows up here
-        edge("billing-service POST /billing/tenants/{tenant}/sync", "unresolved:tax-service PUT /tax-api{*}");
+        // UrlTemplates.join(taxUrl, "tax", "rates", s): the StringBuilder loop over the varargs is unrolled (#7);
+        // tax-service has no PUT endpoint, so it stays unresolved, now with the right path
+        edge("billing-service POST /billing/tenants/{tenant}/sync", "unresolved:tax-service PUT /tax-api/tax/rates/{*}");
     }
 
     @Test

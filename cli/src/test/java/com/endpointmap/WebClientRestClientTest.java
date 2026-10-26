@@ -347,9 +347,9 @@ class WebClientRestClientTest {
         for (String from : List.of("/ternary", "/returns", "/assigned")) {
             assertEquals(Set.of("svc-b GET /b/one", "svc-b GET /b/two"), to.apply(from, ""), from);
         }
-        // #4 not a Spring bean: the client is unknown (a call site to ask about), not the service's only bean
+        // #4 not a Spring bean: not the service's only bean, but the client its constructor was given (#7)
         assertEquals(Set.of(), to.apply("/gw", "svc-b"));
-        assertEquals(1, to.apply("/gw", "unresolved:").size(), g.toString());
+        assertEquals(Set.of("external:https://ext.example.com GET /b/gw"), to.apply("/gw", ""));
         // injected into Spring beans: abstract base built via super(..) by a @Service, @Import, meta-annotated @Service
         for (String p : List.of("base", "reg", "meta")) {
             assertEquals(Set.of("svc-b GET /b/" + p), to.apply("/" + p, ""), g.toString());

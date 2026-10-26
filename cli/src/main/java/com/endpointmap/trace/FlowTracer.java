@@ -11,11 +11,13 @@ import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.Parameter;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
+import com.github.javaparser.ast.expr.EnclosedExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
+import com.github.javaparser.ast.expr.ObjectCreationExpr;
 import com.github.javaparser.ast.expr.ThisExpr;
 import com.github.javaparser.ast.expr.TypeExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
@@ -121,16 +123,15 @@ public final class FlowTracer {
      * per path into it. {@code args}: what the caller passed to m's parameters.
      */
     private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
-                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Result> partial) {
+                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Map<Map<String, ArgValue>, Result>> partial) {
         Map<Map<String, ArgValue>, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
                 .computeIfAbsent(m, k -> new HashMap<>());
         if (done.containsKey(args)) {
             return new Result(done.get(args), Integer.MAX_VALUE);
         }
-        // shortcut: a cut-short result is reused whatever the arguments; only matters for a cycle walked with two
-        // different argument values at once, key partial by args too if that shows up
-        if (partial.containsKey(m)) {
-            return partial.get(m);
+        Result cut = partial.getOrDefault(m, Map.of()).get(args); // a cut-short result holds for the same arguments only
+        if (cut != null) {
+            return cut;
         }
         if (m.getBody().isEmpty()) {
             return new Result(List.of(), Integer.MAX_VALUE);
@@ -149,7 +150,8 @@ public final class FlowTracer {
             for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
                 List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
                         callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
-                for (OutboundCall o : out) {
+                for (OutboundCall raw : out) {
+                    OutboundCall o = wrapped(raw, call);
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
@@ -183,13 +185,13 @@ public final class FlowTracer {
             }
         }
         stack.remove(m);
-        partial.values().removeIf(r -> r.backTo() >= depth); // they were cut back to m or below, which is done now
+        partial.values().forEach(byArgs -> byArgs.values().removeIf(r -> r.backTo() >= depth)); // they were cut back to m or below, which is done now
         Result result = new Result(List.copyOf(found.values()), backTo);
         if (backTo >= depth) { // complete: any recursion below came back to m itself, not to a caller still being walked
             done.put(args, result.found());
             return new Result(result.found(), Integer.MAX_VALUE);
         }
-        partial.put(m, result);
+        partial.computeIfAbsent(m, k -> new HashMap<>()).put(args, result);
         return result;
     }
 
@@ -264,6 +266,12 @@ public final class FlowTracer {
         if (scope instanceof ThisExpr) {
             return enclosingType(scope).map(t -> new Typed(t, true));
         }
+        if (scope instanceof ObjectCreationExpr o) { // new Gateway(..).call(..)
+            return typeOf(o.getType());
+        }
+        if (scope instanceof EnclosedExpr e) {
+            return scopeType(e.getInner());
+        }
         if (scope instanceof TypeExpr t) { // "inventory::release" parses as a type; a variable of that name wins
             return variableType(t.getType().asString(), scope).or(() -> typeOf(t.getType()));
         }
@@ -321,6 +329,21 @@ public final class FlowTracer {
         }
         return new ArrayList<>(out);
     }
+
+    /**
+     * A raw client call made inside a library class (ApiGateway, ReactiveHttp...) is named after that wrapper class:
+     * the class the service code calls, not the client it hides (PLAN: client "&lt;wrapper class&gt;").
+     */
+    private OutboundCall wrapped(OutboundCall o, Expression call) {
+        Optional<TypeDeclaration<?>> holder = enclosingType(call);
+        Repo repo = types.repo(call);
+        if (!RAW_CLIENTS.contains(o.client()) || holder.isEmpty() || repo == null || repo.kind() != Workspace.Kind.library) {
+            return o;
+        }
+        return new OutboundCall(holder.get().getNameAsString(), o.verb(), o.baseUrl(), o.path(), o.unresolvedKey(), o.source(), o.label());
+    }
+
+    private static final Set<String> RAW_CLIENTS = Set.of("webclient", "restclient", "resttemplate");
 
     private static String label(MethodDeclaration m) {
         return m.findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString() + ".").orElse("") + m.getNameAsString();

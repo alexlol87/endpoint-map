@@ -13,9 +13,11 @@ import reactor.core.publisher.Mono;
 public class WarehouseController extends BaseController {
 
     private final WarehouseService service;
+    private final RestockCoordinator restocks;
 
-    public WarehouseController(WarehouseService service) {
+    public WarehouseController(WarehouseService service, RestockCoordinator restocks) {
         this.service = service;
+        this.restocks = restocks;
     }
 
     @GetMapping("/stock/hot")
@@ -26,5 +28,10 @@ public class WarehouseController extends BaseController {
     @PostMapping("/dispatch/{sku}")
     public Mono<Map<String, Object>> dispatch(@PathVariable String sku) {
         return service.dispatch(sku);
+    }
+
+    @PostMapping("/restock/{sku}")
+    public Mono<Void> restock(@PathVariable String sku) {
+        return restocks.restock(sku);
     }
 }
