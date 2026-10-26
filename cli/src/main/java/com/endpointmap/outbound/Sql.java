@@ -28,7 +28,7 @@ final class Sql {
             "(?i)\\b(FROM|JOIN|INTO|UPDATE)\\s+(?:(?:ONLY|LATERAL|FETCH)\\s+)?([\\w.$\"`\\[\\]{}*]+)(\\s*\\()?");
     private static final Pattern CTE = Pattern.compile("(?i)\\b(\\w+)\\s*(?:\\([^()]*\\))?\\s+AS\\s*(?:(?:NOT\\s+)?MATERIALIZED\\s*)?\\(");
     /** The next item of a comma list after a FROM name: {@code [AS] [alias] , <name>} (FROM a x, b y). */
-    private static final Pattern LIST = Pattern.compile("(?i)\\G(?:\\s+(?:AS\\s+)?\\w+)?\\s*,\\s*([\\w.$\"`\\[\\]{}*]+)(\\s*\\()?");
+    private static final Pattern LIST = Pattern.compile("(?i)\\G(?:\\s+(?:AS\\s+)?\\w+)?\\s*,\\s*(?:(?:ONLY|LATERAL)\\s+)?([\\w.$\"`\\[\\]{}*]+)(\\s*\\()?");
     /** MySQL's upsert tail: its UPDATE names columns, not a table. */
     private static final Pattern UPSERT = Pattern.compile("(?i)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b.*", Pattern.DOTALL);
     private static final Pattern DEFAULT_SCHEMA = Pattern.compile("^(public|dbo)\\.");
@@ -42,6 +42,9 @@ final class Sql {
     // shortcut: MERGE ... USING src and a list item after a subquery (FROM (..) x, b) are not read; add them when real code needs it
     /** Null when the statement is not understood (no leading verb); empty when it names no table. */
     static List<Access> parse(String sql, boolean jpql) {
+        if (jpql) {
+            sql = sql.replaceFirst("(?i)^\\s*delete\\s+(?!from\\b)", "delete from "); // HQL: delete Order o where ..
+        }
         String s = UPSERT.matcher(NOISE.matcher(sql).replaceAll(m -> m.group().startsWith("'") ? "''" : " ")).replaceAll("");
         int[] depth = new int[s.length() + 1];
         boolean[] inCall = new boolean[s.length() + 1]; // inside the parentheses of a function call, not a subquery

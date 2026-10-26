@@ -148,7 +148,9 @@ public final class Main {
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
                     // no table (SQL or entity not known from code): one node per call site, saying why (listed in the report)
                     String id = f.call().table() != null ? "db:" + e.service() + ":" + f.call().table()
-                            : "unresolved:db " + e.service() + " " + callSite + " " + f.call().label();
+                            // the reason's hash too: a helper running SQL its callers pass in is one call site, many statements
+                            : "unresolved:db " + e.service() + " " + callSite + " " + f.call().label() + " #"
+                                    + String.format("%08x", f.call().source().hashCode());
                     targets.putIfAbsent(id, f.call().table() != null
                             ? GraphWriter.ordered("id", id, "kind", "db", "tech", f.call().client(), "table", f.call().table())
                             : GraphWriter.ordered("id", id, "kind", "unresolved", "service", e.service(), "tech", f.call().client(),

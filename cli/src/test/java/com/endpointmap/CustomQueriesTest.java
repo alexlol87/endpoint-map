@@ -102,7 +102,7 @@ class CustomQueriesTest {
                 "db:inventory-service:stock_item read EntityManager.createQuery",
                 "db:inventory-service:stock_item read EntityManager.find",                 // find(StockItem.class, ..)
                 "db:inventory-service:stock_item write EntityManager.merge",
-                "unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery write EntityManager.createNativeQuery"),
+                "unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery #11225340 write EntityManager.createNativeQuery"),
                 dbEdges(edges, "inventory-service PATCH /inventory/{sku}/quantity").stream().filter(e -> e.contains("EntityManager")).toList());
         List<String> via = edges.stream().filter(e -> e.get("from").asText().equals("inventory-service PATCH /inventory/{sku}/quantity")
                 && e.get("op").asText("").equals("delete") && e.get("to").asText().endsWith("stock_audit")).map(e -> strings(e.get("via"))).findFirst().orElseThrow();
@@ -111,10 +111,10 @@ class CustomQueriesTest {
         assertEquals(List.of("db:inventory-service:stock_audit read EntityManager.createNativeQuery",
                 "db:inventory-service:stock_item read StockRepository.findBySku"), dbEdges(edges, "inventory-service GET /inventory/{sku}"));
         // a table name built at runtime: unresolved, with the SQL as the reason, never a guessed table
-        JsonNode u = nodes.get("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery");
+        JsonNode u = nodes.get("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery #11225340");
         assertEquals("unresolved", u.get("kind").asText());
         assertTrue(u.get("reason").asText().startsWith("table name not known from code: INSERT INTO stock_audit_{*}"), u.toString());
-        assertTrue(report.contains("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery"), report);
+        assertTrue(report.contains("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery #11225340"), report);
         assertFalse(nodes.keySet().stream().anyMatch(id -> id.contains("stock_audit_")), nodes.keySet().toString());
     }
 
@@ -219,15 +219,15 @@ class CustomQueriesTest {
                 "db:s-service:orders read OrderRepository.lock",               // FOR UPDATE is no table
                 "db:s-service:orders read OrderRepository.totals",
                 "db:s-service:orders write OrderRepository.archive",           // CTE: its name is no table; the target is not also read
-                "unresolved:db s-service Ctl.b:6 OrderRepository.call read OrderRepository.call",   // CALL: no verb read,
-                "unresolved:db s-service Ctl.b:6 OrderRepository.noTable read OrderRepository.noTable"), dbEdges(got, "s-service POST /b"));
+                "unresolved:db s-service Ctl.b:6 OrderRepository.call #ae039bd3 read OrderRepository.call",   // CALL: no verb read,
+                "unresolved:db s-service Ctl.b:6 OrderRepository.noTable #288e374f read OrderRepository.noTable"), dbEdges(got, "s-service POST /b"));
         assertEquals(List.of(
                 "db:s-service:line_item write EntityManager.persist",          // Dao<E>.save: E bound by LineItemDao
                 "db:s-service:orders read R2dbcEntityTemplate.select",
-                "unresolved:db s-service Svc.run:15 EntityManager.createNamedQuery - EntityManager.createNamedQuery", // op unknown: none
-                "unresolved:db s-service Svc.run:16 EntityManager.persist write EntityManager.persist",
-                "unresolved:db s-service Svc.run:17 EntityManager.createNativeQuery read EntityManager.createNativeQuery",
-                "unresolved:db s-service Svc.run:18 DatabaseClient.sql - DatabaseClient.sql"), dbEdges(got, "s-service POST /c"));
+                "unresolved:db s-service Svc.run:15 EntityManager.createNamedQuery #7c02a136 - EntityManager.createNamedQuery", // op unknown: none
+                "unresolved:db s-service Svc.run:16 EntityManager.persist #3592e5a5 write EntityManager.persist",
+                "unresolved:db s-service Svc.run:17 EntityManager.createNativeQuery #222a54d6 read EntityManager.createNativeQuery",
+                "unresolved:db s-service Svc.run:18 DatabaseClient.sql #8afa6b81 - DatabaseClient.sql"), dbEdges(got, "s-service POST /c"));
     }
 
     /** Review of PR #29: SQL idioms that were wrong or dropped, and one unresolved node per call site. */
@@ -257,6 +257,8 @@ class CustomQueriesTest {
                   @NativeQuery("WITH x AS MATERIALIZED (SELECT id FROM pref) SELECT * FROM customer_accounts JOIN x ON true")
                   java.util.List<Customer> topPrefs();
                   @Modifying @NativeQuery("REPLACE INTO pref VALUES (1)") int replace();
+                  @Modifying @Query("delete Pref p where p.id = ?1") int hqlDelete(long id);
+                  @NativeQuery("SELECT * FROM customer_accounts c, LATERAL unnest(c.tags) t") java.util.List<Customer> tags();
                 }
                 """);
         write(s.resolve("Svc.java"), """
@@ -268,7 +270,12 @@ class CustomQueriesTest {
                     jdbc.update("DELETE FROM tmp_" + id);
                     jdbc.update("UPDATE audit_" + id + " SET x = 1");
                     em.createNamedQuery("Customer.recent");
+                    Sqls.exec(jdbc, "DELETE FROM cache_" + id);
+                    Sqls.exec(jdbc, "UPDATE stats_" + id + " SET n = 0");
                   }
+                }
+                class Sqls { // a shared helper running the SQL its callers pass in
+                  static void exec(JdbcTemplate jdbc, String sql) { jdbc.update(sql); }
                 }
                 """);
         write(s.resolve("Ctl.java"), """
@@ -277,10 +284,11 @@ class CustomQueriesTest {
                 @RestController class Ctl {
                   CustomerRepository repo; Svc svc;
                   @GetMapping("/a") Object a() {
-                    repo.latest(1); repo.hql(1); repo.pairs(); repo.upsert(1, "n"); repo.upper(); repo.topPrefs();
+                    repo.latest(1); repo.hql(1); repo.pairs(); repo.upsert(1, "n"); repo.upper(); repo.topPrefs(); repo.hqlDelete(1); repo.tags();
                     return repo.replace();
                   }
                   @PostMapping("/b") void b(@RequestParam String id) { svc.run(id); }
+                  @PutMapping("/c") void c(@RequestParam String id) { Sqls.exec(svc.jdbc, "INSERT INTO hist_" + id + " VALUES (1)"); }
                 }
                 """);
         Path o = root.resolve("out");
@@ -294,24 +302,35 @@ class CustomQueriesTest {
                 "db:s-service:customer_accounts read CustomerRepository.hql",   // HQL without SELECT
                 "db:s-service:customer_accounts read CustomerRepository.latest", // #{#entityName} in a generic base repository
                 "db:s-service:customer_accounts read CustomerRepository.pairs",
+                "db:s-service:customer_accounts read CustomerRepository.tags",  // LATERAL unnest(..) is no table
                 "db:s-service:customer_accounts read CustomerRepository.topPrefs", // @NativeQuery; MATERIALIZED CTE is no table
                 "db:s-service:customer_accounts read CustomerRepository.upper", // upper case: the same table
                 "db:s-service:customer_accounts write CustomerRepository.upsert", // ON DUPLICATE KEY UPDATE names no table
+                "db:s-service:pref delete CustomerRepository.hqlDelete",        // HQL delete without FROM
                 "db:s-service:pref read CustomerRepository.pairs",              // JPQL comma join
                 "db:s-service:pref read CustomerRepository.topPrefs",
                 "db:s-service:pref read CustomerRepository.upper",              // comma join; public. is the default schema
                 "db:s-service:pref write CustomerRepository.replace"),          // REPLACE INTO
                 dbEdges(got, "s-service GET /a"));
         // each runtime-built statement its own node, with its own SQL; an unknown op is left out of the edge
+        // a helper running its callers' SQL: one node per statement (the reason's hash), each with its own SQL
         assertEquals(List.of(
-                "unresolved:db s-service Svc.run:6 JdbcTemplate.update delete JdbcTemplate.update",
-                "unresolved:db s-service Svc.run:7 JdbcTemplate.update write JdbcTemplate.update",
-                "unresolved:db s-service Svc.run:8 EntityManager.createNamedQuery - EntityManager.createNamedQuery"),
+                "unresolved:db s-service Sqls.exec:14 JdbcTemplate.update #b2d15f54 delete JdbcTemplate.update",
+                "unresolved:db s-service Sqls.exec:14 JdbcTemplate.update #d895e790 write JdbcTemplate.update",
+                "unresolved:db s-service Svc.run:6 JdbcTemplate.update #5ba65329 delete JdbcTemplate.update",
+                "unresolved:db s-service Svc.run:7 JdbcTemplate.update #c24e50d7 write JdbcTemplate.update",
+                "unresolved:db s-service Svc.run:8 EntityManager.createNamedQuery #cfedf15a - EntityManager.createNamedQuery"),
                 dbEdges(got, "s-service POST /b"));
         Map<String, JsonNode> n = byId(graph);
-        assertTrue(n.get("unresolved:db s-service Svc.run:6 JdbcTemplate.update").get("reason").asText().contains("DELETE FROM tmp_{*}"));
-        assertTrue(n.get("unresolved:db s-service Svc.run:7 JdbcTemplate.update").get("reason").asText().contains("UPDATE audit_{*}"));
-        assertTrue(md.contains("UPDATE audit_{*}") && md.contains("DELETE FROM tmp_{*}"), md);
+        assertTrue(n.get("unresolved:db s-service Svc.run:6 JdbcTemplate.update #5ba65329").get("reason").asText().contains("DELETE FROM tmp_{*}"));
+        assertTrue(n.get("unresolved:db s-service Svc.run:7 JdbcTemplate.update #c24e50d7").get("reason").asText().contains("UPDATE audit_{*}"));
+        assertEquals(List.of("unresolved:db s-service Sqls.exec:14 JdbcTemplate.update #801ed3fc write JdbcTemplate.update"),
+                dbEdges(got, "s-service PUT /c"));
+        assertTrue(n.get("unresolved:db s-service Sqls.exec:14 JdbcTemplate.update #b2d15f54").get("reason").asText().contains("DELETE FROM cache_{*}"));
+        assertTrue(n.get("unresolved:db s-service Sqls.exec:14 JdbcTemplate.update #d895e790").get("reason").asText().contains("UPDATE stats_{*}"));
+        for (String sql : List.of("UPDATE audit_{*}", "DELETE FROM tmp_{*}", "DELETE FROM cache_{*}", "UPDATE stats_{*}", "INSERT INTO hist_{*}")) {
+            assertTrue(md.contains(sql), sql + " in " + md);
+        }
         assertFalse(n.containsKey("db:s-service:name") || n.containsKey("db:s-service:x"), n.keySet().toString());
     }
 }
