@@ -430,6 +430,27 @@ class RepositoryTablesTest {
                 "GET /g/orders/list -> db:s-service:orders", "GET /os -> db:s-service:orders"), got);
     }
 
+    @Test
+    void aQualifiedTypeArgumentMatchesTheSameTypeWrittenUnqualified(@TempDir Path root) throws Exception {
+        Path s = root.resolve("s-service/src/main/java/s");
+        write(s.resolve("App.java"), "package s;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(s.resolve("X.java"), """
+                package s;
+                import java.util.UUID;
+                interface Handler<T> { String handle(T t); }
+                class LoggingHandler<T> implements Handler<T> { org.springframework.web.client.RestTemplate t; public String handle(T x) { return t.getForObject("http://audit/a", String.class); } }
+                class UuidHandler implements Handler<java.util.UUID> { org.springframework.web.client.RestTemplate t; public String handle(java.util.UUID x) { return t.getForObject("http://uuid/u", String.class); } }
+                @org.springframework.web.bind.annotation.RestController class Ctl { Handler<UUID> h;
+                  @org.springframework.web.bind.annotation.GetMapping("/g") String g() { return h.handle(null); } }
+                """);
+        Path o = root.resolve("out");
+        run("map", root, "--out", o.toString());
+        List<String> to = list(JSON.readTree(o.resolve("graph.json").toFile()).get("edges")).stream()
+                .map(e -> e.get("to").asText()).toList();
+        assertTrue(to.stream().anyMatch(t -> t.contains("http://audit")), to.toString());
+        assertTrue(to.stream().anyMatch(t -> t.contains("http://uuid")), to.toString());
+    }
+
     private static void node(String id, String tech, String table) {
         JsonNode n = nodes.get(id);
         assertEquals("db", n.get("kind").asText());

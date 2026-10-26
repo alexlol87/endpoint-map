@@ -265,7 +265,7 @@ public final class FlowTracer {
             List<Impl> fitting = all.stream().filter(i -> i.on() == null || (receiver.isEmpty() || i.on() == receiver.get(0)
                     || subtypes.getOrDefault(receiver.get(0), List.of()).contains(i.on()))
                     && ownTypeArgs(i.on(), args).entrySet().stream().allMatch(e -> !receiverArgs.containsKey(e.getKey())
-                            || receiverArgs.get(e.getKey()).text().equals(e.getValue().text()))).toList();
+                            || unqualified(receiverArgs.get(e.getKey()).text()).equals(unqualified(e.getValue().text())))).toList();
             for (Impl impl : fitting.isEmpty() ? all : fitting) {
                 MethodDeclaration callee = impl.method();
                 Integer at = stack.get(callee);
@@ -361,6 +361,11 @@ public final class FlowTracer {
     /** Implementations in the calling service or a library only: another service's class runs in that service. */
     private List<MethodDeclaration> implementations(MethodDeclaration m, Repo service) {
         return impls(m, service).stream().map(Impl::method).distinct().toList();
+    }
+
+    /** JDK and library types are not resolved, so java.util.UUID and UUID must compare equal. */
+    private static String unqualified(String type) {
+        return type == null ? null : type.replaceAll("\\s+", "").replaceAll("\\b[a-z_]\\w*\\.", "");
     }
 
     private List<Impl> impls(MethodDeclaration m, Repo service) {
