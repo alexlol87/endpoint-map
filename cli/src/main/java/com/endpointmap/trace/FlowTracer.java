@@ -116,6 +116,9 @@ public final class FlowTracer {
     }
 
     private final Types types;
+    private final Beans beans;
+    /** Call sites dispatching to several implementations, with the interface (or abstract class) called. */
+    private final Map<String, String> oneOf = new HashMap<>();
     private final List<OutboundDetector> detectors;
     private final ArgumentBinder binder;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
@@ -134,6 +137,7 @@ public final class FlowTracer {
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors, ArgumentBinder binder) {
         this.types = types;
+        this.beans = new Beans(ws);
         this.detectors = detectors;
         this.binder = binder;
         ws.repos().stream().flatMap(r -> r.sources().stream())
@@ -295,7 +299,16 @@ public final class FlowTracer {
                     || subtypes.getOrDefault(receiver.get(0), List.of()).contains(i.on()))
                     && ownTypeArgs(i.on(), args).entrySet().stream().allMatch(e -> !receiverArgs.containsKey(e.getKey())
                             || unqualified(receiverArgs.get(e.getKey()).text()).equals(unqualified(e.getValue().text())))).toList();
-            for (Impl impl : fitting.isEmpty() ? all : fitting) {
+            List<Impl> run = fitting.isEmpty() ? all : fitting;
+            if (run.size() > 1 && run.stream().allMatch(i -> i.on() != null)) {
+                List<ClassOrInterfaceDeclaration> kept = beans.narrow(call instanceof MethodCallExpr mc ? mc.getScope() : Optional.empty(),
+                        run.stream().map(Impl::on).distinct().toList(), service, config, types::repo);
+                run = run.stream().filter(i -> kept.stream().anyMatch(k -> k == i.on())).toList();
+            }
+            if (run.size() > 1) { // the flow tree groups the implementations under one oneOf node
+                oneOf.put(service.name() + " " + site(call), c.methods().get(0).findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString()).orElse(""));
+            }
+            for (Impl impl : run) {
                 MethodDeclaration callee = impl.method();
                 Integer at = stack.get(callee);
                 if (at != null) {
@@ -387,7 +400,6 @@ public final class FlowTracer {
         }
     }
 
-    // shortcut: no @Qualifier/@Primary narrowing and no oneOf node, every implementation is followed; M4 adds both
     /** Implementations in the calling service or a library only: another service's class runs in that service. */
     private List<MethodDeclaration> implementations(MethodDeclaration m, Repo service) {
         return impls(m, service).stream().map(Impl::method).distinct().toList();
@@ -599,6 +611,15 @@ public final class FlowTracer {
         if (decl.isEmpty() || decl.get() instanceof VariableDeclarator v && v.getParentNode().orElse(null) instanceof FieldDeclaration) {
             return fieldDeclared(name, at); // fields of supertypes too
         }
+        if (decl.get() instanceof Parameter p && p.getType().isUnknownType() && p.getParentNode().orElse(null) instanceof LambdaExpr l
+                && l.getParentNode().orElse(null) instanceof MethodCallExpr each && each.getNameAsString().equals("forEach")
+                && each.getScope().isPresent() && !(each.getScope().get() instanceof MethodCallExpr)) {
+            // notifiers.forEach(n -> ..) over a List<Notifier>: n is its element type
+            // shortcut: only variable/field.forEach(lambda); getX().forEach, stream().forEach, method refs, wildcards are not typed
+            String owner = each.getScope().get() instanceof FieldAccessExpr fa ? fa.getNameAsString() : each.getScope().get().toString();
+            return declared(owner, each).filter(ClassOrInterfaceType.class::isInstance).map(ClassOrInterfaceType.class::cast)
+                    .flatMap(ClassOrInterfaceType::getTypeArguments).filter(a -> a.size() == 1).map(a -> a.get(0));
+        }
         return Optional.of(decl.get() instanceof Parameter p ? p.getType() : ((VariableDeclarator) decl.get()).getType());
     }
 
@@ -666,6 +687,14 @@ public final class FlowTracer {
     /** Declared return types, as written, of the workspace methods {@code call} may reach (name and arity, no solver). */
     public List<String> returnTypes(MethodCallExpr call) {
         return byName(call).methods().stream().map(m -> m.getType().asString()).toList();
+    }
+
+    /**
+     * The interface called at a {@link Found#sites()} entry when, traced for {@code service} (its config and beans), it
+     * dispatches to several implementations; else null. A library call site can dispatch differently per service.
+     */
+    public String oneOf(String service, String site) {
+        return oneOf.get(service + " " + site);
     }
 
     /** The call expression at a {@link Found#sites()} entry (for the flow tree). */

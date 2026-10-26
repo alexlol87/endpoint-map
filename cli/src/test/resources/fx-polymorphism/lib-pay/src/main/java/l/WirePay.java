@@ -1,0 +1,1 @@
+package l; import org.springframework.web.reactive.function.client.WebClient; import reactor.core.publisher.Mono; @org.springframework.stereotype.Component public class WirePay implements Pay { public Mono<String> pay() { return WebClient.create("http://svc-b").get().uri("/b/wire").retrieve().bodyToMono(String.class); } }

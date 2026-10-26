@@ -73,10 +73,11 @@ class WebClientRestClientTest {
         assertEquals("external", edge("pricing-service GET /prices/{sku}", "external:https://api.exchangerate.host GET /convert")
                 .get("kind").asText());
         // RestClient.create(literal), builder().baseUrl(literal), concatenation with a variable, absolute uri on create()
+        // (#15: the @Primary DhlCarrier serves the unqualified field, the @Qualifier("ups") one the express endpoint)
         assertEquals(Set.of("external:https://api-eu.dhl.com POST /shipping/v2/orders",
-                        "external:https://labels.example-print.com POST /pdf/{id}",
-                        "external:https://onlinetools.ups.com POST /api/shipments/v1/ship"),
+                        "external:https://labels.example-print.com POST /pdf/{id}"),
                 targetsOf("shipping-service POST /shipments", "external:"));
+        edge("shipping-service POST /shipments/express", "external:https://onlinetools.ups.com POST /api/shipments/v1/ship");
         edge("shipping-service GET /shipments/{id}", "external:https://onlinetools.ups.com GET /api/track/v1/details/{*}");
         edge("shipping-service DELETE /shipments/{id}", "external:https://api-eu.dhl.com DELETE /shipping/v2/orders/{id}");
         edge("customer-service GET /customers-api/customers/{id}/orders-summary",
@@ -120,7 +121,7 @@ class WebClientRestClientTest {
         // record @ConfigurationProperties("warehouse.clients").inventoryUrl(): prod is an internal host of no service
         edge("warehouse-service POST /warehouse/dispatch/{sku}", "external:https://inventory.prod.acme.internal PUT /inventory/{sku}/reserve");
         edge("audit-service POST /audit/events", "external:https://api.siem-vendor.example.com POST /v2/events");
-        edge("notification-service POST /notifications/{userId}", "external:https://api.sendgrid.com POST /v3/mail/send");
+        edge("notification-service POST /notifications/broadcast", "external:https://api.sendgrid.com POST /v3/mail/send"); // every Notifier
         // the default profile names inventory-service by its port
         List<JsonNode> dev = map(ENV, "dev", dir.resolve("none.yml"), dir.resolve("out-dev"));
         assertTrue(dev.stream().anyMatch(e -> e.get("from").asText().equals("warehouse-service POST /warehouse/dispatch/{sku}")

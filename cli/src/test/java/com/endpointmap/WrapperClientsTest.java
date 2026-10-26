@@ -108,7 +108,7 @@ class WrapperClientsTest {
         edge(NOTIFY, "notification-service POST /notifications/{userId}");
         assertFalse(resolutions.get("notification-service").get("callSites").has("SmsNotifier.notify:17"), resolutions.toString());
         // a field initializer WebClient.create(literal) in a library class
-        assertEquals("EmailNotifier", edge(NOTIFY, "external:https://api.sendgrid.com POST /v3/mail/send").get("client").asText());
+        assertEquals("EmailNotifier", edge("notification-service POST /notifications/broadcast", "external:https://api.sendgrid.com POST /v3/mail/send").get("client").asText());
     }
 
     @Test

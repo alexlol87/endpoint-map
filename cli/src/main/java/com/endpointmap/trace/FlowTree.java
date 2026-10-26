@@ -45,6 +45,7 @@ public final class FlowTree {
 
     private final Function<String, Node> sites;
     private final Function<MethodCallExpr, List<String>> returnTypes;
+    private final java.util.function.BiFunction<String, String, String> oneOf;
     private final Map<String, List<Leaf>> leaves = new TreeMap<>();
     private final Set<String> truncated = new TreeSet<>();
 
@@ -55,7 +56,10 @@ public final class FlowTree {
 
     /** {@code sites}: the call expression at a {@link FlowTracer.Found#sites()} entry. */
     /** {@code returnTypes}: declared return types, as written, of the workspace methods a call may reach. */
-    public FlowTree(Function<String, Node> sites, Function<MethodCallExpr, List<String>> returnTypes) {
+    /** {@code oneOf}: (service, site) -> the interface the site dispatches through to several implementations there, else null. */
+    public FlowTree(Function<String, Node> sites, Function<MethodCallExpr, List<String>> returnTypes,
+                    java.util.function.BiFunction<String, String, String> oneOf) {
+        this.oneOf = oneOf;
         this.sites = sites;
         this.returnTypes = returnTypes;
     }
@@ -64,11 +68,11 @@ public final class FlowTree {
      * Records every path of {@code f} (traced from {@code handler}) to the graph edge {@code edge} it produced: an edge
      * reached from several places (an if and its else, two callers of one util) is a leaf under each of them.
      */
-    public void add(String endpoint, Node handler, FlowTracer.Found f, Map<String, Object> edge) {
-        f.paths().forEach(p -> add(endpoint, handler, p, edge));
+    public void add(String endpoint, String service, Node handler, FlowTracer.Found f, Map<String, Object> edge) {
+        f.paths().forEach(p -> add(endpoint, service, handler, p, edge));
     }
 
-    private void add(String endpoint, Node handler, FlowTracer.CallPath f, Map<String, Object> edge) {
+    private void add(String endpoint, String service, Node handler, FlowTracer.CallPath f, Map<String, Object> edge) {
         List<String> keys = new ArrayList<>();
         List<Map<String, Object>> json = new ArrayList<>();
         String last = "";
@@ -86,6 +90,11 @@ public final class FlowTree {
             controls(call, handler, keys, json);
             last = pos(call);
             if (i < calls) {
+                String iface = oneOf.apply(service, f.sites().get(i));
+                if (iface != null) { // one branch per implementation
+                    keys.add(pos(call) + ":oneOf:" + iface);
+                    json.add(node("oneOf", iface));
+                }
                 keys.add(pos(call) + ":call:" + f.via().get(i + offset));
                 json.add(node("call", f.via().get(i + offset)));
             }
@@ -156,6 +165,10 @@ public final class FlowTree {
     }
 
     private static Map<String, Object> json(Step s) {
+        if ("oneOf".equals(s.json().get("type")) && s.kids().size() == 1) {
+            // only one implementation leads to an edge here: no alternative to show, so a plain call
+            return json(s.kids().values().iterator().next());
+        }
         Map<String, Object> j = new LinkedHashMap<>(s.json());
         if (!s.kids().isEmpty()) {
             j.put("children", s.kids().values().stream().map(FlowTree::json).toList());
