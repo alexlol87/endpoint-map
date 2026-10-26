@@ -5,6 +5,11 @@ import com.endpointmap.trace.CallSite;
 import com.endpointmap.trace.OutboundCall;
 import com.endpointmap.trace.OutboundDetector;
 import com.endpointmap.workspace.Types;
+import com.endpointmap.workspace.Workspace;
+import com.endpointmap.workspace.Workspace.Repo;
+import com.github.javaparser.ast.Node;
+import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.nodeTypes.NodeWithTypeParameters;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
@@ -16,11 +21,15 @@ import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
+import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.IdentityHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
+import java.util.stream.Stream;
 
 /**
  * A call on a Spring Data repository: an interface extending one of Spring's repository interfaces, directly or
@@ -28,6 +37,8 @@ import java.util.Optional;
  * matched by name on the receiver's type. Table from the entity (the first generic argument): {@code @Table(name)}
  * (JPA or spring.data.relational), else {@code @Entity(name)}, else the class name in snake_case, as Spring Boot's
  * default naming (Hibernate's CamelCaseToUnderscoresNamingStrategy, R2DBC's DefaultNamingStrategy) maps it.
+ * The entity argument is bound from the receiver's declared type ({@code Base<Pet, Long>}) and, when it is still a
+ * type variable, from the calling service's subclasses (one edge each); with none, an unresolved db target.
  */
 public final class RepositoryDetector implements OutboundDetector {
 
@@ -43,10 +54,19 @@ public final class RepositoryDetector implements OutboundDetector {
     private record Base(String tech, ClassOrInterfaceType entity) {
     }
 
+    /** Methods every object has: never a query, though getClass looks like one. */
+    private static final Set<String> OBJECT = Set.of("getClass", "hashCode", "equals", "toString", "notify", "notifyAll", "wait");
+    /** Entities of other Spring Data stores (Redis, Mongo, Neo4j) on the same CrudRepository interfaces: no table. */
+    private static final Set<String> NOT_TABLES = Set.of("RedisHash", "Document", "Node");
+
+    private final Workspace ws;
     private final Types types;
     private final ConstantEvaluator constants;
+    /** Each workspace type's direct subtypes, as their extends/implements clause (lazy: only generic bases need it). */
+    private Map<TypeDeclaration<?>, List<ClassOrInterfaceType>> subClauses;
 
-    public RepositoryDetector(Types types, ConstantEvaluator constants) {
+    public RepositoryDetector(Workspace ws, Types types, ConstantEvaluator constants) {
+        this.ws = ws;
         this.types = types;
         this.constants = constants;
     }
@@ -55,17 +75,37 @@ public final class RepositoryDetector implements OutboundDetector {
     public List<OutboundCall> detect(CallSite site) {
         String name = site.call() instanceof MethodCallExpr mc ? mc.getNameAsString()
                 : site.call() instanceof MethodReferenceExpr ref ? ref.getIdentifier() : null;
-        if (name == null || site.receiverTypes().isEmpty()) {
+        if (name == null || OBJECT.contains(name)) {
             return List.of();
         }
-        TypeDeclaration<?> repo = site.receiverTypes().get(0);
-        Optional<Base> base = base(repo, Map.of(), 0);
-        MethodDeclaration declared = site.callees().isEmpty() ? null : site.callees().get(0);
-        String op = base.isEmpty() || declared != null && declared.getBody().isPresent() ? null : op(name, declared);
-        if (op == null) {
-            return List.of(); // not a repository, a default method (walked on), or Object's methods
+        ClassOrInterfaceType written = site.receiverType();
+        List<Type> writtenArgs = written == null ? List.of() : written.getTypeArguments().map(List::<Type>copyOf).orElse(List.of());
+        String repoName;
+        Optional<Base> base;
+        if (!site.receiverTypes().isEmpty()) {
+            TypeDeclaration<?> repo = site.receiverTypes().get(0);
+            repoName = repo.getNameAsString();
+            base = base(repo, bind(repo, writtenArgs), 0); // the receiver's own type arguments: Base<Pet, Long> base
+        } else if (written != null && SPRING.containsKey(written.getNameAsString())) { // a field typed JpaRepository<E, Long>
+            repoName = written.getNameAsString();
+            base = spring(written, writtenArgs);
+        } else {
+            return List.of();
         }
-        return List.of(OutboundCall.db(base.get().tech(), table(base.get().entity()), op, repo.getNameAsString() + "." + name));
+        MethodDeclaration declared = site.callees().isEmpty() ? null : site.callees().get(0);
+        String op = base.isEmpty() ? null : op(name, declared);
+        if (op == null) {
+            return List.of(); // not a repository, a default method or custom implementation (walked on), or Object's methods
+        }
+        String label = repoName + "." + name;
+        String tech = base.get().tech();
+        List<ClassOrInterfaceType> entities = entities(base.get().entity(), site.service());
+        if (entities.isEmpty()) {
+            return List.of(new OutboundCall(tech, null, null, null, null, "the entity of " + repoName + " is the type variable "
+                    + base.get().entity() + ", bound to no entity class in " + site.service().name(), label, null, op));
+        }
+        return entities.stream().map(this::table).flatMap(Optional::stream).distinct().sorted()
+                .map(t -> OutboundCall.db(tech, t, op, label)).toList();
     }
 
     /** The Spring interface reached from {@code t} and its entity argument, type variables bound along the way. */
@@ -77,29 +117,106 @@ public final class RepositoryDetector implements OutboundDetector {
             List<Type> args = ext.getTypeArguments().map(a -> a.stream().map(x -> bound.getOrDefault(x.asString(), x)).toList())
                     .orElse(List.of());
             Optional<TypeDeclaration<?>> own = types.resolveExact(ext);
-            if (own.isPresent() && own.get() instanceof ClassOrInterfaceDeclaration sup) {
-                Map<String, Type> next = new HashMap<>();
-                for (int i = 0; i < Math.min(args.size(), sup.getTypeParameters().size()); i++) {
-                    next.put(sup.getTypeParameters().get(i).getNameAsString(), args.get(i));
-                }
-                Optional<Base> b = base(sup, next, depth + 1);
-                if (b.isPresent()) {
-                    return b;
-                }
-            } else if (SPRING.containsKey(ext.getNameAsString()) && !args.isEmpty() && args.get(0) instanceof ClassOrInterfaceType e) {
-                return Optional.of(new Base(SPRING.get(ext.getNameAsString()), e));
+            Optional<Base> b = own.isPresent() ? base(own.get(), bind(own.get(), args), depth + 1) : spring(ext, args);
+            if (b.isPresent()) {
+                return b;
             }
         }
         return Optional.empty();
     }
 
-    private String table(ClassOrInterfaceType entityRef) {
+    private static Optional<Base> spring(ClassOrInterfaceType ref, List<Type> args) {
+        return SPRING.containsKey(ref.getNameAsString()) && !args.isEmpty() && args.get(0) instanceof ClassOrInterfaceType e
+                ? Optional.of(new Base(SPRING.get(ref.getNameAsString()), e)) : Optional.empty();
+    }
+
+    /** {@code t}'s type parameters bound to {@code args}, by position. */
+    private static Map<String, Type> bind(TypeDeclaration<?> t, List<Type> args) {
+        Map<String, Type> next = new HashMap<>();
+        if (t instanceof ClassOrInterfaceDeclaration c) {
+            for (int i = 0; i < Math.min(args.size(), c.getTypeParameters().size()); i++) {
+                next.put(c.getTypeParameters().get(i).getNameAsString(), args.get(i));
+            }
+        }
+        return next;
+    }
+
+    /**
+     * The entity class itself, or for a type variable ({@code E} of an {@code AbstractCrudService<E>}) every type the
+     * calling service's (or a library's) subclasses bind it to: the code may run for any of them. Empty: none known.
+     */
+    private List<ClassOrInterfaceType> entities(ClassOrInterfaceType entity, Repo service) {
+        Node owner = typeVariableOwner(entity);
+        if (owner == null) {
+            return List.of(entity);
+        }
+        return owner instanceof ClassOrInterfaceDeclaration c ? bindings(c, entity.getNameAsString(), service, 0) : List.of();
+    }
+
+    private List<ClassOrInterfaceType> bindings(ClassOrInterfaceDeclaration owner, String var, Repo service, int depth) {
+        int at = owner.getTypeParameters().stream().map(p -> p.getNameAsString()).toList().indexOf(var);
+        List<ClassOrInterfaceType> out = new ArrayList<>();
+        for (ClassOrInterfaceType clause : subClauses().getOrDefault(owner, List.of())) {
+            Node sub = clause.getParentNode().orElse(null);
+            Repo repo = types.repo(clause);
+            if (repo != service && repo.kind() != Workspace.Kind.library
+                    || !(clause.getTypeArguments().orElse(new NodeList<>()).stream().skip(at).findFirst().orElse(null) instanceof ClassOrInterfaceType a)) {
+                continue;
+            }
+            Node aOwner = typeVariableOwner(a);
+            if (aOwner == null) {
+                out.add(a);
+            } else if (aOwner == sub && depth < 10) { // Mid<X> extends CrudSvc<X>: X as Mid's subclasses bind it
+                out.addAll(bindings((ClassOrInterfaceDeclaration) sub, a.getNameAsString(), service, depth + 1));
+            }
+        }
+        return out;
+    }
+
+    /** The class, interface or method declaring {@code t} as a type parameter; null when {@code t} names a type. */
+    private static Node typeVariableOwner(ClassOrInterfaceType t) {
+        if (t.getScope().isPresent() || t.getTypeArguments().isPresent()) {
+            return null;
+        }
+        for (Node n = t; n != null; n = n.getParentNode().orElse(null)) {
+            if (n instanceof NodeWithTypeParameters<?> w && w.getTypeParameters().stream().anyMatch(p -> p.getNameAsString().equals(t.getNameAsString()))) {
+                return n;
+            }
+        }
+        return null;
+    }
+
+    private Map<TypeDeclaration<?>, List<ClassOrInterfaceType>> subClauses() {
+        if (subClauses == null) {
+            subClauses = new IdentityHashMap<>();
+            ws.repos().stream().flatMap(r -> r.sources().stream())
+                    .flatMap(sf -> sf.cu().findAll(ClassOrInterfaceDeclaration.class).stream())
+                    .flatMap(c -> Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream()))
+                    .forEach(st -> types.resolve(st).ifPresent(s -> subClauses.computeIfAbsent(s, k -> new ArrayList<>()).add(st)));
+        }
+        return subClauses;
+    }
+
+    /**
+     * Explicit names as written, quotes or backticks dropped; {@code schema.table} when {@code @Table(schema)} is set.
+     * Empty for another store's entity ({@code @RedisHash}, {@code @Document}).
+     */
+    private Optional<String> table(ClassOrInterfaceType entityRef) {
         Optional<TypeDeclaration<?>> entity = types.resolve(entityRef);
         if (entity.isEmpty()) {
-            return snake(entityRef.getNameAsString());
+            return Optional.of(snake(entityRef.getNameAsString()));
         }
-        return attr(entity.get(), "Table", "name", "value").or(() -> attr(entity.get(), "Entity", "name"))
-                .orElseGet(() -> snake(entity.get().getNameAsString()));
+        TypeDeclaration<?> e = entity.get();
+        if (e.getAnnotations().stream().anyMatch(a -> NOT_TABLES.contains(a.getName().getIdentifier()))) {
+            return Optional.empty();
+        }
+        String name = attr(e, "Table", "name", "value").or(() -> attr(e, "Entity", "name")).map(RepositoryDetector::unquote)
+                .orElseGet(() -> snake(e.getNameAsString()));
+        return Optional.of(attr(e, "Table", "schema").map(sch -> unquote(sch) + "." + name).orElse(name));
+    }
+
+    private static String unquote(String name) {
+        return name.replaceAll("^[\"`]+|[\"`]+$", "");
     }
 
     /** A non-blank String attribute of the type's annotation {@code simpleName}. */
@@ -116,23 +233,35 @@ public final class RepositoryDetector implements OutboundDetector {
     }
 
     /**
-     * By name prefix (findBy..., saveAll, deleteById). A repository method with another name: write when
-     * {@code @Modifying}, else read (a {@code @Query} SELECT); a name Spring doesn't declare (equals) is no call.
+     * By name prefix (findBy..., saveAll, deleteById) for a derived query or a method only Spring declares; a
+     * {@code @Query} method with another name: write when {@code @Modifying}, else read. A method of a fragment
+     * interface (not a repository itself), or a repository method neither derived nor annotated, is a custom
+     * implementation: no call, so its implementation is walked. Null too for a default method.
      */
     // shortcut: @Query/@Modifying methods get their op from the name and the entity's table, not from the SQL;
     // #11 parses the query (DELETE FROM other_table) and adds EntityManager/DatabaseClient
-    static String op(String name, MethodDeclaration declared) {
+    private String op(String name, MethodDeclaration declared) {
+        String byName = null;
         for (Map.Entry<String, List<String>> e : OPS.entrySet()) {
             for (String p : e.getValue()) {
-                if (name.startsWith(p) && (name.length() == p.length() || !Character.isLowerCase(name.charAt(p.length())))) {
-                    return e.getKey();
+                if (byName == null && name.startsWith(p) && (name.length() == p.length() || !Character.isLowerCase(name.charAt(p.length())))) {
+                    byName = e.getKey();
                 }
             }
         }
         if (declared == null) {
+            return byName;
+        }
+        if (declared.getBody().isPresent()) {
             return null;
         }
-        return declared.getAnnotationByName("Modifying").isPresent() ? "write" : "read";
+        boolean modifying = declared.getAnnotationByName("Modifying").isPresent();
+        if (!modifying && declared.getAnnotationByName("Query").isEmpty()) {
+            boolean fragment = declared.getParentNode().filter(TypeDeclaration.class::isInstance)
+                    .map(t -> base((TypeDeclaration<?>) t, Map.of(), 0).isEmpty()).orElse(true);
+            return fragment ? null : byName;
+        }
+        return byName != null ? byName : modifying ? "write" : "read";
     }
 
     static String snake(String camel) {

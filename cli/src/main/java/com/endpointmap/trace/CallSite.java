@@ -4,6 +4,7 @@ import com.endpointmap.workspace.Workspace.Repo;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.Expression;
+import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import java.util.List;
 import java.util.Map;
 
@@ -13,8 +14,10 @@ import java.util.Map;
  * resolves placeholders even inside library code. {@code receiverTypes} is the static type of the call's receiver
  * followed by its workspace supertypes (empty when unknown): a {@code @FeignClient} interface may inherit all its
  * methods from a shared API interface. {@code method} is the method being walked and {@code args} what its callers
- * passed to its parameters (see {@link ArgumentBinder}).
+ * passed to its parameters (see {@link ArgumentBinder}). {@code receiverType} is the receiver variable's or field's
+ * declared type as written ({@code Base<Pet, Long>}, also a framework type), null when the receiver is no variable.
  */
 public record CallSite(Expression call, List<MethodDeclaration> callees, List<TypeDeclaration<?>> receiverTypes,
-                       Repo service, Map<String, String> config, MethodDeclaration method, Map<String, ArgValue> args) {
+                       Repo service, Map<String, String> config, MethodDeclaration method, Map<String, ArgValue> args,
+                       ClassOrInterfaceType receiverType) {
 }

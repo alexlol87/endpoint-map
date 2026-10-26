@@ -115,11 +115,12 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Service calling itself through a library impl built by `@Bean new SmsNotifier(url)` (`/sms` also fits `/{userId}`: both edges) | notification-service `SmsNotifier` -> `POST /notifications/sms` |
 
 ### Database and Redis
-Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too.
+Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too. Explicit names are kept as written minus quotes/backticks, with `@Table(schema)` as `schema.table`. A custom fragment method (`OrderRepositoryCustom`) is no repository call: its `*Impl` is walked instead.
 
 | Case | Location |
 |---|---|
 | JPA `JpaRepository`, `@Table`, derived queries, `@Modifying @Query` JPQL, native `@Query` | order-service |
+| Custom repository fragment `OrderRepositoryCustom.purgeLines` implemented by `OrderRepositoryImpl` (`EntityManager` native DELETE, #11): walked, no `OrderRepository.purgeLines` edge | order-service `DELETE /api/orders/{id}` |
 | JPA `CrudRepository`, table from `@Entity(name)`, native query with JOIN | customer-service |
 | JPA bare `Repository` + `PagingAndSortingRepository`, table = class name (`stock_item`), `exists`/`stream` prefixes, `EntityManager` | inventory-service |
 | `JdbcTemplate` and `JdbcClient` raw SQL (SELECT / INSERT / UPDATE / DELETE) | report-service |
