@@ -41,13 +41,30 @@ public final class Resolutions {
             """;
     private static final Set<String> HEADER_LINES = Set.copyOf(HEADER.lines().toList());
     private static final String STALE = "# stale: no longer found in code";
+    /** "# used by Class.method (path/File.java:12)", as {@link #write} makes it. */
+    private static final Pattern USED_BY = Pattern.compile("# used by \\S+ \\(.+:\\d+\\)");
     /** Path of comments after the last key. */
     private static final String END = "\u0001end";
     private static final Pattern VALUE = Pattern.compile("|service:\\S+|external:https?://[^/\\s]+\\S*");
     private static final Pattern PLAIN = Pattern.compile("[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)*");
 
-    /** A key found in code this run: where it is used ({@code usages}, sorted) and what code showed ({@code hint}). */
-    public record Found(String service, String section, String key, String hint, Set<String> usages) {
+    /**
+     * A key found in code this run: where it is used ({@code usages}, sorted) and what code showed ({@code hints}: one
+     * per distinct URL expression, as several clients can share one placeholder).
+     */
+    public record Found(String service, String section, String key, Set<String> hints, Set<String> usages) {
+
+        /** The hints in one line, the URL expressions of those with the same reason listed together; null if none. */
+        public String hint() {
+            Map<String, List<String>> byReason = new java.util.LinkedHashMap<>();
+            for (String h : hints) {
+                int at = h.indexOf("; ");
+                byReason.computeIfAbsent(at < 0 ? "" : h.substring(at), k -> new ArrayList<>()).add(at < 0 ? h : h.substring(0, at));
+            }
+            List<String> out = new ArrayList<>();
+            byReason.forEach((reason, codes) -> out.add(String.join(", ", codes) + reason));
+            return out.isEmpty() ? null : String.join(" | ", out);
+        }
     }
 
     /** {@code blank} counts unknowns; a blank {@code host:} entry keeps what code found and is counted in {@code hostBlank}. */
@@ -129,15 +146,21 @@ public final class Resolutions {
         List<String> pending = new ArrayList<>();
         List<Integer> indents = new ArrayList<>();
         List<String> names = new ArrayList<>();
+        boolean afterUsedBy = false;
         for (String line : text.replace("\uFEFF", "").split("\\R")) {
             String t = line.strip();
             if (t.startsWith("#")) {
-                if (!(HEADER_LINES.contains(t) || t.startsWith("# used by ") || t.startsWith("# hint: ")
-                        || t.startsWith("# stale"))) {
+                // only lines in the exact form write() makes are regenerated; "# hint: <x>" only right after its
+                // "# used by" lines (every found key has at least one), so a user's own "# hint: ..." note is kept
+                boolean generated = HEADER_LINES.contains(t) || USED_BY.matcher(t).matches()
+                        || t.startsWith("# hint: ") && afterUsedBy || t.equals(STALE);
+                if (!generated) {
                     pending.add(t);
                 }
+                afterUsedBy = USED_BY.matcher(t).matches();
                 continue;
             }
+            afterUsedBy = false;
             int comment = commentStart(line);
             String name = keyOf(comment < 0 ? line : line.substring(0, comment));
             if (name == null) {

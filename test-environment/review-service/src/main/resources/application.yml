@@ -5,3 +5,7 @@ spring:
     name: review-service
 catalog:
   url: http://localhost:9081
+clients:
+  profile-url: http://localhost:9086/profile-api
+  inventory-url: ${INVENTORY_URL:http://localhost:8083}
+  customer-url: http://localhost:8082/customers-api

@@ -1,10 +1,10 @@
 package com.endpointmap.trace;
 
+import com.endpointmap.workspace.Names;
 import com.endpointmap.workspace.Types;
 import com.endpointmap.workspace.Workspace;
 import com.endpointmap.workspace.Workspace.Repo;
 import com.github.javaparser.ast.Node;
-import com.github.javaparser.ast.body.CallableDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.FieldDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
@@ -13,7 +13,6 @@ import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
-import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
@@ -24,6 +23,7 @@ import com.github.javaparser.ast.type.Type;
 import com.github.javaparser.resolution.declarations.ResolvedMethodDeclaration;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -37,7 +37,8 @@ import java.util.stream.Stream;
  * Walks method bodies from a handler down through any number of calls (services, static utils, library code) and
  * asks every {@link OutboundDetector} to classify each call. A classified call ends that branch; any other call
  * into workspace code is followed. An interface/abstract method is followed into each implementation.
- * Calls the symbol solver can't resolve fall back to name + arity matching and are marked low confidence.
+ * Calls the symbol solver can't resolve fall back to name + arity matching, low confidence when several match or
+ * the receiver's type was a guess by simple name.
  * Each method keeps one result per call site and target, so repeated calls and diamonds don't multiply paths.
  */
 public final class FlowTracer {
@@ -47,6 +48,10 @@ public final class FlowTracer {
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
+    }
+
+    /** A receiver's static type; {@code exact} when found by the solver, a scoped declaration or Java's import rules. */
+    private record Typed(TypeDeclaration<?> type, boolean exact) {
     }
 
     /** {@code backTo}: stack depth of the shallowest method a recursive call jumped back to, MAX_VALUE if none. */
@@ -59,15 +64,20 @@ public final class FlowTracer {
 
     private final Types types;
     private final List<OutboundDetector> detectors;
+    private final ArgumentBinder binder;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
-    // per service: detectors resolve placeholders with the calling service's config, so library results differ
-    // shortcut: keyed by method only, so a util called with different arguments (WebClient bean, URL) reuses the
-    // first caller's result; add argument bindings to the key with argument propagation (#5/#7)
-    private final Map<Repo, Map<MethodDeclaration, List<Found>>> memo = new IdentityHashMap<>();
+    // per service: detectors resolve placeholders with the calling service's config, so library results differ;
+    // per argument values: a util called with another WebClient bean or URL reaches another target
+    private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, List<Found>>>> memo = new IdentityHashMap<>();
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors) {
+        this(ws, types, detectors, ArgumentBinder.NONE);
+    }
+
+    public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors, ArgumentBinder binder) {
         this.types = types;
         this.detectors = detectors;
+        this.binder = binder;
         ws.repos().stream().flatMap(r -> r.sources().stream())
                 .flatMap(sf -> sf.cu().findAll(ClassOrInterfaceDeclaration.class).stream())
                 .filter(c -> !c.isInterface())
@@ -75,20 +85,23 @@ public final class FlowTracer {
     }
 
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        return walk(handler, service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        return walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
     }
 
     /**
      * {@code stack} maps each method being walked to its depth. {@code partial} holds results cut short by a recursive
      * call back to a method still on the stack: valid until that method returns, so a cycle is walked once, not once
-     * per path into it.
+     * per path into it. {@code args}: what the caller passed to m's parameters.
      */
-    private Result walk(MethodDeclaration m, Repo service, Map<String, String> config, Map<MethodDeclaration, Integer> stack,
-                        Map<MethodDeclaration, Result> partial) {
-        Map<MethodDeclaration, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>());
-        if (done.containsKey(m)) {
-            return new Result(done.get(m), Integer.MAX_VALUE);
+    private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
+                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Result> partial) {
+        Map<Map<String, ArgValue>, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
+                .computeIfAbsent(m, k -> new HashMap<>());
+        if (done.containsKey(args)) {
+            return new Result(done.get(args), Integer.MAX_VALUE);
         }
+        // shortcut: a cut-short result is reused whatever the arguments; only matters for a cycle walked with two
+        // different argument values at once, key partial by args too if that shows up
         if (partial.containsKey(m)) {
             return partial.get(m);
         }
@@ -105,13 +118,16 @@ public final class FlowTracer {
             Callees c = callees(call);
             List<TypeDeclaration<?>> receiver = receiverTypes(call);
             boolean classified = false;
-            for (MethodDeclaration callee : c.methods()) { // one detection per callee, so via names the right one
-                List<OutboundCall> out = detectors.stream()
-                        .flatMap(d -> d.detect(new CallSite(call, List.of(callee), receiver, service, config)).stream()).toList();
-                // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
-                String label = receiver.isEmpty() || callee.getBody().isPresent() ? label(callee)
-                        : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
-                out.forEach(o -> add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low())));
+            // one detection per callee, so via names the right one; a framework call (WebClient...) has none
+            for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
+                List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
+                        callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
+                for (OutboundCall o : out) {
+                    // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
+                    String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
+                            ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low()));
+                }
                 classified |= !out.isEmpty();
             }
             if (classified) {
@@ -123,7 +139,9 @@ public final class FlowTracer {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
-                Result r = walk(callee, service, config, stack, partial);
+                Map<String, ArgValue> calleeArgs = call instanceof MethodCallExpr mc
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : Map.of();
+                Result r = walk(callee, calleeArgs, service, config, stack, partial);
                 backTo = Math.min(backTo, r.backTo());
                 for (Found f : r.found()) {
                     List<String> via = new ArrayList<>(List.of(label(callee)));
@@ -136,7 +154,7 @@ public final class FlowTracer {
         partial.values().removeIf(r -> r.backTo() >= depth); // they were cut back to m or below, which is done now
         Result result = new Result(List.copyOf(found.values()), backTo);
         if (backTo >= depth) { // complete: any recursion below came back to m itself, not to a caller still being walked
-            done.put(m, result.found());
+            done.put(args, result.found());
             return new Result(result.found(), Integer.MAX_VALUE);
         }
         partial.put(m, result);
@@ -156,7 +174,7 @@ public final class FlowTracer {
     private List<TypeDeclaration<?>> receiverTypes(Expression call) {
         Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope()
                 : Optional.of(((MethodReferenceExpr) call).getScope());
-        return scope.flatMap(this::scopeType)
+        return scope.flatMap(this::scopeType).map(Typed::type)
                 .map(t -> Stream.concat(Stream.of(t), supertypes(t).stream()).toList()).orElse(List.of());
     }
 
@@ -165,8 +183,9 @@ public final class FlowTracer {
             ResolvedMethodDeclaration r = call instanceof MethodCallExpr mc ? mc.resolve() : ((MethodReferenceExpr) call).resolve();
             return new Callees(r.toAst(MethodDeclaration.class).map(d -> List.of(types.canonical(d))).orElse(List.of()), false);
         } catch (RuntimeException | StackOverflowError e) {
-            List<MethodDeclaration> byName = byName(call);
-            return new Callees(byName, !byName.isEmpty());
+            // the solver fails on any signature naming a type outside the workspace (every Mono-returning method):
+            // one method of that name and arity is still certain when the receiver's type itself was not a guess
+            return byName(call);
         }
     }
 
@@ -186,7 +205,7 @@ public final class FlowTracer {
     }
 
     /** Fallback when the solver fails: methods of the scope's type (and its supertypes) with that name and arity. */
-    private List<MethodDeclaration> byName(Expression call) {
+    private Callees byName(Expression call) {
         String name;
         Optional<Expression> scope;
         int args;
@@ -200,17 +219,18 @@ public final class FlowTracer {
             scope = Optional.of(ref.getScope());
             args = -1; // a method reference does not show its arity
         }
-        Optional<TypeDeclaration<?>> owner = scope.isEmpty() ? enclosingType(call) : scopeType(scope.get());
-        return owner.stream().flatMap(o -> Stream.concat(Stream.of(o), supertypes(o).stream()))
+        Optional<Typed> owner = scope.isEmpty() ? enclosingType(call).map(t -> new Typed(t, true)) : scopeType(scope.get());
+        List<MethodDeclaration> ms = owner.stream().flatMap(o -> Stream.concat(Stream.of(o.type()), supertypes(o.type()).stream()))
                 .flatMap(t -> t.getMethodsByName(name).stream())
                 .filter(m -> args < 0 || m.getParameters().size() == args
                         || m.getParameters().stream().anyMatch(Parameter::isVarArgs))
                 .distinct().toList();
+        return new Callees(ms, ms.size() > 1 || !ms.isEmpty() && owner.filter(Typed::exact).isEmpty());
     }
 
-    private Optional<TypeDeclaration<?>> scopeType(Expression scope) {
+    private Optional<Typed> scopeType(Expression scope) {
         if (scope instanceof ThisExpr) {
-            return enclosingType(scope);
+            return enclosingType(scope).map(t -> new Typed(t, true));
         }
         if (scope instanceof TypeExpr t) { // "inventory::release" parses as a type; a variable of that name wins
             return variableType(t.getType().asString(), scope).or(() -> typeOf(t.getType()));
@@ -219,46 +239,35 @@ public final class FlowTracer {
             return fieldType(fa.getNameAsString(), scope);
         }
         if (scope instanceof NameExpr n) {
-            Optional<TypeDeclaration<?>> variable = variableType(n.getNameAsString(), scope);
-            // not a variable: a static call on a class (UrlUtils.join)
-            return variable.isPresent() ? variable : types.bySimpleNameNear(n.getNameAsString(), scope);
+            Optional<Typed> variable = variableType(n.getNameAsString(), scope);
+            // not a variable: a static call on a class (UrlUtils.join), exact only through imports or the package
+            return variable.isPresent() ? variable : types.byImports(n.getNameAsString(), scope).map(t -> new Typed(t, true))
+                    .or(() -> types.bySimpleNameNear(n.getNameAsString(), scope).map(t -> new Typed(t, false)));
         }
         return Optional.empty();
     }
 
-    /** Declared type of a parameter, local variable or field visible from {@code at}, innermost first. */
-    private Optional<TypeDeclaration<?>> variableType(String name, Node at) {
-        for (Node n = at; n != null; n = n.getParentNode().orElse(null)) {
-            List<Parameter> params = n instanceof CallableDeclaration<?> cd ? cd.getParameters()
-                    : n instanceof LambdaExpr l ? l.getParameters() : List.of();
-            for (Parameter p : params) {
-                if (p.getNameAsString().equals(name)) {
-                    return typeOf(p.getType());
-                }
-            }
-            if (n instanceof CallableDeclaration<?>) {
-                for (VariableDeclarator v : n.findAll(VariableDeclarator.class)) {
-                    if (v.getNameAsString().equals(name) && !(v.getParentNode().orElse(null) instanceof FieldDeclaration)) {
-                        return typeOf(v.getType());
-                    }
-                }
-            }
-            if (n instanceof TypeDeclaration<?>) {
-                return fieldType(name, at);
-            }
+    /** Declared type of a parameter, local variable or field visible from {@code at}, by scope (see {@link Names}). */
+    private Optional<Typed> variableType(String name, Node at) {
+        Optional<Node> decl = Names.declaration(name, at);
+        if (decl.isEmpty() || decl.get() instanceof VariableDeclarator v && v.getParentNode().orElse(null) instanceof FieldDeclaration) {
+            return fieldType(name, at); // fields of supertypes too
         }
-        return Optional.empty();
+        return typeOf(decl.get() instanceof Parameter p ? p.getType() : ((VariableDeclarator) decl.get()).getType());
     }
 
-    private Optional<TypeDeclaration<?>> fieldType(String name, Node at) {
+    private Optional<Typed> fieldType(String name, Node at) {
         Optional<TypeDeclaration<?>> owner = enclosingType(at);
         return owner.stream().flatMap(o -> Stream.concat(Stream.of(o), supertypes(o).stream()))
                 .flatMap(t -> t.getFieldByName(name).stream())
                 .findFirst().flatMap(f -> typeOf(f.getVariable(0).getType()));
     }
 
-    private Optional<TypeDeclaration<?>> typeOf(Type type) {
-        return type instanceof ClassOrInterfaceType ct ? types.resolve(ct) : Optional.empty();
+    private Optional<Typed> typeOf(Type type) {
+        if (!(type instanceof ClassOrInterfaceType ct)) {
+            return Optional.empty();
+        }
+        return types.resolveExact(ct).map(t -> new Typed(t, true)).or(() -> types.resolve(ct).map(t -> new Typed(t, false)));
     }
 
     private static Optional<TypeDeclaration<?>> enclosingType(Node n) {
