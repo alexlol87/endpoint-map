@@ -45,6 +45,7 @@ public final class FlowTree {
 
     private final Function<String, Node> sites;
     private final Function<MethodCallExpr, List<String>> returnTypes;
+    private final Function<String, String> oneOf;
     private final Map<String, List<Leaf>> leaves = new TreeMap<>();
     private final Set<String> truncated = new TreeSet<>();
 
@@ -55,7 +56,9 @@ public final class FlowTree {
 
     /** {@code sites}: the call expression at a {@link FlowTracer.Found#sites()} entry. */
     /** {@code returnTypes}: declared return types, as written, of the workspace methods a call may reach. */
-    public FlowTree(Function<String, Node> sites, Function<MethodCallExpr, List<String>> returnTypes) {
+    /** {@code oneOf}: the interface a site dispatches through to several implementations, else null. */
+    public FlowTree(Function<String, Node> sites, Function<MethodCallExpr, List<String>> returnTypes, Function<String, String> oneOf) {
+        this.oneOf = oneOf;
         this.sites = sites;
         this.returnTypes = returnTypes;
     }
@@ -86,6 +89,11 @@ public final class FlowTree {
             controls(call, handler, keys, json);
             last = pos(call);
             if (i < calls) {
+                String iface = oneOf.apply(f.sites().get(i));
+                if (iface != null) { // one branch per implementation
+                    keys.add(pos(call) + ":oneOf:" + iface);
+                    json.add(node("oneOf", iface));
+                }
                 keys.add(pos(call) + ":call:" + f.via().get(i + offset));
                 json.add(node("call", f.via().get(i + offset)));
             }

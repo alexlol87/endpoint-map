@@ -157,9 +157,9 @@ Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) an
 | `onErrorResume`, `retryWhen`, `retry`, `then` chains | review-service, warehouse-service |
 | `Flux.zip`, `retryWhen`, `filter`, `Mono.fromCallable` over blocking RestClient | analytics-service |
 | `Mono.when`, `zipWith`, `flatMapMany` | recommendation-service, user-profile-service |
-| Interface with `@Primary` + `@Qualifier` impls | shipping-service `CarrierGateway` (Dhl primary, Ups qualified) |
-| Interface with two conditional impls and no qualifier -> oneOf | shipping-service `LabelPrinter` |
-| Library interface, impls from library `@Bean`s and a local `@Primary`, `@Qualifier("sms")`, `List<Notifier>` | notification-service + lib-reactive-clients `Notifier` |
+| Interface with `@Primary` + `@Qualifier` impls; `GET`/`DELETE /shipments/{id}` pick either by tracking-number prefix | shipping-service `CarrierGateway` (Dhl primary, Ups qualified) |
+| Interface with two `@ConditionalOnProperty` impls: `labels.format` unset, so only `PdfLabelPrinter` (`matchIfMissing`), no oneOf | shipping-service `LabelPrinter` |
+| Library interface, impls from library `@Bean`s and a local `@Primary`, `@Qualifier("sms")` (narrowed: no oneOf), `List<Notifier>.forEach` (oneOf of all three) | notification-service + lib-reactive-clients `Notifier` |
 | Cross-service cycle (MVC) | order `GET /orders/by-customer/{id}/summary` <-> customer `GET /customers/{id}/orders-summary` |
 | Cross-service cycle (WebFlux) | search `GET /search/products/{sku}/similar` <-> analytics `GET /analytics/trending` |
 | Cross-service cycle (functional route + `@HttpExchange`) | loyalty `POST /loyalty/{userId}/simulate` <-> cart `GET /carts/{userId}/points-preview` |

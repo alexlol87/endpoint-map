@@ -41,11 +41,16 @@ public class ShipmentController implements ShipmentApi {
 
     @Override
     public Map<String, Object> get(String id) {
-        return Map.of("id", id, "status", defaultCarrier.track(id));
+        // UPS tracking numbers start with 1Z: the qualified carrier, else the primary one
+        return Map.of("id", id, "status", id.startsWith("1Z") ? expressCarrier.track(id) : defaultCarrier.track(id));
     }
 
     @Override
     public void cancel(String id) {
-        defaultCarrier.cancel(id);
+        if (id.startsWith("1Z")) {
+            expressCarrier.cancel(id);
+        } else {
+            defaultCarrier.cancel(id);
+        }
     }
 }
