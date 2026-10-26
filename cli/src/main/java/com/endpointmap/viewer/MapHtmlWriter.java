@@ -18,8 +18,9 @@ public final class MapHtmlWriter {
                 .replace("/*@CYTOSCAPE@*/", resource("cytoscape.min.js"))
                 .replace("/*@DAGRE@*/", resource("dagre.min.js"))
                 .replace("/*@CYTOSCAPE_DAGRE@*/", resource("cytoscape-dagre.js"))
-                // "</" inside a string would end the <script> element early
-                .replace("/*@GRAPH@*/null", graphJson.replace("</", "<\\/"));
+                // <, >, & only occur inside JSON strings: \\u escapes keep "</script>" and "<!--" from reaching the HTML parser
+                .replace("/*@GRAPH@*/null", graphJson.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+                        .replace("\u2028", "\\u2028").replace("\u2029", "\\u2029"));
         Files.writeString(file, html);
     }
 

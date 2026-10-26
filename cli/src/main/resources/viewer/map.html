@@ -27,6 +27,8 @@
   .seg button:last-child { border-radius: 0 6px 6px 0; border-left: 0; }
   header button.on { background: #0969da; border-color: #0969da; color: #fff; }
   .hint { color: var(--muted); margin: 0 0 8px; }
+  #picks label { display: flex; gap: 6px; align-items: baseline; font-size: 12px; word-break: break-all; cursor: pointer; }
+  #depth { width: 90px; }
   #details { white-space: pre-wrap; word-break: break-all; font: 12px/1.5 ui-monospace, Menlo, monospace; }
 </style>
 </head>
@@ -36,13 +38,18 @@
   <div class="seg" role="group" aria-label="Detail level">
     <button id="l1" type="button">L1 services</button><button id="l2" type="button">L2 endpoints</button>
   </div>
-  <input id="search" type="search" placeholder="Filter endpoints (service, verb, path, handler)" aria-label="Filter endpoints">
+  <div class="seg" role="group" aria-label="Direction">
+    <button id="down" type="button">Downstream</button><button id="up" type="button">Upstream</button>
+  </div>
+  <label>Depth <input id="depth" type="range" min="1" max="11" value="11" aria-label="Depth"> <span id="depthv">all</span></label>
+  <input id="search" type="search" placeholder="Search endpoints, tables, Redis keys" aria-label="Search start points">
   <button id="clear" type="button">Show all</button>
   <span class="stats" id="stats"></span>
 </header>
 <div id="cy"></div>
 <aside>
-  <p class="hint">Click an endpoint (L2) or a service (L1) to see what it calls downstream. Shift-click adds to the selection.</p>
+  <p class="hint">Tick start points (search above), or click an endpoint/service/table; shift-click adds. Upstream shows who reaches the selection.</p>
+  <h2>Start from</h2><div id="picks"></div>
   <h2>Verbs</h2><div id="verbs"></div>
   <h2>Targets</h2><div id="kinds"></div>
   <h2>Services</h2><div id="services"></div>
@@ -66,27 +73,42 @@ GRAPH.edges.forEach(e => (out[e.from] = out[e.from] || []).push(e));
 // L1 node for any L2 node: endpoints roll up to their service, external to its host, unresolved to what is missing,
 // a db table stays itself
 // (a known service without the endpoint stays a separate ✕ node, so the gap shows at L1 too)
-const l1Of = n => n.kind === 'endpoint' ? 'svc:' + n.service : n.kind === 'db' ? n.id
+const l1Of = n => n.kind === 'endpoint' ? 'svc:' + n.service : n.kind === 'db' || n.kind === 'redis' ? n.id
   : n.kind === 'external' ? 'external:' + n.host : 'unresolved:' + n.id.replace(/^unresolved:/, '').split(' ')[0];
-const l1Label = id => id.startsWith('svc:') ? id.slice(4) : id.startsWith('db:') ? id.slice(3) : id.startsWith('external:') ? id.slice(9) : '✕ ' + id.slice(11);
+const l1Label = id => id.startsWith('svc:') ? id.slice(4) : id.startsWith('db:') ? id.slice(3) : id.startsWith('redis:') ? 'redis ' + id.slice(6) : id.startsWith('external:') ? id.slice(9) : '✕ ' + id.slice(11);
 
-let level = 'L2';
-let roots = new Set(); // selected endpoint ids; empty = whole map
+// a whole L2 map of hundreds of endpoints takes dagre many seconds; start big workspaces at L1
+let level = endpoints.length > 300 ? 'L1' : 'L2';
+let roots = new Set(); // selected node ids; empty = whole map
+let dir = 'down', depth = 11; // depth 11 = unlimited
+const inc = {};
+GRAPH.edges.forEach(e => (inc[e.to] = inc[e.to] || []).push(e));
+// pick list: endpoints, then a table across all services that use it, then Redis keys
+const tables = {};
+GRAPH.nodes.filter(n => n.kind === 'db').forEach(n => (tables[n.table] = tables[n.table] || []).push(n.id));
+const picks = [...endpoints.map(n => ({ key: n.id, ids: [n.id] })),
+  ...Object.keys(tables).sort().map(t => ({ key: 'table ' + t, ids: tables[t] })),
+  ...GRAPH.nodes.filter(n => n.kind === 'redis').map(n => ({ key: 'redis ' + n.keyPattern, ids: [n.id] }))];
 
-function downstream() {
+// breadth-first so the depth limit counts hops from the nearest root
+function reach() {
   if (!roots.size) return { nodes: new Set(GRAPH.nodes.map(n => n.id)), edges: GRAPH.edges };
-  const nodes = new Set(roots), edges = [], todo = [...roots];
-  while (todo.length) {
-    (out[todo.pop()] || []).forEach(e => {
+  const adj = dir === 'down' ? out : inc, end = e => dir === 'down' ? e.to : e.from;
+  const nodes = new Set(roots), edges = [];
+  let front = [...roots];
+  for (let d = 0; front.length && (depth >= 11 || d < depth); d++) {
+    const next = [];
+    front.forEach(id => (adj[id] || []).forEach(e => {
       edges.push(e);
-      if (!nodes.has(e.to)) { nodes.add(e.to); todo.push(e.to); }
-    });
+      if (!nodes.has(end(e))) { nodes.add(end(e)); next.push(end(e)); }
+    }));
+    front = next;
   }
   return { nodes, edges };
 }
 
 function elements() {
-  const { nodes, edges } = downstream();
+  const { nodes, edges } = reach();
   const els = [], seen = new Set();
   const add = (id, data, classes) => { if (!seen.has(id)) { seen.add(id); els.push({ data: { id, ...data }, classes }); } };
   const pair = {};
@@ -101,13 +123,16 @@ function elements() {
       const parent = n.service ? 'svc:' + n.service : undefined;
       if (n.kind === 'endpoint') add(id, { ...n, label: n.method + ' ' + n.path, parent, color: colorOf[n.service], verb: verbColor(n.method) }, 'endpoint');
       else if (n.kind === 'db') add(id, { ...n, label: n.id.slice(3) }, 'db');
+      else if (n.kind === 'redis') add(id, { ...n, label: 'redis ' + n.keyPattern }, 'db redis');
       else add(id, { ...n, label: (n.kind === 'unresolved' ? '✕ ' : '') + (n.method || '') + ' ' + (n.path || ''), parent, verb: verbColor(n.method) }, n.kind);
     });
     edges.forEach(e => link(e.from, e.to, e));
   } else {
     nodes.forEach(id => {
       const n = nodeById[id], l1 = l1Of(n);
-      add(l1, { label: l1Label(l1), color: n.service ? colorOf[n.service] : '#ffffff' }, l1.startsWith('svc:') ? 'service1' : n.kind);
+      // db/redis keep their own id at L1, so they carry kind and stay clickable start points
+      add(l1, { label: l1Label(l1), color: n.service ? colorOf[n.service] : '#ffffff', kind: l1 === id ? n.kind : undefined },
+        l1.startsWith('svc:') ? 'service1' : n.kind === 'redis' ? 'db redis' : n.kind);
     });
     edges.forEach(e => link(l1Of(nodeById[e.from]), l1Of(nodeById[e.to]), e));
   }
@@ -140,6 +165,7 @@ const cy = cytoscape({
     { selector: 'node.db', style: { label: 'data(label)', 'text-valign': 'center', 'text-halign': 'center',
       'font-size': 11, color: '#1f2328', width: 200, height: 36, shape: 'barrel', 'background-color': '#d0d7de',
       'border-color': '#6e7781', 'border-width': 2, 'text-max-width': 190, 'text-wrap': 'ellipsis' } },
+    { selector: 'node.redis', style: { 'background-color': '#a31515', 'border-color': '#6b0d0d', color: '#ffffff' } },
     { selector: 'node:selected', style: { 'border-width': 5, 'overlay-opacity': 0.08 } },
     { selector: 'node.root', style: { 'underlay-color': '#0969da', 'underlay-opacity': 0.25, 'underlay-padding': 4 } },
     { selector: '.dim', style: { opacity: 0.12 } },
@@ -150,26 +176,46 @@ const cy = cytoscape({
   ]
 });
 
+const BIG = 300;
 function render() {
+  if (level === 'L2' && !roots.size && endpoints.length > BIG) {
+    level = 'L1';
+    alert(`${endpoints.length} endpoints are too many to lay out at L2 at once. Pick start points first.`);
+  }
   cy.elements().remove();
   cy.add(elements());
   cy.nodes().forEach(n => n.toggleClass('root', roots.has(n.id()) ||
     (level === 'L1' && [...roots].some(r => l1Of(nodeById[r]) === n.id()))));
-  cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
+  // shortcut: dagre takes seconds above ~400 edges; breadthfirst is fast but rougher. Upgrade with a web-worker layout if needed.
+  cy.layout(cy.edges().length > 400 ? { name: 'breadthfirst', directed: true, spacingFactor: 0.8 }
+    : { name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
   cy.fit(undefined, 30);
   document.getElementById('l1').classList.toggle('on', level === 'L1');
   document.getElementById('l2').classList.toggle('on', level === 'L2');
+  document.getElementById('down').classList.toggle('on', dir === 'down');
+  document.getElementById('up').classList.toggle('on', dir === 'up');
+  document.getElementById('depthv').textContent = depth >= 11 ? 'all' : depth;
+  showPicks();
+  dim();
   document.getElementById('stats').textContent = roots.size
-    ? `downstream of ${roots.size} endpoint(s): ${cy.edges().length} link(s)`
+    ? `${dir}stream of ${roots.size} node(s): ${cy.edges().length} link(s)`
     : `${endpoints.length} endpoints, ${GRAPH.edges.length} calls`;
 }
 
-const legend = (el, items) => el.innerHTML = items.map(([label, css]) =>
-  `<div class="row"><span class="sw ${css.cls || ''}" style="${css.style}"></span>${label}</div>`).join('');
+// DOM + textContent: service names come from scanned folders and must not become markup
+const legend = (el, items) => items.forEach(([label, css]) => {
+  const row = document.createElement('div'), sw = document.createElement('span');
+  row.className = 'row';
+  sw.className = 'sw ' + (css.cls || '');
+  sw.style.cssText = css.style;
+  row.append(sw, label);
+  el.append(row);
+});
 legend(document.getElementById('verbs'), Object.entries(VERB).map(([v, c]) => [v, { cls: 'verb', style: 'border-color:' + c }]));
 legend(document.getElementById('kinds'), [
   ['external API', { style: 'border:2px dashed #57606a' }],
   ['database table', { style: 'border:2px solid #6e7781;background:#d0d7de;border-radius:40%/25%' }],
+  ['Redis key', { style: 'border:2px solid #6b0d0d;background:#a31515;border-radius:40%/25%' }],
   ['✕ unresolved', { style: 'border:2px solid #d63031;background:#fff0f0' }],
   ['low-confidence call (dashed)', { style: 'border-top:2px dashed #8c959f;border-radius:0;height:0' }]]);
 legend(document.getElementById('services'), GRAPH.services.map(s =>
@@ -186,7 +232,7 @@ cy.on('tap', 'node', ev => {
   } else {
     details.textContent = d.label;
   }
-  const picked = d.kind === 'endpoint' ? [d.id]
+  const picked = d.kind === 'endpoint' || d.kind === 'db' || d.kind === 'redis' ? [d.id]
     : ev.target.hasClass('service1') ? endpoints.filter(n => 'svc:' + n.service === d.id).map(n => n.id) : null;
   if (!picked) return;
   if (!ev.originalEvent || !ev.originalEvent.shiftKey) roots = new Set();
@@ -200,13 +246,36 @@ cy.on('tap', 'edge', ev => {
     (e.repoMethod ? `${e.op ? e.op + ': ' : ''}${e.repoMethod}\n` : '') +
     `via: ${e.via.join(' -> ')}\nat: ${e.file}:${e.line}`).join('\n\n');
 });
-document.getElementById('search').addEventListener('input', ev => {
-  const q = ev.target.value.trim().toLowerCase();
-  cy.batch(() => cy.nodes('.endpoint, .service1').forEach(n => {
+const search = document.getElementById('search');
+// shortcut: list caps at 50 matches, refine the search to reach the rest
+function showPicks() {
+  const q = search.value.trim().toLowerCase();
+  const hits = picks.filter(p => p.ids.some(id => roots.has(id)) ||
+    (q && (p.key + ' ' + (nodeById[p.ids[0]].handler || '')).toLowerCase().includes(q))).slice(0, 50);
+  const box = document.getElementById('picks');
+  box.innerHTML = '';
+  if (!hits.length) box.textContent = q ? 'No match.' : 'Type in the search box.';
+  hits.forEach(p => {
+    const l = document.createElement('label'), c = document.createElement('input');
+    c.type = 'checkbox';
+    c.checked = p.ids.every(id => roots.has(id));
+    c.onchange = () => { p.ids.forEach(id => c.checked ? roots.add(id) : roots.delete(id)); render(); };
+    l.append(c, p.key);
+    box.append(l);
+  });
+}
+function dim() {
+  const q = search.value.trim().toLowerCase();
+  cy.batch(() => cy.nodes('.endpoint, .service1, .db').forEach(n => {
     const hit = !q || (n.data('id') + ' ' + (n.data('handler') || '')).toLowerCase().includes(q);
     n.toggleClass('dim', !hit);
   }));
-});
+}
+search.addEventListener('input', () => { showPicks(); dim(); });
+document.getElementById('down').onclick = () => { dir = 'down'; render(); };
+document.getElementById('up').onclick = () => { dir = 'up'; render(); };
+// onchange: one relayout when the slider is released, not one per step dragged
+document.getElementById('depth').onchange = ev => { depth = +ev.target.value; render(); };
 document.getElementById('l1').onclick = () => { level = 'L1'; render(); };
 document.getElementById('l2').onclick = () => { level = 'L2'; render(); };
 document.getElementById('clear').onclick = () => { roots = new Set(); details.textContent = 'Nothing selected.'; render(); };

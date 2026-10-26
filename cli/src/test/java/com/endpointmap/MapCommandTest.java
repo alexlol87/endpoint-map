@@ -179,6 +179,38 @@ class MapCommandTest {
         assertFalse(html.contains("/*@"), "all placeholders filled");
     }
 
+    /** Names from scanned code end up in map.html: they must not end the script element or open a comment in it. */
+    @Test
+    void hostileNamesCannotBreakOutOfTheEmbeddedGraph(@TempDir Path root) throws Exception {
+        Path d = root.resolve("evil\"><img src=x onerror=alert(1)>/src/main/java/g");
+        Files.createDirectories(d);
+        Files.writeString(d.resolve("App.java"), "package g;\n@org.springframework.boot.autoconfigure.SpringBootApplication class App {}\n");
+        Files.writeString(d.resolve("Ctl.java"), "package g;\n@org.springframework.web.bind.annotation.RestController\npublic class Ctl {\n"
+                + "  @org.springframework.web.bind.annotation.GetMapping(\"/a</script><!--<script>&\u2028\") String a() { return \"\"; }\n}\n");
+        ByteArrayOutputStream err = new ByteArrayOutputStream();
+        assertEquals(0, Main.run(new String[] {"map", "--root", root.toString(), "--out", root.resolve("out").toString()},
+                new PrintStream(new ByteArrayOutputStream(), true), new PrintStream(err, true)), err.toString());
+        String html = Files.readString(root.resolve("out/map.html"));
+        String graph = html.substring(html.indexOf("const GRAPH = "), html.indexOf("// ANY"));
+        assertTrue(graph.contains("/a\\u003c/script\\u003e\\u003c!--\\u003cscript\\u003e\\u0026"), graph);
+        assertTrue(graph.contains("evil\\\"\\u003e\\u003cimg"), graph);
+        for (String raw : List.of("<", ">", "&", "\u2028")) {
+            assertFalse(graph.contains(raw), raw);
+        }
+    }
+
+    /** #17 controls; behaviour is checked in a browser by src/test/playwright/viewer-smoke.js. */
+    @Test
+    void mapHtmlContainsUpstreamMultiSelectAndDepthControls() throws Exception {
+        String html = Files.readString(out.resolve("map.html"));
+        for (String id : List.of("id=\"down\"", "id=\"up\"", "id=\"depth\"", "id=\"picks\"", "id=\"search\"")) {
+            assertTrue(html.contains(id), id);
+        }
+        assertTrue(html.contains("'table ' + t"), "tables pickable as upstream start points");
+        assertTrue(html.contains("'redis ' + n.keyPattern"), "Redis keys pickable");
+        assertTrue(html.contains("serviceColor(s.colorIndex)"), "colour from graph.json colorIndex (alphabetical, stable)");
+    }
+
     @Test
     void profileSelectsContextPath(@TempDir Path root) throws Exception {
         Path svc = root.resolve("svc");
