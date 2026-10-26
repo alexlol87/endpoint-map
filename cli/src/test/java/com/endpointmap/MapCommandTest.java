@@ -179,6 +179,18 @@ class MapCommandTest {
         assertFalse(html.contains("/*@"), "all placeholders filled");
     }
 
+    /** #17 controls; behaviour is checked in a browser by src/test/playwright/viewer-smoke.js. */
+    @Test
+    void mapHtmlHasUpstreamMultiSelectAndDepth() throws Exception {
+        String html = Files.readString(out.resolve("map.html"));
+        for (String id : List.of("id=\"down\"", "id=\"up\"", "id=\"depth\"", "id=\"picks\"", "id=\"search\"")) {
+            assertTrue(html.contains(id), id);
+        }
+        assertTrue(html.contains("'table ' + t"), "tables pickable as upstream start points");
+        assertTrue(html.contains("'redis ' + n.keyPattern"), "Redis keys pickable");
+        assertTrue(html.contains("serviceColor(s.colorIndex)"), "colour from graph.json colorIndex (alphabetical, stable)");
+    }
+
     @Test
     void profileSelectsContextPath(@TempDir Path root) throws Exception {
         Path svc = root.resolve("svc");
