@@ -119,7 +119,107 @@ class OpenApiAttributionTest {
         assertTrue(used.contains("- `order-service/docs/clients/openapi-inventory.json`: documents inventory-service (2 of 2"), used);
         assertTrue(used.contains("- `order-service/src/main/resources/openapi/openapi-inventory.yaml`: documents inventory-service"), used);
         assertTrue(out.section("OpenAPI files skipped").contains("- `order-service/docs/openapi-partner.json`: not used: could not tell"
-                + " which service it documents (none of its 1 operations match any service's code)"), out.report);
+                + " which service it documents (none of its 1 operations match only one service's code; order-service has endpoints"
+                + " and none of them are in it)"), out.report);
+    }
+
+    static final String PAYMENT_SPEC = "{\"openapi\": \"3.0.1\", \"paths\": {\"/payments\": {\"get\": {}}, \"/payments/a\": {\"get\": {}},"
+            + " \"/payments/b\": {\"get\": {}}, \"/payments/c\": {\"get\": {}}, \"/payments/d\": {\"get\": {}}, \"/payments/e\": {\"get\": {}}}}";
+    static final List<String> PAYMENT_EXTRA = List.of("payment-service GET /payments/a", "payment-service GET /payments/b",
+            "payment-service GET /payments/c", "payment-service GET /payments/d", "payment-service GET /payments/e");
+
+    /** payment-service (WebFlux): its routes are built in a loop the walker cannot read; {@code readable} adds GET /payments. */
+    void paymentService(boolean readable) throws Exception {
+        Path p = root.resolve("payment-service/src/main/java/p");
+        write(p.resolve("App.java"), "package p;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        String head = """
+                package p;
+                import org.springframework.context.annotation.*;
+                import org.springframework.web.reactive.function.server.*;
+                import static org.springframework.web.reactive.function.server.RouterFunctions.route;
+                """;
+        if (readable) {
+            write(p.resolve("Ok.java"), head + "@Configuration\npublic class Ok {\n"
+                    + "  @Bean RouterFunction<ServerResponse> ok(H h) { return route().GET(\"/payments\", h::list).build(); }\n}\n");
+        }
+        write(p.resolve("Routes.java"), head + """
+                @Configuration
+                public class Routes {
+                  static String[] EXTRA = {"/payments/a", "/payments/b", "/payments/c", "/payments/d", "/payments/e"};
+                  @Bean RouterFunction<ServerResponse> r(H h) {
+                    RouterFunctions.Builder b = route();
+                    for (String p : EXTRA) b = b.GET(p, h::list);
+                    return b.build();
+                  }
+                }
+                class H { reactor.core.publisher.Mono<ServerResponse> list(ServerRequest r) { return null; } }
+                """);
+    }
+
+    @Test
+    void ownSpecIsUsedWhenTheWalkerReadsFewOfItsRoutes(@TempDir Path docs) throws Exception { // recheck A, D
+        workspace();
+        paymentService(true);
+        write(root.resolve("payment-service/openapi.json"), PAYMENT_SPEC);
+        Out out = run();
+        assertEquals(PAYMENT_EXTRA, openapiOnly(out), out.report);
+        assertTrue(out.section("OpenAPI files used").contains("- `payment-service/openapi.json`: documents payment-service (low overlap,"
+                + " 1 of 6 operations match its code; attributed by location, check)"), out.report);
+        // the same file in --openapi-dir, named after the service: same bar
+        Files.move(root.resolve("payment-service/openapi.json"), docs.resolve("payment-service.json"));
+        out = run("--openapi-dir", docs.toString());
+        assertEquals(PAYMENT_EXTRA, openapiOnly(out), out.report);
+        assertTrue(out.section("OpenAPI files used").contains("- `openapi-dir:payment-service.json`: documents payment-service (low"
+                + " overlap, 1 of 6 operations match its code; attributed by name, check)"), out.report);
+    }
+
+    @Test
+    void serviceWhoseRoutesNoneAreReadStillAppearsFromItsSpec() throws Exception { // recheck A
+        workspace();
+        paymentService(false);
+        write(root.resolve("payment-service/openapi.json"), PAYMENT_SPEC);
+        Out out = run();
+        List<String> all = new ArrayList<>(List.of("payment-service GET /payments"));
+        all.addAll(PAYMENT_EXTRA);
+        assertEquals(all, openapiOnly(out), out.report);
+        assertTrue(out.section("OpenAPI files used").contains("documents payment-service (low overlap, 0 of 6"), out.report);
+    }
+
+    @Test
+    void sharedHealthAndInfoPathsDoNotMakeTheHoldingRepoOwnAVendoredSpec() throws Exception { // recheck B
+        workspace();
+        String health = """
+                package %s;
+                @org.springframework.web.bind.annotation.RestController public class Health {
+                  @org.springframework.web.bind.annotation.GetMapping("/health") public void h() { }
+                  @org.springframework.web.bind.annotation.GetMapping("/info") public void i() { }
+                }
+                """;
+        write(root.resolve("order-service/src/main/java/o/Health.java"), health.formatted("o"));
+        write(root.resolve("inventory-service/src/main/java/i/Health.java"), health.formatted("i"));
+        String spec = "{\"openapi\": \"3.0.1\", \"paths\": {\"/health\": {\"get\": {}}, \"/info\": {\"get\": {}},"
+                + " \"/warehouses\": {\"get\": {}}, \"/warehouses/{id}\": {\"get\": {}}, \"/transfers\": {\"post\": {}}}}";
+        write(root.resolve("order-service/docs/clients/openapi-inventory.json"), spec);
+        Out out = run();
+        assertEquals(List.of("inventory-service GET /warehouses", "inventory-service GET /warehouses/{id}",
+                "inventory-service POST /transfers"), openapiOnly(out), out.report);
+        assertFalse(out.report.contains("order-service GET /api/orders` ("), "order-service has no spec of its own: " + out.report);
+    }
+
+    @Test
+    void externalHostSpecServedByAnotherRepoStaysExternal() throws Exception { // recheck C (vendor mock)
+        workspace();
+        String spec = "{\"openapi\": \"3.0.1\", \"servers\": [{\"url\": \"https://api.vendor.com\"}], \"paths\": {"
+                + "\"/stock/{sku}\": {\"get\": {}}, \"/stock/reserve\": {\"post\": {}}}}";
+        write(root.resolve("order-service/docs/openapi-vendor.json"), spec);
+        Out out = run();
+        assertEquals(List.of(), openapiOnly(out), out.report);
+        assertTrue(out.section("OpenAPI files used").contains("- `order-service/docs/openapi-vendor.json`: external API of"
+                + " https://api.vendor.com"), out.report);
+        Files.move(root.resolve("order-service/docs/openapi-vendor.json"), root.resolve("inventory-service/openapi.json"));
+        out = run();
+        assertTrue(out.section("OpenAPI files used").contains("- `inventory-service/openapi.json`: documents inventory-service (2 of 2"),
+                out.report);
     }
 
     @Test

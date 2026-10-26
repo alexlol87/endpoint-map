@@ -29,13 +29,15 @@ import java.util.stream.Stream;
 
 /**
  * OpenAPI 3 and Swagger 2 files, found as {@code **}{@code /openapi*}, {@code api-docs*}, {@code swagger*}
- * (.json/.yaml/.yml) in every Java repo, plus every such file (any name) under {@code --openapi-dir}. Which service a
- * file documents is decided by its content: the service whose code endpoints match most of its operations (verb and
- * path, tried with and without the server URL path and the service's context path), when that is at least 3 or half
- * of them (2 for the repo holding the file or the service its server URL names); ties go to the service its server URL names, then the repo holding the file, then a repo named in its
- * path or {@code info.title}. A file no service clears that bar for describes an external API when its server host
- * is not a workspace service, else it is not used (both listed in the report). Paths are compared segment by
- * segment, template variables matching anything whatever their names.
+ * (.json/.yaml/.yml) in every Java repo, plus every such file (any name) under {@code --openapi-dir}. A file's owner is
+ * the service its server URL names, else the service its file name or {@code info.title} names, else the repo holding
+ * it. Overlap with a service is how many operations its code endpoints match (verb and path, tried with and without
+ * the server URL path and the service's context path), leaving out operations whose paths 2 or more services have
+ * (health, info, actuator). The file documents its owner even at low overlap (flagged in the report), unless another
+ * service has strictly more overlap and at least 3 or half of its operations, or the owner has endpoints and none of
+ * them is in the file (a vendored client or partner spec). With an external server host the file is that external
+ * API, unless its owner clears the 3-or-half bar. Otherwise it is not used (listed in the report). Paths are compared
+ * segment by segment, template variables matching anything whatever their names.
  */
 public final class OpenApi {
 
@@ -47,7 +49,12 @@ public final class OpenApi {
     }
 
     /** A loaded file before attribution: {@code host} null when its server URL has none (relative, or a variable). */
-    private record Raw(String file, String repo, Set<String> hints, String url, String host, String prefix, List<Operation> ops) {
+    private record Raw(String file, String repo, String owner, Set<String> hints, String url, String host, String prefix,
+            List<Operation> ops) {
+    }
+
+    /** A service's best prefix for a file: {@code distinct} operations matched that no other service has, {@code raw} all matched. */
+    private record Score(String service, String prefix, int distinct, int raw) {
     }
 
     private static final Pattern NAME = Pattern.compile("(openapi|api-docs|swagger)[^/]*\\.(json|ya?ml)");
@@ -61,6 +68,7 @@ public final class OpenApi {
     private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
 
     private final TargetMatcher matcher;
+    private final List<String> services;
     private final Map<String, String> basePaths = new HashMap<>();
     private final List<Raw> raws = new ArrayList<>();
     private final List<Spec> specs = new ArrayList<>();
@@ -74,6 +82,7 @@ public final class OpenApi {
     /** Auto-finds inside each repo (non-Java folders are not repos, so they are skipped), and reads {@code openapiDir} too. */
     public OpenApi(Workspace ws, String openapiDir, TargetMatcher matcher, Map<String, Map<String, String>> configs) {
         this.matcher = matcher;
+        this.services = ws.repos().stream().map(Workspace.Repo::name).sorted().toList();
         configs.forEach((s, c) -> basePaths.put(s, ConfigResolver.basePath(c)));
         Map<Path, String> files = new LinkedHashMap<>(); // file -> repo holding it
         ws.repos().forEach(r -> find(r.dir(), NAME).forEach(f -> files.put(f, r.name())));
@@ -123,6 +132,13 @@ public final class OpenApi {
                 hints.add(r.name());
             }
         });
+        // the service the file name names: the longest service name (without "-service") that is a whole-word run of the stem
+        String stem = "-" + file.getFileName().toString().toLowerCase().replaceFirst("\\.[^.]*$", "").replaceAll("[^a-z0-9]+", "-") + "-";
+        List<String> byName = ws.repos().stream().map(Workspace.Repo::name).filter(n -> n.equals(title)
+                || stem.contains("-" + n.toLowerCase().replaceFirst("-service$", "") + "-")).toList();
+        int longest = byName.stream().mapToInt(String::length).max().orElse(0);
+        List<String> top = byName.stream().filter(n -> n.length() == longest).toList();
+        String owner = top.size() == 1 ? top.get(0) : repo != null ? repo : hints.size() == 1 ? hints.iterator().next() : null;
         Map<String, Integer> lines = keyLines(text);
         List<Operation> ops = new ArrayList<>();
         doc.get("paths").fields().forEachRemaining(p -> {
@@ -140,7 +156,7 @@ public final class OpenApi {
             VERBS.stream().filter(it::has).forEach(v -> ops.add(new Operation(v.toUpperCase(), p.getKey(), null,
                     text(it.get(v), "operationId"), text(it.get(v), "summary"), rel, lines.getOrDefault(p.getKey(), 1))));
         });
-        raws.add(new Raw(rel, repo, hints, url, host, prefix, ops));
+        raws.add(new Raw(rel, repo, owner, hints, url, host, prefix, ops));
     }
 
     /** {@code servers[0].url} with its variables set to their defaults. */
@@ -223,47 +239,94 @@ public final class OpenApi {
 
     private void classify(Raw r, Map<String, List<Endpoint>> code) {
         String named = r.host() == null ? null : matcher.service(r.host());
-        String best = null;
-        String bestPrefix = r.prefix();
-        int bestCount = 0;
-        for (Map.Entry<String, List<Endpoint>> s : code.entrySet()) {
-            String base = basePaths.getOrDefault(s.getKey(), "");
-            for (String prefix : new LinkedHashSet<>(List.of(r.prefix(), UrlPaths.join(base, r.prefix()), "", base))) {
-                int n = (int) r.ops().stream().filter(op -> s.getValue().stream()
-                        .anyMatch(e -> matches(e, op.method(), UrlPaths.join(prefix, op.key())))).count();
-                if (n > bestCount || n > 0 && n == bestCount && rank(r, named, s.getKey()) < rank(r, named, best)) {
-                    best = s.getKey();
-                    bestPrefix = prefix;
-                    bestCount = n;
-                }
+        boolean external = r.host() != null && matcher.isExternal(r.host());
+        Map<String, List<String>> prefixes = new TreeMap<>();
+        for (String s : services) {
+            String base = basePaths.getOrDefault(s, "");
+            prefixes.put(s, List.copyOf(new LinkedHashSet<>(List.of(r.prefix(), UrlPaths.join(base, r.prefix()), "", base))));
+        }
+        List<Operation> ops = r.ops();
+        // operations matching code in 2+ services (health, info, actuator) say nothing about which one the file documents
+        Set<Operation> shared = new java.util.HashSet<>();
+        for (Operation op : ops) {
+            if (services.stream().filter(s -> prefixes.get(s).stream().anyMatch(p -> hit(code.get(s), p, op))).count() > 1) {
+                shared.add(op);
             }
         }
-        int total = r.ops().size();
-        String counts = bestCount + " of " + total + " operations match its code";
-        // the repo holding the file, or the service its server names, needs only 2 (some routes are not readable from code)
-        int need = rank(r, named, best) <= 1 ? 2 : 3;
-        if (best != null && (bestCount >= need || bestCount * 2 >= total)) {
-            String p = bestPrefix;
-            specs.add(new Spec(r.file(), best, null, r.ops().stream().map(op -> new Operation(op.method(), op.key(),
+        Map<String, Score> scores = new TreeMap<>();
+        Score best = null;
+        for (String s : services) {
+            Score top = null;
+            for (String p : prefixes.get(s)) {
+                List<Operation> hits = ops.stream().filter(op -> hit(code.get(s), p, op)).toList();
+                Score sc = new Score(s, p, (int) hits.stream().filter(op -> !shared.contains(op)).count(), hits.size());
+                if (top == null || sc.distinct() > top.distinct() || sc.distinct() == top.distinct() && sc.raw() > top.raw()) {
+                    top = sc;
+                }
+            }
+            String base = basePaths.getOrDefault(s, "");
+            if (top.raw() == 0 && !r.prefix().startsWith(base)) { // nothing matches: the context path, then the server path
+                top = new Score(s, UrlPaths.join(base, r.prefix()), 0, 0);
+            }
+            scores.put(s, top);
+            if (top.distinct() > 0 && (best == null || top.distinct() > best.distinct()
+                    || top.distinct() == best.distinct() && rank(r, named, s) < rank(r, named, best.service()))) {
+                best = top;
+            }
+        }
+        int total = ops.size();
+        String dflt = named != null ? named : r.owner();
+        Score own = dflt == null ? null : scores.get(dflt);
+        // shortcut: an owner whose code has endpoints yet matches none of the file is taken for a vendored copy, even if
+        // it is the owner's spec-first doc of routes the walker cannot read; upgrade with a reason from the user (resolutions)
+        boolean disowned = own != null && own.raw() == 0 && code.containsKey(dflt);
+        Score chosen;
+        String why = "";
+        if (external) {
+            chosen = best != null && best.service().equals(r.owner()) && clears(best, total) ? best : null;
+        } else if (best != null && clears(best, total) && (own == null || best.distinct() > own.distinct())) {
+            chosen = best;
+        } else if (own != null && !disowned) {
+            chosen = own;
+            why = clears(own, total) ? "" : "low overlap, " + own.distinct() + " of " + total + " operations match its code; attributed by "
+                    + (dflt.equals(named) ? "its server URL" : dflt.equals(r.repo()) ? "location" : "name") + ", check";
+        } else {
+            chosen = null;
+        }
+        String counts = best == null ? "none of its " + total + " operations match only one service's code"
+                : "best match " + best.service() + ", " + best.distinct() + " of " + total + " operations match its code";
+        if (chosen != null) {
+            String p = chosen.prefix();
+            specs.add(new Spec(r.file(), chosen.service(), null, ops.stream().map(op -> new Operation(op.method(), op.key(),
                     UrlPaths.join(p, op.key()), op.operationId(), op.summary(), op.file(), op.line())).toList()));
-            used.add("`" + r.file() + "`: documents " + best + " (" + counts + (p.isEmpty() || p.equals("/") ? ""
-                    : "; paths prefixed with `" + UrlPaths.join(p) + "`") + ")");
-        } else if (r.host() != null && matcher.isExternal(r.host())) {
-            specs.add(new Spec(r.file(), null, r.host(), r.ops().stream().map(op -> new Operation(op.method(), op.key(),
+            used.add("`" + r.file() + "`: documents " + chosen.service() + " (" + (why.isEmpty() ? chosen.distinct() + " of " + total
+                    + " operations match its code" : why) + (p.isEmpty() || p.equals("/") ? "" : "; paths prefixed with `"
+                    + UrlPaths.join(p) + "`") + ")");
+        } else if (external) {
+            specs.add(new Spec(r.file(), null, r.host(), ops.stream().map(op -> new Operation(op.method(), op.key(),
                     UrlPaths.join(r.prefix(), op.key()), op.operationId(), op.summary(), op.file(), op.line())).toList()));
             used.add("`" + r.file() + "`: external API of " + r.host() + " (its server host is not a workspace service"
-                    + (best == null ? " and no service's code has its operations)" : "; best service match " + best + ", " + counts + ")"));
+                    + (best == null ? " and no service's code has its operations)" : "; " + counts + ")"));
         } else {
-            problems.add("`" + r.file() + "`: not used: could not tell which service it documents ("
-                    + (best == null ? "none of its " + total + " operations match any service's code"
-                    : "best match " + best + ", " + counts + "; at least " + need + " or half are needed")
+            problems.add("`" + r.file() + "`: not used: could not tell which service it documents (" + counts
+                    + (best == null ? "" : "; at least 3 or half are needed")
+                    + (disowned ? "; " + dflt + " has endpoints and none of them are in it" : "")
                     + (r.host() == null ? "" : ", server " + r.host()) + ")");
         }
     }
 
+    /** Enough overlap to give a file to a service other than its owner: at least 3 operations or half of them. */
+    private static boolean clears(Score s, int total) {
+        return s.distinct() > 0 && (s.distinct() >= 3 || s.distinct() * 2 >= total);
+    }
+
+    private static boolean hit(List<Endpoint> code, String prefix, Operation op) {
+        return code != null && code.stream().anyMatch(e -> matches(e, op.method(), UrlPaths.join(prefix, op.key())));
+    }
+
     /** Tie-break among services matching equally many operations: lower wins. */
     private static int rank(Raw r, String named, String service) {
-        return service == null ? 9 : service.equals(named) ? 0 : service.equals(r.repo()) ? 1 : r.hints().contains(service) ? 2 : 3;
+        return service == null ? 9 : service.equals(named) ? 0 : service.equals(r.owner()) ? 1 : r.hints().contains(service) ? 2 : 3;
     }
 
     private static boolean matches(Endpoint e, String method, String path) {
