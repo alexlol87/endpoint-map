@@ -2,6 +2,7 @@ package com.endpointmap.trace;
 
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.body.MethodDeclaration;
+import com.github.javaparser.ast.expr.AnnotationExpr;
 import com.github.javaparser.ast.expr.ConditionalExpr;
 import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
@@ -243,6 +244,20 @@ public final class FlowTree {
                 j.add(0, node(type, label));
             }
             ch = p;
+        }
+        if (call instanceof AnnotationExpr a) { // a resilience fallback, called by the framework when the method fails
+            // keyed at the method's end: after what its body reaches
+            Node m = a.getParentNode().orElse(a);
+            k.add(m.getEnd().map(p -> String.format("%06d:%06d", p.line, p.column)).orElse(pos(a)) + ":fallback:" + pos(a));
+            j.add(node("fallback", "@" + a.getNameAsString() + a.findFirst(com.github.javaparser.ast.expr.MemberValuePair.class,
+                    p -> p.getNameAsString().equals("name")).map(p -> "(" + text(p) + ")").orElse("")));
+        } else if (ch instanceof MethodDeclaration md) { // retried as a whole: outside everything in its body
+            for (AnnotationExpr a : md.getAnnotations().reversed()) {
+                if (a.getName().getIdentifier().equals("Retry") || a.getName().getIdentifier().equals("Retryable")) {
+                    k.add(0, pos(a) + ":retry:" + a.getNameAsString());
+                    j.add(0, node("retry", text(a)));
+                }
+            }
         }
         keys.addAll(k);
         json.addAll(j);
