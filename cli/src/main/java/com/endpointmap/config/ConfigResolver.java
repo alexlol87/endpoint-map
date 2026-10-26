@@ -97,6 +97,11 @@ public final class ConfigResolver {
         }
     }
 
+    /** The prefix every inbound path gets: {@code server.servlet.context-path}, else {@code spring.webflux.base-path}. */
+    public static String basePath(Map<String, String> config) {
+        return resolve(config.getOrDefault("server.servlet.context-path", config.getOrDefault("spring.webflux.base-path", "")), config);
+    }
+
     /**
      * Expands {@code ${key}} and {@code ${key:default}} from {@code props}, then the default; a placeholder with
      * neither (an environment variable, say) becomes {@code {*}}.

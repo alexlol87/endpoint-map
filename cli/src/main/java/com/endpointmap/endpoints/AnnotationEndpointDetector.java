@@ -64,8 +64,7 @@ public final class AnnotationEndpointDetector {
         List<Endpoint> out = new ArrayList<>();
         for (Repo repo : ws.repos()) {
             Map<String, String> config = ConfigResolver.load(repo.dir(), profile, warnings);
-            String contextPath = ConfigResolver.resolve(config.getOrDefault("server.servlet.context-path",
-                    config.getOrDefault("spring.webflux.base-path", "")), config);
+            String contextPath = ConfigResolver.basePath(config);
             for (SourceFile sf : repo.sources()) {
                 for (ClassOrInterfaceDeclaration c : sf.cu().findAll(ClassOrInterfaceDeclaration.class)) {
                     if (!c.isInterface() && (Workspace.hasAnnotation(c, "RestController") || Workspace.hasAnnotation(c, "Controller"))) {

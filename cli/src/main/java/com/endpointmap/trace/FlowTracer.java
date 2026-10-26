@@ -14,6 +14,7 @@ import com.github.javaparser.ast.body.VariableDeclarator;
 import com.github.javaparser.ast.expr.EnclosedExpr;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.FieldAccessExpr;
+import com.github.javaparser.ast.expr.LambdaExpr;
 import com.github.javaparser.ast.expr.MethodCallExpr;
 import com.github.javaparser.ast.expr.MethodReferenceExpr;
 import com.github.javaparser.ast.expr.NameExpr;
@@ -82,7 +83,7 @@ public final class FlowTracer {
     private final Map<Expression, List<TypeDeclaration<?>>> receivers = new IdentityHashMap<>();
     // per service: detectors resolve placeholders with the calling service's config, so library results differ;
     // per argument values: a util called with another WebClient bean or URL reaches another target
-    private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, Result>>> memo = new IdentityHashMap<>();
+    private final Map<Repo, Map<Node, Map<Map<String, ArgValue>, Result>>> memo = new IdentityHashMap<>();
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors) {
         this(ws, types, detectors, ArgumentBinder.NONE);
@@ -113,8 +114,23 @@ public final class FlowTracer {
     private final List<Integer> clusterWalks = new ArrayList<>();
     private Set<String> lossy = Set.of();
 
-    public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        Result r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+    /** {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector). */
+    public List<Found> trace(Node handler, Repo service, Map<String, String> config) {
+        List<MethodDeclaration> impls = handler instanceof MethodDeclaration md ? implementations(md, service) : List.of();
+        Result r;
+        if (impls.isEmpty() || impls.get(0) == handler) {
+            r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        } else { // a route handler typed as an interface: each implementation is walked, as for a call to it
+            List<Found> all = new ArrayList<>();
+            Set<String> lossyAll = new java.util.TreeSet<>();
+            for (MethodDeclaration impl : impls) {
+                Result ri = walk(impl, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+                lossyAll.addAll(ri.lossy());
+                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl)), f.via().stream()).toList(),
+                        f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy())));
+            }
+            r = new Result(all, Integer.MAX_VALUE, Set.copyOf(lossyAll));
+        }
         lossy = r.lossy();
         // a result reused across arguments may pair a URL with the wrong path: those URLs are capped per client call
         // site, not per path, so a mixed-up pairing never stands as a confident edge
@@ -139,6 +155,11 @@ public final class FlowTracer {
         return List.copyOf(out.values());
     }
 
+    /** A handler with no body and no implementation in {@code service} or a library: nothing to trace. */
+    public boolean bodiless(Node handler, Repo service) {
+        return handler instanceof MethodDeclaration md && md.getBody().isEmpty() && implementations(md, service).get(0) == md;
+    }
+
     /** Clusters of the last {@link #trace} explored only partly (some paths through them may be missing), sorted. */
     public Set<String> partialClusters() {
         return lossy;
@@ -149,8 +170,8 @@ public final class FlowTracer {
      * call back to a method still on the stack: valid until that method returns, so a cycle is walked once, not once
      * per path into it. {@code args}: what the caller passed to m's parameters.
      */
-    private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
-                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Map<Map<String, ArgValue>, Result>> partial) {
+    private Result walk(Node m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
+                        Map<Node, Integer> stack, Map<Node, Map<Map<String, ArgValue>, Result>> partial) {
         Map<Map<String, ArgValue>, Result> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
                 .computeIfAbsent(m, k -> new HashMap<>());
         if (done.containsKey(args)) {
@@ -172,9 +193,12 @@ public final class FlowTracer {
             return new Result(c.found().stream().map(f -> new Found(f.call(), f.via(), f.file(), f.line(), f.lowConfidence(),
                     f.sites(), f.wrapper(), true)).toList(), c.backTo(), Set.copyOf(names));
         }
-        if (m.getBody().isEmpty()) {
+        Optional<? extends Node> body = m instanceof LambdaExpr l ? Optional.of(l.getBody()) : ((MethodDeclaration) m).getBody();
+        if (body.isEmpty()) {
             return new Result(List.of(), Integer.MAX_VALUE, Set.of());
         }
+        // detectors see a lambda's enclosing method as the method being walked; a root lambda gets no arguments
+        MethodDeclaration method = m instanceof MethodDeclaration md ? md : m.findAncestor(MethodDeclaration.class).orElse(null);
         int depth = stack.size();
         stack.put(m, depth);
         while (clusterWalks.size() <= depth) {
@@ -185,7 +209,7 @@ public final class FlowTracer {
         Set<String> lossyHere = new java.util.TreeSet<>();
         int backTo = Integer.MAX_VALUE;
         // shortcut: the body is walked flat (no if/loop/try structure); the flow tree (#13) needs that structure
-        for (Expression call : m.getBody().get().findAll(Expression.class,
+        for (Expression call : body.get().findAll(Expression.class,
                 e -> e instanceof MethodCallExpr || e instanceof MethodReferenceExpr)) {
             // the same in every walk of m: a recursive cluster walks m once per argument combination
             Callees c = callees.computeIfAbsent(call, this::callees);
@@ -194,7 +218,7 @@ public final class FlowTracer {
             // one detection per callee, so via names the right one; a framework call (WebClient...) has none
             for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
                 List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
-                        callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
+                        callee == null ? List.of() : List.of(callee), receiver, service, config, method, args)).stream()).toList();
                 for (OutboundCall o : out) {
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
@@ -215,7 +239,7 @@ public final class FlowTracer {
                     continue;
                 }
                 List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
-                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : List.of(Map.of());
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, method, args)) : List.of(Map.of());
                 for (Map<String, ArgValue> calleeArgs : bound) {
                     Result r = walk(callee, calleeArgs, service, config, stack, partial);
                     backTo = Math.min(backTo, r.backTo());
@@ -285,10 +309,17 @@ public final class FlowTracer {
             return List.of(m);
         }
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
+        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; per class, by arity
+        // only when none of its methods matches the parameter types as written (generic parameters: handle(Order) for handle(T))
         List<MethodDeclaration> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
                 .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
-                .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream())
-                .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                .flatMap(c -> {
+                    List<MethodDeclaration> arity = c.getMethodsByName(m.getNameAsString()).stream()
+                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                            .toList();
+                    List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
+                    return (same.isEmpty() ? arity : same).stream();
+                })
                 .toList();
         return impls.isEmpty() ? List.of(m) : impls;
     }
@@ -385,6 +416,10 @@ public final class FlowTracer {
         return new ArrayList<>(out);
     }
 
+    private static List<String> paramTypes(MethodDeclaration m) {
+        return m.getParameters().stream().map(p -> p.getType().asString()).toList();
+    }
+
     private boolean library(Node n) {
         Repo r = types.repo(n);
         return r != null && r.kind() == Workspace.Kind.library;
@@ -392,8 +427,11 @@ public final class FlowTracer {
 
     private static final Set<String> RAW_CLIENTS = Set.of("webclient", "restclient", "resttemplate");
 
-    private static String label(MethodDeclaration m) {
-        return m.findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString() + ".").orElse("") + m.getNameAsString();
+    private static String label(Node m) {
+        if (m instanceof LambdaExpr) {
+            return m.findAncestor(MethodDeclaration.class).map(FlowTracer::label).orElse("") + "$lambda";
+        }
+        return m.findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString() + ".").orElse("") + ((MethodDeclaration) m).getNameAsString();
     }
 
     private String site(Expression call) {
