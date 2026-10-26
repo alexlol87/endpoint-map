@@ -213,7 +213,7 @@ public final class AnnotationEndpointDetector {
                 String full = UrlPaths.join(contextPath, prefix, path);
                 for (String verb : verbs) {
                     out.add(new Endpoint(repo.name(), verb, full,
-                            controller.getNameAsString() + "." + handler.getNameAsString(), file, line, "annotation", handler));
+                            controller.getNameAsString() + "." + handler.getNameAsString(), file, line, "annotation", handler, controller));
                 }
             }
         }

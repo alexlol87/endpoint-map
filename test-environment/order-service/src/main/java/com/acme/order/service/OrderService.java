@@ -107,6 +107,7 @@ public class OrderService {
     }
 
     public void delete(long id) {
+        orders.purgeLines(id);
         orders.deleteById(id);
     }
 

@@ -60,6 +60,19 @@ public final class FlowTracer {
     private record Callees(List<MethodDeclaration> methods, boolean low) {
     }
 
+    /** A method walked for a call; {@code on}: the implementing class it was found for, whose clauses bind type variables. */
+    private record Impl(MethodDeclaration method, ClassOrInterfaceDeclaration on) {
+        @Override
+        public boolean equals(Object o) { // by identity: a Node's equals walks its whole AST
+            return o instanceof Impl i && i.method == method && i.on == on;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(method) * 31 + System.identityHashCode(on);
+        }
+    }
+
     /** A receiver's static type; {@code exact} when found by the solver, a scoped declaration or Java's import rules. */
     private record Typed(TypeDeclaration<?> type, boolean exact) {
     }
@@ -81,6 +94,9 @@ public final class FlowTracer {
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
     private final Map<Expression, Callees> callees = new IdentityHashMap<>();
     private final Map<Expression, List<TypeDeclaration<?>>> receivers = new IdentityHashMap<>();
+    private final Map<Expression, Optional<ClassOrInterfaceType>> written = new IdentityHashMap<>();
+    private final List<ClassOrInterfaceDeclaration> allInterfaces = new ArrayList<>();
+    private Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> extenders;
     // per service: detectors resolve placeholders with the calling service's config, so library results differ;
     // per argument values: a util called with another WebClient bean or URL reaches another target
     private final Map<Repo, Map<Node, Map<Map<String, ArgValue>, Result>>> memo = new IdentityHashMap<>();
@@ -95,8 +111,13 @@ public final class FlowTracer {
         this.binder = binder;
         ws.repos().stream().flatMap(r -> r.sources().stream())
                 .flatMap(sf -> sf.cu().findAll(ClassOrInterfaceDeclaration.class).stream())
-                .filter(c -> !c.isInterface())
-                .forEach(c -> supertypes(c).forEach(s -> subtypes.computeIfAbsent(s, k -> new ArrayList<>()).add(c)));
+                .forEach(c -> {
+                    if (c.isInterface()) {
+                        allInterfaces.add(c);
+                    } else {
+                        supertypes(c).forEach(s -> subtypes.computeIfAbsent(s, k -> new ArrayList<>()).add(c));
+                    }
+                });
     }
 
     /**
@@ -114,19 +135,22 @@ public final class FlowTracer {
     private final List<Integer> clusterWalks = new ArrayList<>();
     private Set<String> lossy = Set.of();
 
-    /** {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector). */
-    public List<Found> trace(Node handler, Repo service, Map<String, String> config) {
-        List<MethodDeclaration> impls = handler instanceof MethodDeclaration md ? implementations(md, service) : List.of();
+    /**
+     * {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector).
+     * {@code controller}: the class the endpoint was found on (an inherited handler's subclass binds its type variables), or null.
+     */
+    public List<Found> trace(Node handler, TypeDeclaration<?> controller, Repo service, Map<String, String> config) {
+        List<Impl> impls = handler instanceof MethodDeclaration md ? impls(md, service) : List.of();
         Result r;
-        if (impls.isEmpty() || impls.get(0) == handler) {
-            r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        if (impls.isEmpty() || impls.get(0).method() == handler) {
+            r = walk(handler, ownTypeArgs(controller, Map.of()), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
         } else { // a route handler typed as an interface: each implementation is walked, as for a call to it
             List<Found> all = new ArrayList<>();
             Set<String> lossyAll = new java.util.TreeSet<>();
-            for (MethodDeclaration impl : impls) {
-                Result ri = walk(impl, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+            for (Impl impl : impls) {
+                Result ri = walk(impl.method(), ownTypeArgs(impl.on(), Map.of()), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
                 lossyAll.addAll(ri.lossy());
-                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl)), f.via().stream()).toList(),
+                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl.method())), f.via().stream()).toList(),
                         f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy())));
             }
             r = new Result(all, Integer.MAX_VALUE, Set.copyOf(lossyAll));
@@ -139,7 +163,8 @@ public final class FlowTracer {
                 k -> new ArrayList<>()).add(f));
         Map<Key, Found> out = new LinkedHashMap<>(); // several capped paths to one site give the same {*} edge
         for (List<Found> site : byPath.values()) {
-            if (site.size() <= MAX_URLS_PER_CALL_SITE) {
+            // db calls (op set) have no URL to ask for: one edge per table, however many entities a fan-out gives
+            if (site.size() <= MAX_URLS_PER_CALL_SITE || site.get(0).call().op() != null) {
                 site.forEach(f -> add(out, f));
                 continue;
             }
@@ -214,33 +239,50 @@ public final class FlowTracer {
             // the same in every walk of m: a recursive cluster walks m once per argument combination
             Callees c = callees.computeIfAbsent(call, this::callees);
             List<TypeDeclaration<?>> receiver = receivers.computeIfAbsent(call, this::receiverTypes);
+            ClassOrInterfaceType receiverType = written.computeIfAbsent(call, this::writtenType).orElse(null);
             boolean classified = false;
             // one detection per callee, so via names the right one; a framework call (WebClient...) has none
             for (MethodDeclaration callee : c.methods().isEmpty() ? Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
                 List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
-                        callee == null ? List.of() : List.of(callee), receiver, service, config, method, args)).stream()).toList();
+                        callee == null ? List.of() : List.of(callee), receiver, service, config, method, args, receiverType)).stream()).toList();
                 for (OutboundCall o : out) {
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
                     String wrapper = RAW_CLIENTS.contains(o.client()) && library(call)
                             ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
-                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call)), wrapper, false));
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low() || o.low(), List.of(site(call)), wrapper, false));
                 }
                 classified |= !out.isEmpty();
             }
             if (classified) {
                 continue;
             }
-            for (MethodDeclaration callee : c.methods().stream().flatMap(d -> implementations(d, service).stream()).distinct().toList()) {
+            Map<String, ArgValue> receiverArgs = typeArgs(call, receiverType, args);
+            List<Impl> all = c.methods().stream().flatMap(d -> impls(d, service).stream()).distinct().toList();
+            // only classes the receiver can be: subtypes of its static type, binding no type variable otherwise than it
+            // (OrderService extends CrudService<Order>: not ItemServiceImpl); none left, a guessed receiver type: all
+            List<Impl> fitting = all.stream().filter(i -> i.on() == null || (receiver.isEmpty() || i.on() == receiver.get(0)
+                    || subtypes.getOrDefault(receiver.get(0), List.of()).contains(i.on()))
+                    && ownTypeArgs(i.on(), args).entrySet().stream().allMatch(e -> !receiverArgs.containsKey(e.getKey())
+                            || unqualified(receiverArgs.get(e.getKey()).text()).equals(unqualified(e.getValue().text())))).toList();
+            for (Impl impl : fitting.isEmpty() ? all : fitting) {
+                MethodDeclaration callee = impl.method();
                 Integer at = stack.get(callee);
                 if (at != null) {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
                 List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
-                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, method, args)) : List.of(Map.of());
-                for (Map<String, ArgValue> calleeArgs : bound) {
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, method, args, receiverType)) : List.of(Map.of());
+                // the implementation that runs adds what the receiver leaves open: OrderServiceImpl extends CrudSvc<Order>
+                Map<String, ArgValue> typeArgs = new HashMap<>(ownTypeArgs(impl.on(), args));
+                typeArgs.putAll(receiverArgs);
+                for (Map<String, ArgValue> calleeArgs : typeArgs.isEmpty() ? bound : bound.stream().map(b -> {
+                    Map<String, ArgValue> both = new HashMap<>(b);
+                    both.putAll(typeArgs);
+                    return (Map<String, ArgValue>) both;
+                }).toList()) {
                     Result r = walk(callee, calleeArgs, service, config, stack, partial);
                     backTo = Math.min(backTo, r.backTo());
                     lossyHere.addAll(r.lossy());
@@ -276,7 +318,9 @@ public final class FlowTracer {
      * a cycle can carry a longer, looping chain), then the first found.
      */
     private static void add(Map<Key, Found> found, Found f) {
-        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> {
+        OutboundCall c = f.call(); // a guessed table and a certain one at the same site are one edge, the certain one kept
+        found.merge(new Key(c.low() ? new OutboundCall(c.client(), c.verb(), c.baseUrl(), c.path(), c.unresolvedKey(), c.source(),
+                c.label(), c.table(), c.op(), false) : c, f.file(), f.line()), f, (a, b) -> {
             Found w = a.lowConfidence() != b.lowConfidence() ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a;
             return a.lossy() || b.lossy() // lossy if either path was, so the capped grouping still sees it
                     ? new Found(w.call(), w.via(), w.file(), w.line(), w.lowConfidence(), w.sites(), w.wrapper(), true) : w;
@@ -289,6 +333,17 @@ public final class FlowTracer {
                 : Optional.of(((MethodReferenceExpr) call).getScope());
         return scope.flatMap(this::scopeType).map(Typed::type)
                 .map(t -> Stream.concat(Stream.of(t), supertypes(t).stream()).toList()).orElse(List.of());
+    }
+
+    /** The receiver's declared type as written ({@code Base<Pet, Long>}), for a variable or field receiver; Spring's types too. */
+    private Optional<ClassOrInterfaceType> writtenType(Expression call) {
+        Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope()
+                : Optional.of(((MethodReferenceExpr) call).getScope());
+        return scope.flatMap(s -> s instanceof NameExpr n ? declared(n.getNameAsString(), s)
+                : s instanceof TypeExpr t ? declared(t.getType().asString(), s)
+                : s instanceof FieldAccessExpr fa && fa.getScope() instanceof ThisExpr ? fieldDeclared(fa.getNameAsString(), s)
+                : Optional.empty())
+                .filter(ClassOrInterfaceType.class::isInstance).map(ClassOrInterfaceType.class::cast);
     }
 
     private Callees callees(Expression call) {
@@ -305,23 +360,149 @@ public final class FlowTracer {
     // shortcut: no @Qualifier/@Primary narrowing and no oneOf node, every implementation is followed; M4 adds both
     /** Implementations in the calling service or a library only: another service's class runs in that service. */
     private List<MethodDeclaration> implementations(MethodDeclaration m, Repo service) {
+        return impls(m, service).stream().map(Impl::method).distinct().toList();
+    }
+
+    /** JDK and library types are not resolved, so java.util.UUID and UUID must compare equal. */
+    private static String unqualified(String type) {
+        return type == null ? null : type.replaceAll("\\s+", "").replaceAll("\\b[a-z_]\\w*\\.", "");
+    }
+
+    private List<Impl> impls(MethodDeclaration m, Repo service) {
         if (m.getBody().isPresent()) {
-            return List.of(m);
+            return List.of(new Impl(m, null));
         }
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
-        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; per class, by arity
-        // only when none of its methods matches the parameter types as written (generic parameters: handle(Order) for handle(T))
-        List<MethodDeclaration> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
+        // declared in the class, else inherited from its nearest superclass declaring it (PingServiceImpl extends BasePing)
+        List<Impl> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
                 .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
-                .flatMap(c -> {
-                    List<MethodDeclaration> arity = c.getMethodsByName(m.getNameAsString()).stream()
-                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
-                            .toList();
-                    List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
-                    return (same.isEmpty() ? arity : same).stream();
-                })
+                .filter(c -> !c.isAbstract() || subtypes.getOrDefault(c, List.of()).stream().noneMatch(k -> !k.isAbstract()
+                        && (types.repo(k) == service || types.repo(k).kind() == Workspace.Kind.library))) // its concrete subclasses run instead
+                .flatMap(c -> Stream.concat(Stream.of(c), supertypes(c).stream())
+                        .filter(t -> t instanceof ClassOrInterfaceDeclaration k && !k.isInterface())
+                        .map(t -> declaring(t, m)).filter(l -> !l.isEmpty()).findFirst().orElse(List.of())
+                        .stream().map(i -> new Impl(i, c)))
                 .toList();
-        return impls.isEmpty() ? List.of(m) : impls;
+        if (impls.isEmpty() && owner.isPresent() && fragment(owner.get())) { // Spring Data's custom implementation, by name
+            impls = types.bySimpleNameNear(owner.get().getNameAsString() + "Impl", owner.get()).stream()
+                    .filter(c -> types.repo(c) == types.repo(owner.get()))
+                    .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
+                    .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream()
+                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                            .map(i -> new Impl(i, c instanceof ClassOrInterfaceDeclaration k ? k : null))).toList();
+        }
+        return impls.isEmpty() ? List.of(new Impl(m, null)) : impls;
+    }
+
+    /**
+     * {@code t}'s methods with a body implementing {@code m}: an overload of the same arity (top(String) beside
+     * top(ServerRequest)) is not one; by arity only when none matches the parameter types as written (handle(Order) for handle(T)).
+     */
+    private static List<MethodDeclaration> declaring(TypeDeclaration<?> t, MethodDeclaration m) {
+        List<MethodDeclaration> arity = t.getMethodsByName(m.getNameAsString()).stream()
+                .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                .toList();
+        List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
+        return same.isEmpty() ? arity : same;
+    }
+
+    /** Type variables {@code t}'s own extends/implements clauses bind (OrderController extends CrudController&lt;Order&gt;). */
+    private Map<String, ArgValue> ownTypeArgs(TypeDeclaration<?> t, Map<String, ArgValue> args) {
+        Map<String, ArgValue> out = new HashMap<>();
+        if (t != null) {
+            bindTypeArgs(t, List.of(), args, out, 0);
+        }
+        return out;
+    }
+
+    /**
+     * A Spring Data repository (an interface reaching a Spring Data type through workspace interfaces) or a fragment
+     * one extends: only for those does Spring look up {@code <Repository>Impl} / {@code <Fragment>Impl} by name.
+     */
+    private boolean fragment(TypeDeclaration<?> owner) {
+        if (extenders == null) {
+            extenders = new IdentityHashMap<>();
+            allInterfaces.forEach(i -> i.getExtendedTypes().forEach(ext -> types.resolveExact(ext)
+                    .ifPresent(t -> extenders.computeIfAbsent(t, k -> new ArrayList<>()).add(i))));
+        }
+        return owner instanceof ClassOrInterfaceDeclaration c && springRepository(c, 0)
+                || extenders.getOrDefault(owner, List.of()).stream().anyMatch(i -> springRepository(i, 0));
+    }
+
+    private boolean springRepository(ClassOrInterfaceDeclaration i, int depth) {
+        return depth <= 10 && i.getExtendedTypes().stream().anyMatch(ext -> types.resolveExact(ext)
+                .map(t -> t instanceof ClassOrInterfaceDeclaration c && springRepository(c, depth + 1))
+                .orElseGet(() -> Types.fromPackage(ext, SPRING_DATA)));
+    }
+
+    public static final String SPRING_DATA = "org.springframework.data.";
+
+    /** Key in a walk's arguments of what a class's type variable stands for on this path, null for a method's own. */
+    public static String typeArgKey(Node owner, String variable) {
+        return owner instanceof TypeDeclaration<?> t ? t.getFullyQualifiedName().map(q -> "<" + q + ">" + variable).orElse(null) : null;
+    }
+
+    /** The class, interface or method declaring {@code t} as a type parameter; null when {@code t} names a type. */
+    public static Node typeVariableOwner(ClassOrInterfaceType t) {
+        if (t.getScope().isPresent() || t.getTypeArguments().isPresent()) {
+            return null;
+        }
+        for (Node n = t; n != null; n = n.getParentNode().orElse(null)) {
+            if (n instanceof com.github.javaparser.ast.nodeTypes.NodeWithTypeParameters<?> w
+                    && w.getTypeParameters().stream().anyMatch(p -> p.getNameAsString().equals(t.getNameAsString()))) {
+                return n;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * What the callee's class type variables stand for on this path (see {@link #typeArgKey}): for {@code this}/no
+     * receiver the caller's own; else from the receiver's declared type ({@code OrderSvc}, {@code CrudSvc<Order>})
+     * and up its supertypes' clauses ({@code OrderSvc extends CrudSvc<Order>}: CrudSvc's E is Order). Value: the
+     * entity's qualified name when it is a workspace type, else its name as written.
+     */
+    private Map<String, ArgValue> typeArgs(Expression call, ClassOrInterfaceType receiverType, Map<String, ArgValue> args) {
+        Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope() : Optional.of(((MethodReferenceExpr) call).getScope());
+        Map<String, ArgValue> out = new HashMap<>();
+        if (scope.isEmpty() || scope.get() instanceof ThisExpr || scope.get() instanceof com.github.javaparser.ast.expr.SuperExpr) {
+            // the calling class's own clauses (OrderServiceImpl extends CrudSvc<Order>), then the caller's bindings
+            enclosingType(call).ifPresent(t -> out.putAll(ownTypeArgs(t, args)));
+            args.forEach((k, v) -> {
+                if (k.startsWith("<")) {
+                    out.put(k, v);
+                }
+            });
+        } else if (receiverType != null) {
+            types.resolve(receiverType).ifPresent(t -> bindTypeArgs(t, receiverType.getTypeArguments().map(List::<Type>copyOf).orElse(List.of()),
+                    args, out, 0));
+        }
+        return out;
+    }
+
+    private void bindTypeArgs(TypeDeclaration<?> t, List<Type> written, Map<String, ArgValue> args, Map<String, ArgValue> out, int depth) {
+        if (!(t instanceof ClassOrInterfaceDeclaration c) || depth > 10) {
+            return;
+        }
+        for (int i = 0; i < Math.min(written.size(), c.getTypeParameters().size()); i++) {
+            String key = typeArgKey(c, c.getTypeParameters().get(i).getNameAsString());
+            ArgValue v = written.get(i) instanceof ClassOrInterfaceType ct ? typeValue(ct, args, out) : null;
+            if (key != null && v != null) {
+                out.put(key, v);
+            }
+        }
+        Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream()).forEach(st -> types.resolve(st)
+                .ifPresent(s -> bindTypeArgs(s, st.getTypeArguments().map(List::<Type>copyOf).orElse(List.of()), args, out, depth + 1)));
+    }
+
+    /** A type argument as bound: a type variable by what it stands for (in {@code out}, then the caller's), else the type. */
+    private ArgValue typeValue(ClassOrInterfaceType ct, Map<String, ArgValue> args, Map<String, ArgValue> out) {
+        Node owner = typeVariableOwner(ct);
+        if (owner == null) {
+            return new ArgValue(types.resolve(ct).flatMap(TypeDeclaration::getFullyQualifiedName).orElse(ct.getNameWithScope()), 0);
+        }
+        String key = typeArgKey(owner, ct.getNameAsString());
+        return key == null ? null : out.getOrDefault(key, args.get(key));
     }
 
     /** Fallback when the solver fails: methods of the scope's type (and its supertypes) with that name and arity. */
@@ -375,18 +556,27 @@ public final class FlowTracer {
 
     /** Declared type of a parameter, local variable or field visible from {@code at}, by scope (see {@link Names}). */
     private Optional<Typed> variableType(String name, Node at) {
-        Optional<Node> decl = Names.declaration(name, at);
-        if (decl.isEmpty() || decl.get() instanceof VariableDeclarator v && v.getParentNode().orElse(null) instanceof FieldDeclaration) {
-            return fieldType(name, at); // fields of supertypes too
-        }
-        return typeOf(decl.get() instanceof Parameter p ? p.getType() : ((VariableDeclarator) decl.get()).getType());
+        return declared(name, at).flatMap(this::typeOf);
     }
 
     private Optional<Typed> fieldType(String name, Node at) {
+        return fieldDeclared(name, at).flatMap(this::typeOf);
+    }
+
+    /** Declared type, as written, of a parameter, local variable or field visible from {@code at}. */
+    private Optional<Type> declared(String name, Node at) {
+        Optional<Node> decl = Names.declaration(name, at);
+        if (decl.isEmpty() || decl.get() instanceof VariableDeclarator v && v.getParentNode().orElse(null) instanceof FieldDeclaration) {
+            return fieldDeclared(name, at); // fields of supertypes too
+        }
+        return Optional.of(decl.get() instanceof Parameter p ? p.getType() : ((VariableDeclarator) decl.get()).getType());
+    }
+
+    private Optional<Type> fieldDeclared(String name, Node at) {
         Optional<TypeDeclaration<?>> owner = enclosingType(at);
         return owner.stream().flatMap(o -> Stream.concat(Stream.of(o), supertypes(o).stream()))
                 .flatMap(t -> t.getFieldByName(name).stream())
-                .findFirst().flatMap(f -> typeOf(f.getVariable(0).getType()));
+                .findFirst().map(f -> f.getVariable(0).getType());
     }
 
     private Optional<Typed> typeOf(Type type) {

@@ -142,10 +142,11 @@ class RouterEndpointsTest {
         run(root, "map", "--out", root.resolve("out").toString());
         List<String> to = new ArrayList<>();
         JSON.readTree(root.resolve("out/graph.json").toFile()).get("edges").forEach(e -> to.add(e.get("to").asText()));
-        // shortcut: no generic-argument narrowing yet (#15), so every implementation is an alternative
-        for (String impl : List.of("LoggingHandler", "OrderHandler", "PaymentHandler")) {
+        // every implementation a Handler<Order> can be is an alternative; PaymentHandler (Handler<Payment>) cannot be one
+        for (String impl : List.of("LoggingHandler", "OrderHandler")) {
             assertTrue(to.stream().anyMatch(t -> t.contains(impl + ".handle")), to.toString());
         }
+        assertTrue(to.stream().noneMatch(t -> t.contains("PaymentHandler.handle")), to.toString());
     }
 
     @Test
