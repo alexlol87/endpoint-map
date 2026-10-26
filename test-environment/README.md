@@ -88,6 +88,8 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Feign, `${property}` url + `path` prefix + `@RequestMapping(method=PATCH)` | lib-http-clients `InventoryFeignClient` |
 | Feign, literal url that includes the target's context path | lib-http-clients `CustomerFeignClient` |
 | Feign, env-var url `${SHIPPING_SERVICE_URL}` | order-service `ShippingFeignClient` |
+| Feign, env-var host plus context path `${REWARDS_HOST}/rewards-api` -> resolutions.yml key `${REWARDS_HOST}`, `/rewards-api` kept in front of the path | notification-service `RewardsClient` |
+| Feign, `${property}` url set in application-prod.yml to an internal DNS name that looks public (`https://loyalty-service.prod.acme.io`) -> external by heuristic, `host:` entry in resolutions.yml | notification-service `LoyaltyClient` |
 | RestTemplate: `postForEntity`, `postForObject`, `getForObject`, `exchange`, `put`, `execute`, `delete` | order-service `PaymentClient`, payment-service `PaymentGateway`, lib-common-clients |
 | RestClient: `baseUrl` builder, `RestClient.create(url)`, `uri(Function)` URI builder | pricing-service `PriceService`, shipping-service carriers |
 | WebClient: `WebClient.create(url)`, builder `baseUrl`, two beans told apart by `@Qualifier`/bean name | catalog-service `WebClientConfig`, user-profile-service `ClientsConfig` |

@@ -11,12 +11,16 @@ import com.endpointmap.trace.OutboundDetector;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.AnnotationExpr;
+import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MemberValuePair;
 import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 import java.util.stream.Stream;
 
 /**
@@ -25,6 +29,10 @@ import java.util.stream.Stream;
  * service's config). No {@code url}, or a placeholder nothing defines, leaves the base unresolved.
  */
 public final class FeignDetector implements OutboundDetector {
+
+    private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([^}:]+)}");
+    /** The path of a URL, with or without scheme. */
+    private static final Pattern URL_PATH = Pattern.compile("^(?:[a-zA-Z][\\w+.-]*://)?[^/?#]*([^?#]*).*$");
 
     private final AnnotationEndpointDetector mappings;
     private final ConstantEvaluator constants;
@@ -48,15 +56,30 @@ public final class FeignDetector implements OutboundDetector {
                 continue; // not Feign, or a default method of the interface: keep walking
             }
             String name = attr(feign.get(), site, "name", "value").orElse("?");
-            Optional<String> rawUrl = attrRaw(feign.get(), "url").filter(u -> !u.isBlank());
-            String url = rawUrl.map(u -> ConfigResolver.resolve(u, site.config())).orElse(null);
-            String key = rawUrl.isEmpty() ? "feign:" + name : url.contains("{*}") ? rawUrl.get() : null;
-            String prefix = attr(feign.get(), site, "path").orElse("");
+            Optional<Expression> urlExpr = attrExpr(feign.get(), "url");
+            String source = urlExpr.map(Expression::toString).orElse(null);
+            Optional<String> rawUrl = urlExpr.flatMap(e -> constants.eval(e, feign.get()));
+            // Spring treats a url that is blank once resolved (url = "", "${x.url:}") as no url: the name is used
+            String url = rawUrl.map(u -> ConfigResolver.resolve(u, site.config())).filter(u -> !u.isBlank()).orElse(null);
+            String urlPrefix = "";
+            String key;
+            if (url == null) {
+                // a url the evaluator can't read (a constant from a jar) leaves nothing to name: the call site is the key
+                key = urlExpr.isPresent() && rawUrl.isEmpty() ? null : "feign:" + name;
+            } else if (url.contains("{*}")) {
+                key = missingPlaceholder(rawUrl.get(), site.config());
+                // "${HOST}/loyalty-api": only the placeholder is unknown, the rest stays as a path prefix
+                Matcher u = URL_PATH.matcher(url.replace("{*}", "x"));
+                urlPrefix = u.matches() ? u.group(1) : "";
+            } else {
+                key = null;
+            }
+            String prefix = UrlPaths.join(urlPrefix, attr(feign.get(), site, "path").orElse(""));
             for (String verb : mapping.get().verbs()) {
                 for (String path : mapping.get().paths()) {
                     // Feign sends GET when the mapping names no method
                     out.add(new OutboundCall("feign", verb.equals("ANY") ? "GET" : verb, key == null ? url : null,
-                            UrlPaths.join(prefix, path), key));
+                            UrlPaths.join(prefix, path), key, source));
                 }
             }
         }
@@ -67,18 +90,33 @@ public final class FeignDetector implements OutboundDetector {
         return attrRaw(a, names).map(v -> ConfigResolver.resolve(v, site.config()));
     }
 
+    /** The first {@code ${name}} without a default that the config doesn't define, as written; the raw url if none. */
+    private static String missingPlaceholder(String raw, Map<String, String> config) {
+        Matcher m = PLACEHOLDER.matcher(raw);
+        while (m.find()) {
+            if (!config.containsKey(m.group(1))) {
+                return m.group();
+            }
+        }
+        return raw;
+    }
+
     private Optional<String> attrRaw(AnnotationExpr a, String... names) {
         for (String name : names) {
-            if (a instanceof SingleMemberAnnotationExpr s && name.equals("value")) {
-                return constants.eval(s.getMemberValue(), a);
+            Optional<Expression> e = attrExpr(a, name);
+            if (e.isPresent()) {
+                return constants.eval(e.get(), a);
             }
-            if (a instanceof NormalAnnotationExpr n) {
-                for (MemberValuePair p : n.getPairs()) {
-                    if (p.getNameAsString().equals(name)) {
-                        return constants.eval(p.getValue(), a);
-                    }
-                }
-            }
+        }
+        return Optional.empty();
+    }
+
+    private static Optional<Expression> attrExpr(AnnotationExpr a, String name) {
+        if (a instanceof SingleMemberAnnotationExpr s && name.equals("value")) {
+            return Optional.of(s.getMemberValue());
+        }
+        if (a instanceof NormalAnnotationExpr n) {
+            return n.getPairs().stream().filter(p -> p.getNameAsString().equals(name)).map(MemberValuePair::getValue).findFirst();
         }
         return Optional.empty();
     }

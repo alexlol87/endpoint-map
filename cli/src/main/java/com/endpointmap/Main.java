@@ -6,6 +6,8 @@ import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.endpoints.Endpoint;
 import com.endpointmap.graph.GraphWriter;
 import com.endpointmap.outbound.FeignDetector;
+import com.endpointmap.report.DiscoverReport;
+import com.endpointmap.resolutions.Resolutions;
 import com.endpointmap.trace.FlowTracer;
 import com.endpointmap.trace.OutboundDetector;
 import com.endpointmap.url.TargetMatcher;
@@ -22,6 +24,8 @@ import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
+import java.util.TreeSet;
 
 public final class Main {
 
@@ -29,6 +33,7 @@ public final class Main {
             Usage:
               endpoint-map discover --root <dir> --profile <p> [--resolutions resolutions.yml]
               endpoint-map map --root <dir> --profile <p> [--resolutions resolutions.yml] --out <dir>
+            discover writes resolutions.yml (edit it) and discover-report.md next to it; map applies it.
             """;
     private static final Set<String> OPTIONS = Set.of("--root", "--profile", "--resolutions", "--out", "--openapi-dir");
 
@@ -60,24 +65,41 @@ public final class Main {
             return 2;
         }
         try {
-            return args[0].equals("map") ? map(opts, out, err) : discover(out);
+            return args[0].equals("map") ? map(opts, out, err) : discover(opts, out);
         } catch (Exception e) {
             err.println("endpoint-map failed: " + e);
             return 1;
         }
     }
 
+    /** Everything one run found: the graph, and every key resolutions.yml is asked about. */
+    private record Scan(Workspace ws, Map<String, Object> graph, Map<String, Resolutions.Found> asked,
+                        List<String> configWarnings, List<String> traceWarnings) {
+
+        /** "id: reason" of every unresolved node. */
+        List<String> unresolved() {
+            return DiscoverReport.unresolved(graph);
+        }
+    }
+
     /** Traces every endpoint's handler to its outbound calls and matches each call to its target nodes. */
-    private static Map<String, Object> buildGraph(Workspace ws, String profile, AnnotationEndpointDetector detector,
-                                                  List<Endpoint> endpoints, List<String> warnings) {
+    private static Scan scan(Map<String, String> opts, Resolutions resolutions) {
+        Workspace ws = WorkspaceLoader.load(Path.of(opts.get("--root")).toAbsolutePath().normalize());
+        String profile = opts.get("--profile");
+        AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
+        List<Endpoint> endpoints = detector.detect(profile);
         Map<String, Map<String, String>> configs = new HashMap<>();
-        ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>())));
+        Map<String, Map<String, String>> sources = new HashMap<>();
+        ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>(),
+                sources.computeIfAbsent(r.name(), k -> new HashMap<>()))));
         Types types = new Types(ws);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, new ConstantEvaluator(types)));
         FlowTracer tracer = new FlowTracer(ws, types, detectors);
-        TargetMatcher matcher = new TargetMatcher(ws, configs, endpoints);
+        TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         List<Map<String, Object>> edges = new ArrayList<>();
         Map<String, Map<String, Object>> targets = new HashMap<>();
+        Map<String, Resolutions.Found> asked = new TreeMap<>();
+        List<String> warnings = new ArrayList<>();
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
             List<FlowTracer.Found> found;
@@ -88,7 +110,17 @@ public final class Main {
                 continue;
             }
             for (FlowTracer.Found f : found) {
-                for (TargetMatcher.Target t : matcher.match(f.call(), e.service())) {
+                // the method holding the call: the one entered before the client method, or the handler itself
+                String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
+                String callSite = at + ":" + f.line();
+                TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
+                if (ask != null) {
+                    String section = ask.key().equals(callSite) ? Resolutions.CALL_SITES : Resolutions.PROPERTIES;
+                    asked.computeIfAbsent(e.service() + "\0" + ask.key(),
+                            k -> new Resolutions.Found(e.service(), section, ask.key(), ask.hint(), new TreeSet<>()))
+                            .usages().add(at + " (" + f.file() + ":" + f.line() + ")");
+                }
+                for (TargetMatcher.Target t : matcher.match(f.call(), e.service(), callSite)) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),
                             "client", f.call().client(), "via", f.via(), "file", f.file(), "line", f.line());
                     if (f.lowConfidence()) {
@@ -101,11 +133,22 @@ public final class Main {
                 }
             }
         }
-        return GraphWriter.build(ws, endpoints, edges, targets.values());
+        return new Scan(ws, GraphWriter.build(ws, endpoints, edges, targets.values()), asked, detector.warnings(), warnings);
     }
 
-    private static int discover(PrintStream out) {
-        out.println("discover: not implemented yet");
+    private static int discover(Map<String, String> opts, PrintStream out) throws Exception {
+        Path file = Path.of(opts.getOrDefault("--resolutions", "resolutions.yml")).toAbsolutePath();
+        Resolutions old = Resolutions.read(file); // read first: a file we can't parse is never overwritten
+        Scan scan = scan(opts, old);
+        Files.createDirectories(file.getParent());
+        Resolutions.Stats stats = old.write(file, scan.asked().values());
+        Path report = file.resolveSibling("discover-report.md");
+        DiscoverReport.write(report, scan.ws(), scan.graph(), scan.asked().values(), old, scan.configWarnings(),
+                scan.traceWarnings(), stats);
+        summary(scan, out);
+        out.printf("resolutions: %d entries, %d blank, %d new, %d stale, %d host: blank (kept external) -> %s%n",
+                stats.entries(), stats.blank(), stats.added(), stats.stale(), stats.hostBlank(), file);
+        out.println("report -> " + report);
         return 0;
     }
 
@@ -115,32 +158,41 @@ public final class Main {
             err.println("map needs --out <dir>");
             return 2;
         }
-        Workspace ws = WorkspaceLoader.load(Path.of(opts.get("--root")).toAbsolutePath().normalize());
-        String profile = opts.get("--profile");
-        AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
-        List<Endpoint> endpoints = detector.detect(profile);
-        List<String> traceWarnings = new ArrayList<>();
-        Map<String, Object> graph = buildGraph(ws, profile, detector, endpoints, traceWarnings);
+        String file = opts.get("--resolutions");
+        if (file != null && !Files.isRegularFile(Path.of(file))) {
+            err.println("--resolutions " + file + " does not exist; run discover first");
+            return 2;
+        }
+        // same default as discover, so map applies the file discover just wrote
+        Path res = Path.of(file == null ? "resolutions.yml" : file).toAbsolutePath();
+        boolean use = Files.isRegularFile(res);
+        Scan scan = scan(opts, use ? Resolutions.read(res) : Resolutions.empty());
         Path dir = Files.createDirectories(Path.of(outDir));
-        GraphWriter.write(graph, dir.resolve("graph.json"));
-        MapHtmlWriter.write(GraphWriter.toJson(graph), dir.resolve("map.html"));
+        GraphWriter.write(scan.graph(), dir.resolve("graph.json"));
+        MapHtmlWriter.write(GraphWriter.toJson(scan.graph()), dir.resolve("map.html"));
+        out.println(use ? "resolutions <- " + res : "resolutions: none (" + res + " not found; run discover to create it)");
+        out.println("map -> " + dir);
+        summary(scan, out);
+        return 0;
+    }
+
+    private static void summary(Scan scan, PrintStream out) {
+        Map<String, Object> graph = scan.graph();
         List<?> nodes = (List<?>) graph.get("nodes");
-        List<String> unresolved = nodes.stream().map(n -> (String) ((Map<?, ?>) n).get("id"))
-                .filter(id -> id.startsWith("unresolved:")).toList();
-        out.printf("%d repos, %d endpoints, %d edges -> %s%n", ws.repos().size(),
+        List<String> unresolved = scan.unresolved();
+        out.printf("%d repos, %d endpoints, %d edges, %d unresolved%n", scan.ws().repos().size(),
                 nodes.stream().filter(n -> "endpoint".equals(((Map<?, ?>) n).get("kind"))).count(),
-                ((List<?>) graph.get("edges")).size(), dir);
+                ((List<?>) graph.get("edges")).size(), unresolved.size());
         if (!unresolved.isEmpty()) {
             out.printf("%d unresolved target(s):%n", unresolved.size());
             unresolved.forEach(id -> out.println("  " + id));
         }
-        if (!ws.parseFailures().isEmpty()) {
-            out.printf("%d file(s) could not be parsed and were skipped:%n", ws.parseFailures().size());
-            ws.parseFailures().forEach(f -> out.println("  " + f.relPath() + ": " + f.error()));
+        if (!scan.ws().parseFailures().isEmpty()) {
+            out.printf("%d file(s) could not be parsed and were skipped:%n", scan.ws().parseFailures().size());
+            scan.ws().parseFailures().forEach(f -> out.println("  " + f.relPath() + ": " + f.error()));
         }
-        detector.warnings().forEach(w -> out.println("warning: config file skipped: " + w));
-        traceWarnings.forEach(w -> out.println("warning: " + w));
-        // shortcut: printed only, list collisions in discover-report.md once that exists
+        scan.configWarnings().forEach(w -> out.println("warning: config file skipped: " + w));
+        scan.traceWarnings().forEach(w -> out.println("warning: " + w));
         for (Object n : nodes) {
             Map<?, ?> node = (Map<?, ?>) n;
             if (node.containsKey("alsoHandledBy")) {
@@ -148,6 +200,5 @@ public final class Main {
                         + ", " + node.get("alsoHandledBy"));
             }
         }
-        return 0;
     }
 }
