@@ -253,7 +253,7 @@ public final class FlowTracer {
                             ? enclosingType(call).map(TypeDeclaration::getNameAsString).orElse(null) : null;
                     add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low() || o.low(), List.of(site(call)), wrapper, false));
                 }
-                classified |= !out.isEmpty();
+                classified |= out.stream().anyMatch(o -> !o.cache());
             }
             if (classified) {
                 continue;
