@@ -663,6 +663,11 @@ public final class FlowTracer {
 
     private final Map<String, Expression> siteNodes = new HashMap<>();
 
+    /** Declared return types, as written, of the workspace methods {@code call} may reach (name and arity, no solver). */
+    public List<String> returnTypes(MethodCallExpr call) {
+        return byName(call).methods().stream().map(m -> m.getType().asString()).toList();
+    }
+
     /** The call expression at a {@link Found#sites()} entry (for the flow tree). */
     public Node siteNode(String site) {
         return siteNodes.get(site);

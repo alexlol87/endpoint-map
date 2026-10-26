@@ -35,8 +35,8 @@ class ReactiveFlowTest {
     @Test
     void flatMapAndConcatMapOverAFluxAreLoopsButFlatMapOnAMonoIsNot() {
         assertEquals(List.of("call ProductService.batch > loop skus.flatMap > edge db:catalog-service:products",
-                        "call ProductService.batch > loop skus...concatMap > edge inventory-service GET /inventory/{sku}",
-                        "call ProductService.batch > loop skus...flatMap > edge db:catalog-service:products"),
+                        "call ProductService.batch > loop skus.flatMap(..).concatMap > edge inventory-service GET /inventory/{sku}",
+                        "call ProductService.batch > loop skus.flatMap(..).concatMap(..).flatMap > edge db:catalog-service:products"),
                 paths(graph, "catalog-service POST /catalog/products/batch"));
         has("catalog-service GET /catalog/products/{sku}", "call ProductService.getWithPrice > edge pricing-service GET /prices/{sku}");
     }
@@ -48,6 +48,11 @@ class ReactiveFlowTest {
                 + " > call ReactiveClientUtils.getJson > edge inventory-service GET /inventory/{sku}");
         has("catalog-service GET /catalog/products/{sku}/details", d + "call PriceLookupService.price > call ReactiveClientUtils.getJson"
                 + " > edge pricing-service GET /prices/{sku}");
+        // publishers held in local variables, then zipped
+        has("cart-service GET /carts/{userId}", "call CartService.view > parallel Mono.zip > edge loyalty-service GET /loyalty/{userId}/balance");
+        has("cart-service GET /carts/{userId}", "call CartService.view > parallel Mono.zip > edge redis:cart:*");
+        has("analytics-service GET /analytics/trending", "call AnalyticsService.trending > parallel Flux.zip > else !(sku == null)"
+                + " > retry retryWhen(Retry.fixedDelay(2, Duration.ofMillis(50))) > edge search-service GET /search/products/{sku}/similar");
         has("recommendation-service GET /recs/v2/users/{userId}/bundle", "parallel Mono.when > edge user-profile-service GET /profile-api/profiles/{userId}");
     }
 
@@ -67,7 +72,7 @@ class ReactiveFlowTest {
     }
 
     @Test
-    void fluxZipDefaultIfEmptyAndOnErrorReturnInASmallService(@TempDir Path root) throws Exception {
+    void fluxSourcesAndEagerFallbackArgumentsInASmallService(@TempDir Path root) throws Exception {
         Path c = root.resolve("rx-service/src/main/java/r");
         RepositoryTablesTest.write(c.resolve("App.java"), "package r;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
         RepositoryTablesTest.write(c.resolve("Api.java"), """
@@ -79,6 +84,16 @@ class ReactiveFlowTest {
                 public class Api {
                   private final Ext ext;
                   Api(Ext ext) { this.ext = ext; }
+                  private final Flux<String> top = Flux.just("t");
+                  private final org.springframework.web.reactive.function.client.WebClient wc =
+                      org.springframework.web.reactive.function.client.WebClient.create("https://w.example.com");
+                  @GetMapping("/s") public Object s() {
+                    var local = Flux.fromIterable(java.util.List.of("a"));
+                    return Flux.concat(ids().flatMap(i -> ext.b()), this.ids().concatMap(i -> ext.c()), ext.list().flatMap(i -> ext.d()),
+                        wc.get().uri("/l").retrieve().bodyToFlux(String.class).flatMap(i -> ext.a()), top.flatMap(t -> ext.b()),
+                        local.flatMap(i -> ext.c()), Mono.just("m").flatMap(top -> Mono.just(top).flatMap(v -> ext.d())));
+                  }
+                  Flux<String> ids() { return Flux.just("i"); }
                   @GetMapping("/r") public Object r() {
                     Flux<String> ids = Flux.just("a");
                     return Flux.zip(ext.a(), ext.b())
@@ -92,7 +107,7 @@ class ReactiveFlowTest {
                 package r;
                 import org.springframework.web.bind.annotation.GetMapping;
                 @org.springframework.cloud.openfeign.FeignClient(name = "ext", url = "https://api.example.com")
-                public interface Ext { @GetMapping("/a") String a(); @GetMapping("/b") String b(); @GetMapping("/c") String c(); @GetMapping("/d") String d(); }
+                public interface Ext { @GetMapping("/l") reactor.core.publisher.Flux<String> list(); @GetMapping("/a") String a(); @GetMapping("/b") String b(); @GetMapping("/c") String c(); @GetMapping("/d") String d(); }
                 """);
         Path out = root.resolve("out");
         String res = out.resolve("resolutions.yml").toString();
@@ -100,7 +115,12 @@ class ReactiveFlowTest {
         RepositoryTablesTest.run("map", root, "--resolutions", res, "--out", out.toString());
         String x = "external:https://api.example.com GET /";
         assertEquals(List.of("parallel Flux.zip > edge " + x + "a", "parallel Flux.zip > edge " + x + "b",
-                        "fallback defaultIfEmpty > edge " + x + "c", "fallback onErrorReturn > edge " + x + "d", "loop ids.map > edge " + x + "a"),
+                        "edge " + x + "c", "edge " + x + "d", "loop ids.map > edge " + x + "a"),
                 paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "rx-service GET /r"));
+        // a Flux from a workspace method, a Feign method, bodyToFlux, a field, a var; a lambda parameter shadowing the field is no Flux
+        assertEquals(List.of("loop ids().flatMap > edge " + x + "b", "loop this.ids().concatMap > edge " + x + "c", "edge " + x + "l",
+                        "loop ext.list().flatMap > edge " + x + "d", "unresolved unresolved:rx-service:Api.s:15 GET /l",
+                        "loop wc.get().uri(..).retrieve().bodyToFlux(..).flatMap > edge " + x + "a", "loop top.flatMap > edge " + x + "b",
+                        "loop local.flatMap > edge " + x + "c", "edge " + x + "d"), paths(new ObjectMapper().readTree(out.resolve("graph.json").toFile()), "rx-service GET /s"));
     }
 }

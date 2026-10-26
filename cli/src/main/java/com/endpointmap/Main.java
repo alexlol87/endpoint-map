@@ -126,7 +126,7 @@ public final class Main {
         Map<String, Map<String, Object>> targets = new HashMap<>();
         Map<String, Resolutions.Found> asked = new TreeMap<>();
         List<String> warnings = new ArrayList<>();
-        FlowTree flows = new FlowTree(tracer::siteNode);
+        FlowTree flows = new FlowTree(tracer::siteNode, tracer::returnTypes);
         for (Endpoint e : endpoints) {
             Repo repo = ws.repos().stream().filter(r -> r.name().equals(e.service())).findFirst().orElseThrow();
             List<FlowTracer.Found> found;

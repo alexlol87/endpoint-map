@@ -196,7 +196,7 @@ class FlowTreeTest {
         // Flux.fromStream(..).map is no Java stream loop, but a map over a Flux (issue #14)
         assertEquals(List.of("call Svc.run > loop for (int i = 0; i < n; i++) > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.parallelStream().map > edge external:https://api.example.com GET /b",
-                        "call Svc.run > loop reactor.core.publisher.Flux...map > edge external:https://api.example.com GET /a",
+                        "call Svc.run > loop reactor.core.publisher.Flux.fromStream(ids.stream()).map > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.stream().map > edge external:https://api.example.com GET /b"),
                 paths(g, "flow-service GET /f"));
     }
