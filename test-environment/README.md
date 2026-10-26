@@ -78,8 +78,8 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | catalog-service/openapi.json | `PUT /catalog/products/{sku}` only in OpenAPI; `POST .../bulk` only in code |
 | search-service/openapi-search.json | `/search/facets/*` only in OpenAPI (generated in a loop in code) |
 | audit-service/openapi/openapi.json | matches code exactly (control case) |
-| payment-service/docs/external/openapi-stripe.json | external API (api.stripe.com) |
-| audit-service/openapi/openapi-siem-vendor.json | external API (api.siem-vendor.example.com) |
+| payment-service/docs/external/openapi-stripe.json | external API (api.stripe.com, once `${PAYMENT_HOST}` is resolved to it): `POST /v1/charges`, `POST /v1/refunds` matched; `GET /v1/charges/{id}` (`PaymentGateway.refund`) is not in it -> reported |
+| audit-service/openapi/openapi-siem-vendor.json | external API (api.siem-vendor.example.com): both calls matched, `GET /v2/events/{id}` to template `/v2/events/{eventId}` |
 | ml-scoring-py/openapi.json | belongs to a non-Java repo |
 
 ### Outbound HTTP

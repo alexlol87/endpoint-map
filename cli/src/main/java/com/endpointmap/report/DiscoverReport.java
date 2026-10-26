@@ -1,5 +1,6 @@
 package com.endpointmap.report;
 
+import com.endpointmap.openapi.OpenApi;
 import com.endpointmap.resolutions.Resolutions;
 import com.endpointmap.workspace.Workspace;
 import java.io.IOException;
@@ -17,7 +18,7 @@ public final class DiscoverReport {
 
     public static void write(Path file, Workspace ws, Map<String, Object> graph, Collection<Resolutions.Found> asked,
                              Resolutions resolutions, List<String> configWarnings, List<String> traceWarnings,
-                             List<String> routesNotUnderstood,
+                             List<String> routesNotUnderstood, OpenApi openapi,
                              Resolutions.Stats stats) throws IOException {
         List<Map<?, ?>> nodes = ((List<?>) graph.get("nodes")).stream().<Map<?, ?>>map(n -> (Map<?, ?>) n).toList();
         List<String> unresolved = unresolved(graph);
@@ -44,7 +45,11 @@ public final class DiscoverReport {
         section(md, "Endpoints mapped by more than one handler", nodes.stream().filter(n -> n.containsKey("alsoHandledBy"))
                 .map(n -> "`" + n.get("id") + "`: " + n.get("handler") + ", " + n.get("alsoHandledBy")).toList());
         section(md, "Tracing problems", traceWarnings);
-        md.append("\n## OpenAPI vs code mismatches\n\n_Not checked yet (#9)._\n");
+        section(md, "OpenAPI files used", openapi.used());
+        section(md, "OpenAPI vs code mismatches: only in OpenAPI", openapi.onlyInOpenApi());
+        section(md, "OpenAPI vs code mismatches: only in code", openapi.onlyInCode());
+        section(md, "External calls not in their OpenAPI", openapi.externalNotInSpec());
+        section(md, "OpenAPI files skipped", openapi.problems());
         section(md, "Routes not understood", routesNotUnderstood.stream().map(r -> "`" + r.replaceFirst(": ", "`: ")).toList());
         Files.writeString(file, md);
     }
