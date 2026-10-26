@@ -314,6 +314,77 @@ class RepositoryTablesTest {
         assertFalse(n.containsKey("db:s-service:line") || n.containsKey("db:s-service:`Line`"), n.keySet().toString());
     }
 
+    @Test
+    void entityBoundByTheImplementingClassInheritedMethodsAndWideFanOuts(@TempDir Path root) throws Exception {
+        Path lib = root.resolve("lib-data/src/main/java/lib");
+        write(lib.resolve("CrudSvc.java"), """
+                package lib;
+                public abstract class CrudSvc<E> {
+                  protected org.springframework.data.jpa.repository.JpaRepository<E, Long> repo;
+                  public java.util.List<E> all() { return repo.findAll(); }
+                  public java.util.List<E> all2() { return all(); }
+                }
+                """);
+        Path s = root.resolve("s-service/src/main/java/s");
+        write(s.resolve("App.java"), "package s;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        StringBuilder many = new StringBuilder("package s;\n");
+        for (int i = 0; i < 6; i++) { // more entities on one base than the per-path URL cap
+            many.append("@jakarta.persistence.Entity @jakarta.persistence.Table(name = \"t").append(i).append("\") class E").append(i).append(" {}\n")
+                    .append("@org.springframework.stereotype.Service class Svc").append(i).append(" extends lib.CrudSvc<E").append(i).append("> {}\n");
+        }
+        write(s.resolve("Many.java"), many.toString());
+        write(s.resolve("Shapes.java"), """
+                package s;
+                import org.springframework.web.bind.annotation.*;
+                @jakarta.persistence.Entity @jakarta.persistence.Table(name = "orders") class Order {}
+                interface OrderService { java.util.List<Order> all(); java.util.List<Order> mine(); }
+                @org.springframework.stereotype.Service
+                class OrderServiceImpl extends lib.CrudSvc<Order> implements OrderService {
+                  public java.util.List<Order> mine() { return all2(); }
+                }
+                abstract class CrudController<E> {
+                  protected lib.CrudSvc<E> svc;
+                  @GetMapping("/list") public Object list() { return svc.all(); }
+                }
+                @RestController @RequestMapping("/g/orders") class OrderController extends CrudController<Order> {}
+                @RestController @RequestMapping("/g/t1") class E1Controller extends CrudController<E1> {}
+                interface PingService { String ping(); }
+                abstract class BasePing {
+                  org.springframework.web.client.RestTemplate rt;
+                  public String ping() { return rt.getForObject("http://ping-service/p", String.class); }
+                }
+                @org.springframework.stereotype.Service class PingServiceImpl extends BasePing implements PingService {}
+                @RestController
+                class Ctl {
+                  OrderService os; lib.CrudSvc<?> any; PingService ping;
+                  @GetMapping("/if/mine") public Object mine() { return os.mine(); }
+                  @GetMapping("/if/all") public Object all() { return os.all(); }
+                  @GetMapping("/any") public Object any() { return any.all2(); }
+                  @GetMapping("/ping") public Object ping() { return ping.ping(); }
+                }
+                """);
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        Path o = root.resolve("out");
+        run("map", root, "--resolutions", res.toString(), "--out", o.toString());
+        JsonNode graph = JSON.readTree(o.resolve("graph.json").toFile());
+        List<String> got = list(graph.get("edges")).stream()
+                .map(e -> e.get("from").asText().substring("s-service ".length()) + " -> " + e.get("to").asText()
+                        + (e.has("confidence") ? " low" : "")).sorted().toList();
+        List<String> want = new ArrayList<>(List.of(
+                // CrudSvc<?>: each subclass's table as a guess, never collapsed into an unresolved HTTP call
+                "GET /any -> db:s-service:orders low", "GET /any -> db:s-service:t0 low", "GET /any -> db:s-service:t1 low",
+                "GET /any -> db:s-service:t2 low", "GET /any -> db:s-service:t3 low", "GET /any -> db:s-service:t4 low",
+                "GET /any -> db:s-service:t5 low",
+                "GET /g/orders/list -> db:s-service:orders",   // inherited handler: E from the controller it was found on
+                "GET /g/t1/list -> db:s-service:t1",
+                "GET /if/all -> db:s-service:orders",          // interface method implemented only by the inherited CrudSvc.all
+                "GET /if/mine -> db:s-service:orders",         // this-call in OrderServiceImpl: E from its own extends clause
+                "GET /ping -> external:http://ping-service GET /p")); // inherited from BasePing
+        assertEquals(want, got);
+        assertFalse(Files.readString(res).contains("CrudSvc"), Files.readString(res));
+    }
+
     private static void node(String id, String tech, String table) {
         JsonNode n = nodes.get(id);
         assertEquals("db", n.get("kind").asText());

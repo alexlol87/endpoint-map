@@ -60,6 +60,10 @@ public final class FlowTracer {
     private record Callees(List<MethodDeclaration> methods, boolean low) {
     }
 
+    /** A method walked for a call; {@code on}: the implementing class it was found for, whose clauses bind type variables. */
+    private record Impl(MethodDeclaration method, ClassOrInterfaceDeclaration on) {
+    }
+
     /** A receiver's static type; {@code exact} when found by the solver, a scoped declaration or Java's import rules. */
     private record Typed(TypeDeclaration<?> type, boolean exact) {
     }
@@ -122,19 +126,22 @@ public final class FlowTracer {
     private final List<Integer> clusterWalks = new ArrayList<>();
     private Set<String> lossy = Set.of();
 
-    /** {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector). */
-    public List<Found> trace(Node handler, Repo service, Map<String, String> config) {
-        List<MethodDeclaration> impls = handler instanceof MethodDeclaration md ? implementations(md, service) : List.of();
+    /**
+     * {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector).
+     * {@code controller}: the class the endpoint was found on (an inherited handler's subclass binds its type variables), or null.
+     */
+    public List<Found> trace(Node handler, TypeDeclaration<?> controller, Repo service, Map<String, String> config) {
+        List<Impl> impls = handler instanceof MethodDeclaration md ? impls(md, service) : List.of();
         Result r;
-        if (impls.isEmpty() || impls.get(0) == handler) {
-            r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        if (impls.isEmpty() || impls.get(0).method() == handler) {
+            r = walk(handler, ownTypeArgs(controller, Map.of()), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
         } else { // a route handler typed as an interface: each implementation is walked, as for a call to it
             List<Found> all = new ArrayList<>();
             Set<String> lossyAll = new java.util.TreeSet<>();
-            for (MethodDeclaration impl : impls) {
-                Result ri = walk(impl, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+            for (Impl impl : impls) {
+                Result ri = walk(impl.method(), ownTypeArgs(impl.on(), Map.of()), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
                 lossyAll.addAll(ri.lossy());
-                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl)), f.via().stream()).toList(),
+                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl.method())), f.via().stream()).toList(),
                         f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy())));
             }
             r = new Result(all, Integer.MAX_VALUE, Set.copyOf(lossyAll));
@@ -147,7 +154,8 @@ public final class FlowTracer {
                 k -> new ArrayList<>()).add(f));
         Map<Key, Found> out = new LinkedHashMap<>(); // several capped paths to one site give the same {*} edge
         for (List<Found> site : byPath.values()) {
-            if (site.size() <= MAX_URLS_PER_CALL_SITE) {
+            // db calls (op set) have no URL to ask for: one edge per table, however many entities a fan-out gives
+            if (site.size() <= MAX_URLS_PER_CALL_SITE || site.get(0).call().op() != null) {
                 site.forEach(f -> add(out, f));
                 continue;
             }
@@ -241,7 +249,8 @@ public final class FlowTracer {
             if (classified) {
                 continue;
             }
-            for (MethodDeclaration callee : c.methods().stream().flatMap(d -> implementations(d, service).stream()).distinct().toList()) {
+            for (Impl impl : c.methods().stream().flatMap(d -> impls(d, service).stream()).distinct().toList()) {
+                MethodDeclaration callee = impl.method();
                 Integer at = stack.get(callee);
                 if (at != null) {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
@@ -249,7 +258,8 @@ public final class FlowTracer {
                 }
                 List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
                         ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, method, args, receiverType)) : List.of(Map.of());
-                Map<String, ArgValue> typeArgs = typeArgs(call, receiverType, args);
+                Map<String, ArgValue> typeArgs = new HashMap<>(typeArgs(call, receiverType, args));
+                typeArgs.putAll(ownTypeArgs(impl.on(), args)); // the implementation that runs: OrderServiceImpl extends CrudSvc<Order>
                 for (Map<String, ArgValue> calleeArgs : typeArgs.isEmpty() ? bound : bound.stream().map(b -> {
                     Map<String, ArgValue> both = new HashMap<>(b);
                     both.putAll(typeArgs);
@@ -330,30 +340,52 @@ public final class FlowTracer {
     // shortcut: no @Qualifier/@Primary narrowing and no oneOf node, every implementation is followed; M4 adds both
     /** Implementations in the calling service or a library only: another service's class runs in that service. */
     private List<MethodDeclaration> implementations(MethodDeclaration m, Repo service) {
+        return impls(m, service).stream().map(Impl::method).distinct().toList();
+    }
+
+    private List<Impl> impls(MethodDeclaration m, Repo service) {
         if (m.getBody().isPresent()) {
-            return List.of(m);
+            return List.of(new Impl(m, null));
         }
         Optional<TypeDeclaration<?>> owner = m.getParentNode().filter(TypeDeclaration.class::isInstance).map(t -> (TypeDeclaration<?>) t);
-        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; per class, by arity
-        // only when none of its methods matches the parameter types as written (generic parameters: handle(Order) for handle(T))
-        List<MethodDeclaration> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
+        // declared in the class, else inherited from its nearest superclass declaring it (PingServiceImpl extends BasePing)
+        List<Impl> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
                 .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
-                .flatMap(c -> {
-                    List<MethodDeclaration> arity = c.getMethodsByName(m.getNameAsString()).stream()
-                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
-                            .toList();
-                    List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
-                    return (same.isEmpty() ? arity : same).stream();
-                })
+                .flatMap(c -> Stream.concat(Stream.of(c), supertypes(c).stream())
+                        .filter(t -> t instanceof ClassOrInterfaceDeclaration k && !k.isInterface())
+                        .map(t -> declaring(t, m)).filter(l -> !l.isEmpty()).findFirst().orElse(List.of())
+                        .stream().map(i -> new Impl(i, c)))
                 .toList();
         if (impls.isEmpty() && owner.isPresent() && fragment(owner.get())) { // Spring Data's custom implementation, by name
             impls = types.bySimpleNameNear(owner.get().getNameAsString() + "Impl", owner.get()).stream()
                     .filter(c -> types.repo(c) == types.repo(owner.get()))
                     .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
-                    .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream())
-                    .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size()).toList();
+                    .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream()
+                            .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                            .map(i -> new Impl(i, c instanceof ClassOrInterfaceDeclaration k ? k : null))).toList();
         }
-        return impls.isEmpty() ? List.of(m) : impls;
+        return impls.isEmpty() ? List.of(new Impl(m, null)) : impls;
+    }
+
+    /**
+     * {@code t}'s methods with a body implementing {@code m}: an overload of the same arity (top(String) beside
+     * top(ServerRequest)) is not one; by arity only when none matches the parameter types as written (handle(Order) for handle(T)).
+     */
+    private static List<MethodDeclaration> declaring(TypeDeclaration<?> t, MethodDeclaration m) {
+        List<MethodDeclaration> arity = t.getMethodsByName(m.getNameAsString()).stream()
+                .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
+                .toList();
+        List<MethodDeclaration> same = arity.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
+        return same.isEmpty() ? arity : same;
+    }
+
+    /** Type variables {@code t}'s own extends/implements clauses bind (OrderController extends CrudController&lt;Order&gt;). */
+    private Map<String, ArgValue> ownTypeArgs(TypeDeclaration<?> t, Map<String, ArgValue> args) {
+        Map<String, ArgValue> out = new HashMap<>();
+        if (t != null) {
+            bindTypeArgs(t, List.of(), args, out, 0);
+        }
+        return out;
     }
 
     /**
@@ -407,6 +439,8 @@ public final class FlowTracer {
         Optional<Expression> scope = call instanceof MethodCallExpr mc ? mc.getScope() : Optional.of(((MethodReferenceExpr) call).getScope());
         Map<String, ArgValue> out = new HashMap<>();
         if (scope.isEmpty() || scope.get() instanceof ThisExpr || scope.get() instanceof com.github.javaparser.ast.expr.SuperExpr) {
+            // the calling class's own clauses (OrderServiceImpl extends CrudSvc<Order>), then the caller's bindings
+            enclosingType(call).ifPresent(t -> out.putAll(ownTypeArgs(t, args)));
             args.forEach((k, v) -> {
                 if (k.startsWith("<")) {
                     out.put(k, v);

@@ -132,7 +132,7 @@ public final class Main {
                 continue;
             }
             try {
-                found = tracer.trace(e.decl(), repo, configs.get(repo.name()));
+                found = tracer.trace(e.decl(), e.controller(), repo, configs.get(repo.name()));
             } catch (OutOfMemoryError | StackOverflowError err) { // one pathological endpoint must not lose the whole map
                 warnings.add("tracing " + e.id() + " failed (" + err.getClass().getSimpleName() + "), its edges are missing");
                 continue;
