@@ -193,10 +193,10 @@ class FlowTreeTest {
         run("discover", root, "--resolutions", res);
         run("map", root, "--resolutions", res, "--out", out.toString());
         JsonNode g = new ObjectMapper().readTree(out.resolve("graph.json").toFile());
-        // Flux.fromStream(..).map is no Java stream loop
+        // Flux.fromStream(..).map is no Java stream loop, but a map over a Flux (issue #14)
         assertEquals(List.of("call Svc.run > loop for (int i = 0; i < n; i++) > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.parallelStream().map > edge external:https://api.example.com GET /b",
-                        "call Svc.run > edge external:https://api.example.com GET /a",
+                        "call Svc.run > loop reactor.core.publisher.Flux...map > edge external:https://api.example.com GET /a",
                         "call Svc.run > loop ids.stream().map > edge external:https://api.example.com GET /b"),
                 paths(g, "flow-service GET /f"));
     }

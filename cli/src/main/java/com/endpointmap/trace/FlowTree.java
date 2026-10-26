@@ -216,6 +216,9 @@ public final class FlowTree {
                 type = "loop";
                 label = m.getScope().map(s -> text(s).replaceAll("\\s+\\.", ".") + ".").orElse("") + m.getNameAsString();
             }
+            if (type == null && p instanceof MethodCallExpr m) {
+                reactive(m, ch, k, j);
+            }
             if (type != null) {
                 k.add(0, pos(at) + ":" + type + ":" + label);
                 j.add(0, node(type, label));
@@ -224,6 +227,94 @@ public final class FlowTree {
         }
         keys.addAll(k);
         json.addAll(j);
+    }
+
+    private static final Set<String> FLUX_LOOP = Set.of("flatMap", "concatMap", "flatMapSequential", "map");
+    private static final Set<String> FALLBACK = Set.of("switchIfEmpty", "defaultIfEmpty", "onErrorResume", "onErrorReturn");
+    /** Operators that keep a Flux a Flux, followed back up a chain to find its source. */
+    private static final Set<String> FLUX_KEEP = Set.of("flatMap", "concatMap", "flatMapSequential", "map", "filter", "take", "skip",
+            "distinct", "sort", "switchIfEmpty", "defaultIfEmpty", "onErrorResume", "onErrorReturn", "retry", "retryWhen",
+            "doOnNext", "doOnError", "log", "delayElements", "timeout", "concatWith", "mergeWith");
+
+    /** PLAN section 4 reactive operators around {@code ch}, which sits in the scope or an argument of {@code m}. */
+    // keys use the operator name position: a chained call begins where its whole chain begins
+    private static void reactive(MethodCallExpr m, Node ch, List<String> k, List<Map<String, Object>> j) {
+        String name = m.getNameAsString();
+        if (m.getScope().filter(s -> s == ch).isPresent()) {
+            if (name.equals("retry") || name.equals("retryWhen")) { // everything upstream is retried
+                k.add(0, pos(m.getName()) + ":retry:" + name);
+                j.add(0, node("retry", name + "(" + m.getArguments().stream().map(FlowTree::text).collect(Collectors.joining(", ")) + ")"));
+            }
+            return;
+        }
+        if (!m.getArguments().contains(ch)) {
+            return;
+        }
+        String scope = m.getScope().map(FlowTree::text).orElse("");
+        boolean fn = ch instanceof LambdaExpr || ch instanceof MethodReferenceExpr;
+        if ((name.equals("zip") || name.equals("when")) && scope.matches("(reactor\\.core\\.publisher\\.)?(Mono|Flux)")) {
+            k.add(0, pos(m.getName()) + ":parallel:" + name);
+            j.add(0, node("parallel", scope.replaceAll(".*\\.", "") + "." + name));
+        } else if (FALLBACK.contains(name)) {
+            k.add(0, pos(m.getName()) + ":fallback:" + name);
+            j.add(0, node("fallback", name));
+        } else if (name.equals("filter") && fn) {
+            k.add(0, pos(m.getName()) + ":if:filter");
+            j.add(0, node("if", "filter(" + text(ch) + ")"));
+        } else if (FLUX_LOOP.contains(name) && fn) {
+            if (m.getScope().filter(FlowTree::flux).isPresent()) {
+                k.add(0, pos(m.getName()) + ":loop:" + name);
+                Node root = m;
+                while (root instanceof MethodCallExpr c && c.getScope().isPresent()) {
+                    root = c.getScope().get();
+                }
+                j.add(0, node("loop", text(root) + (root == m.getScope().get() ? "." : "...") + name)); // skus...concatMap
+            }
+            // an upstream filter decides whether this runs at all
+            for (Node n = m.getScope().orElse(null); n instanceof MethodCallExpr c && FLUX_KEEP.contains(c.getNameAsString())
+                    && !FALLBACK.contains(c.getNameAsString()); n = c.getScope().orElse(null)) {
+                if (c.getNameAsString().equals("filter") && c.getArguments().size() == 1) {
+                    k.add(0, pos(c.getName()) + ":if:filter");
+                    j.add(0, node("if", "filter(" + text(c.getArgument(0)) + ")"));
+                }
+            }
+        }
+    }
+
+    /** Whether {@code e} is a Flux: by its declared type (variable, parameter, method), or a Flux.x(..) source up its chain. */
+    private static boolean flux(Node e) {
+        if (e instanceof MethodCallExpr c) {
+            if (c.getScope().filter(s -> s.toString().matches("(reactor\\.core\\.publisher\\.)?Flux")).isPresent()) {
+                return true;
+            }
+            try {
+                var decl = c.resolve().toAst();
+                if (decl.isPresent() && decl.get() instanceof MethodDeclaration md) {
+                    return md.getType().asString().matches("(reactor\\.core\\.publisher\\.)?Flux(<.*)?");
+                }
+            } catch (RuntimeException | StackOverflowError ex) {
+                // shortcut: unresolvable calls are judged by their chain only, upgrade when reactor types are on the solver path
+            }
+            return FLUX_KEEP.contains(c.getNameAsString()) && c.getScope().filter(FlowTree::flux).isPresent();
+        }
+        if (e instanceof com.github.javaparser.ast.expr.NameExpr n) {
+            String v = n.getNameAsString();
+            for (Node p = n; p != null; p = p.getParentNode().orElse(null)) {
+                if (p instanceof MethodDeclaration md) {
+                    for (var prm : md.getParameters()) {
+                        if (prm.getNameAsString().equals(v)) {
+                            return prm.getType().asString().matches("(reactor\\.core\\.publisher\\.)?Flux(<.*)?");
+                        }
+                    }
+                    for (var d : md.findAll(com.github.javaparser.ast.body.VariableDeclarator.class)) {
+                        if (d.getNameAsString().equals(v)) {
+                            return d.getType().asString().matches("(reactor\\.core\\.publisher\\.)?Flux(<.*)?");
+                        }
+                    }
+                }
+            }
+        }
+        return false;
     }
 
     /** {@code x.forEach(..)}, or {@code map/flatMap} on a Java stream: each element runs the lambda. */
