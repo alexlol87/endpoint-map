@@ -12,8 +12,9 @@ import java.util.Map;
  * methods it may invoke (empty for framework/JDK calls), and the service the trace started in, whose config
  * resolves placeholders even inside library code. {@code receiverTypes} is the static type of the call's receiver
  * followed by its workspace supertypes (empty when unknown): a {@code @FeignClient} interface may inherit all its
- * methods from a shared API interface.
+ * methods from a shared API interface. {@code method} is the method being walked and {@code args} what its callers
+ * passed to its parameters (see {@link ArgumentBinder}).
  */
 public record CallSite(Expression call, List<MethodDeclaration> callees, List<TypeDeclaration<?>> receiverTypes,
-                       Repo service, Map<String, String> config) {
+                       Repo service, Map<String, String> config, MethodDeclaration method, Map<String, ArgValue> args) {
 }

@@ -93,6 +93,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | RestTemplate: `postForEntity`, `postForObject`, `getForObject`, `exchange`, `put`, `execute`, `delete` | order-service `PaymentClient`, payment-service `PaymentGateway`, lib-common-clients |
 | RestClient: `baseUrl` builder, `RestClient.create(url)`, `uri(Function)` URI builder | pricing-service `PriceService`, shipping-service carriers |
 | WebClient: `WebClient.create(url)`, builder `baseUrl`, two beans told apart by `@Qualifier`/bean name | catalog-service `WebClientConfig`, user-profile-service `ClientsConfig` |
+| WebClient `.method(HttpMethod.PATCH)` in a static util with the bean, verb and URI from the caller; bean picked by field name among two (no `@Qualifier`); `.patch()` + `UriComponentsBuilder.fromPath(..).pathSegment(..)`; RestClient `.patch()` + `String.format`, an unset property (-> `properties`) and a URL from the request body (-> `callSites`) | review-service `moderation/*` (`POST /reviews/{id}/moderate`) |
 | `@HttpExchange` client via `RestClientAdapter` | shipping-service `BillingExchangeClient` + `ClientConfig` |
 | `@HttpExchange` client via `WebClientAdapter`, inline and through a factory bean | recommendation-service `ExchangeConfig`, loyalty-service `CartClientConfig` |
 | `@HttpExchange` interface shared from a library | lib-reactive-clients `ShippingExchange`, used by warehouse-service |
@@ -155,6 +156,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | MVC: same chain, `CheckoutService` -> static library helper `CustomerChecks.requireActive` -> private static `load` -> `CustomerFeignClient.getCustomer` (Feign client passed as an argument; via has 5 hops) | order-service `CheckoutService`, lib-http-clients `CustomerChecks` |
 | MVC: same chain, second branch -> `FulfilmentService` -> pure static `ShippingPayloadUtils`, then Feign + RestTemplate; pure static `MoneyUtils` (no I/O, nothing to report) | order-service `CheckoutService` |
 | WebFlux annotated: controller -> `ProductDetailsHandler` -> `ProductDetailsService` (`Mono.zip`) -> `AvailabilityService` -> `StockLookupService` / `PriceLookupService` -> one static util `ReactiveClientUtils.getJson` called with two different `WebClient` beans (inventory vs pricing) | catalog-service `GET /catalog/products/{sku}/details` |
+| WebFlux annotated: controller -> `ModerationHandler` -> `ModerationService` -> `ProfileSync` / `StockSync` / `VendorSync` -> static `WebClientCalls.send(client, HttpMethod.PATCH, ModerationPaths.profile(userId))` (URL from a static `join` helper) | review-service `POST /reviews/{id}/moderate` |
 | WebFlux functional: route -> `SearchHandler.bundle` -> `BundleService` -> `RelatedProductsService` -> path from static `SearchPathUtils` -> catalog `GET /catalog/products/{sku}/details` (deep chain calling another deep chain) | search-service `GET /search/products/{sku}/bundle` |
 
 ### Robustness

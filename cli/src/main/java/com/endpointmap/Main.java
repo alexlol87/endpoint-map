@@ -6,11 +6,13 @@ import com.endpointmap.endpoints.ConstantEvaluator;
 import com.endpointmap.endpoints.Endpoint;
 import com.endpointmap.graph.GraphWriter;
 import com.endpointmap.outbound.FeignDetector;
+import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
 import com.endpointmap.resolutions.Resolutions;
 import com.endpointmap.trace.FlowTracer;
 import com.endpointmap.trace.OutboundDetector;
 import com.endpointmap.url.TargetMatcher;
+import com.endpointmap.url.UrlEvaluator;
 import com.endpointmap.viewer.MapHtmlWriter;
 import com.endpointmap.workspace.Types;
 import com.endpointmap.workspace.Workspace;
@@ -93,8 +95,10 @@ public final class Main {
         ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>(),
                 sources.computeIfAbsent(r.name(), k -> new HashMap<>()))));
         Types types = new Types(ws);
-        List<OutboundDetector> detectors = List.of(new FeignDetector(detector, new ConstantEvaluator(types)));
-        FlowTracer tracer = new FlowTracer(ws, types, detectors);
+        ConstantEvaluator constants = new ConstantEvaluator(types);
+        UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
+        List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls));
+        FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         List<Map<String, Object>> edges = new ArrayList<>();
         Map<String, Map<String, Object>> targets = new HashMap<>();
@@ -116,9 +120,12 @@ public final class Main {
                 TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
                 if (ask != null) {
                     String section = ask.key().equals(callSite) ? Resolutions.CALL_SITES : Resolutions.PROPERTIES;
-                    asked.computeIfAbsent(e.service() + "\0" + ask.key(),
-                            k -> new Resolutions.Found(e.service(), section, ask.key(), ask.hint(), new TreeSet<>()))
-                            .usages().add(at + " (" + f.file() + ":" + f.line() + ")");
+                    Resolutions.Found entry = asked.computeIfAbsent(e.service() + "\0" + ask.key(),
+                            k -> new Resolutions.Found(e.service(), section, ask.key(), new TreeSet<>(), new TreeSet<>()));
+                    entry.usages().add(at + " (" + f.file() + ":" + f.line() + ")");
+                    if (ask.hint() != null) {
+                        entry.hints().add(ask.hint());
+                    }
                 }
                 for (TargetMatcher.Target t : matcher.match(f.call(), e.service(), callSite)) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),

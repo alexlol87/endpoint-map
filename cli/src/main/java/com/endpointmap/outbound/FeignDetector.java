@@ -8,6 +8,7 @@ import com.endpointmap.endpoints.UrlPaths;
 import com.endpointmap.trace.CallSite;
 import com.endpointmap.trace.OutboundCall;
 import com.endpointmap.trace.OutboundDetector;
+import com.endpointmap.url.UrlEvaluator;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
 import com.github.javaparser.ast.expr.AnnotationExpr;
@@ -17,7 +18,7 @@ import com.github.javaparser.ast.expr.NormalAnnotationExpr;
 import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
+import java.util.Objects;
 import java.util.Optional;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
@@ -30,7 +31,6 @@ import java.util.stream.Stream;
  */
 public final class FeignDetector implements OutboundDetector {
 
-    private static final Pattern PLACEHOLDER = Pattern.compile("\\$\\{([^}:]+)}");
     /** The path of a URL, with or without scheme. */
     private static final Pattern URL_PATH = Pattern.compile("^(?:[a-zA-Z][\\w+.-]*://)?[^/?#]*([^?#]*).*$");
 
@@ -67,7 +67,7 @@ public final class FeignDetector implements OutboundDetector {
                 // a url the evaluator can't read (a constant from a jar) leaves nothing to name: the call site is the key
                 key = urlExpr.isPresent() && rawUrl.isEmpty() ? null : "feign:" + name;
             } else if (url.contains("{*}")) {
-                key = missingPlaceholder(rawUrl.get(), site.config());
+                key = Objects.requireNonNullElse(UrlEvaluator.firstUndefined(rawUrl.get(), site.config()), rawUrl.get());
                 // "${HOST}/loyalty-api": only the placeholder is unknown, the rest stays as a path prefix
                 Matcher u = URL_PATH.matcher(url.replace("{*}", "x"));
                 urlPrefix = u.matches() ? u.group(1) : "";
@@ -79,7 +79,7 @@ public final class FeignDetector implements OutboundDetector {
                 for (String path : mapping.get().paths()) {
                     // Feign sends GET when the mapping names no method
                     out.add(new OutboundCall("feign", verb.equals("ANY") ? "GET" : verb, key == null ? url : null,
-                            UrlPaths.join(prefix, path), key, source));
+                            UrlPaths.join(prefix, path), key, source, null));
                 }
             }
         }
@@ -88,17 +88,6 @@ public final class FeignDetector implements OutboundDetector {
 
     private Optional<String> attr(AnnotationExpr a, CallSite site, String... names) {
         return attrRaw(a, names).map(v -> ConfigResolver.resolve(v, site.config()));
-    }
-
-    /** The first {@code ${name}} without a default that the config doesn't define, as written; the raw url if none. */
-    private static String missingPlaceholder(String raw, Map<String, String> config) {
-        Matcher m = PLACEHOLDER.matcher(raw);
-        while (m.find()) {
-            if (!config.containsKey(m.group(1))) {
-                return m.group();
-            }
-        }
-        return raw;
     }
 
     private Optional<String> attrRaw(AnnotationExpr a, String... names) {

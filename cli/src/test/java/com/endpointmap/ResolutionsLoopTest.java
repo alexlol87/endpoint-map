@@ -187,7 +187,9 @@ class ResolutionsLoopTest {
         assertEquals(new TreeSet<>(List.of("${LOY_HOST}", "b.url", "feign:e", "feign:d", "host:svc-b.prod.acme.io")),
                 names(props), out);
         String text = Files.readString(res);
-        assertTrue(text.contains("# hint: url = \"${LOY_HOST}/loyalty-api\"; environment variable ${LOY_HOST} not set"), text);
+        // two clients share ${LOY_HOST}: the hint lists both URL expressions
+        assertTrue(text.contains("# hint: url = \"${LOY_HOST}/loyalty-api\", url = \"${LOY_HOST}/points-api\"; environment"
+                + " variable ${LOY_HOST} not set"), text);
         assertTrue(text.contains("# hint: url = \"${b.url}/v2\"; property ${b.url} not set"), text);
         assertTrue(text.contains("# hint: @FeignClient(name = \"e\") has no url (url = \"\" is blank)"), text);
         assertTrue(text.contains("# hint: found in code: h.url = https://svc-b.prod.acme.io (application-prod.yml); treated as"

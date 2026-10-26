@@ -37,7 +37,7 @@ import java.util.stream.Stream;
  * Walks method bodies from a handler down through any number of calls (services, static utils, library code) and
  * asks every {@link OutboundDetector} to classify each call. A classified call ends that branch; any other call
  * into workspace code is followed. An interface/abstract method is followed into each implementation.
- * Calls the symbol solver can't resolve fall back to name + arity matching and are marked low confidence.
+ * Calls the symbol solver can't resolve fall back to name + arity matching, low confidence when several match.
  * Each method keeps one result per call site and target, so repeated calls and diamonds don't multiply paths.
  */
 public final class FlowTracer {
@@ -59,15 +59,20 @@ public final class FlowTracer {
 
     private final Types types;
     private final List<OutboundDetector> detectors;
+    private final ArgumentBinder binder;
     private final Map<TypeDeclaration<?>, List<ClassOrInterfaceDeclaration>> subtypes = new IdentityHashMap<>();
-    // per service: detectors resolve placeholders with the calling service's config, so library results differ
-    // shortcut: keyed by method only, so a util called with different arguments (WebClient bean, URL) reuses the
-    // first caller's result; add argument bindings to the key with argument propagation (#5/#7)
-    private final Map<Repo, Map<MethodDeclaration, List<Found>>> memo = new IdentityHashMap<>();
+    // per service: detectors resolve placeholders with the calling service's config, so library results differ;
+    // per argument values: a util called with another WebClient bean or URL reaches another target
+    private final Map<Repo, Map<MethodDeclaration, Map<Map<String, ArgValue>, List<Found>>>> memo = new IdentityHashMap<>();
 
     public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors) {
+        this(ws, types, detectors, ArgumentBinder.NONE);
+    }
+
+    public FlowTracer(Workspace ws, Types types, List<OutboundDetector> detectors, ArgumentBinder binder) {
         this.types = types;
         this.detectors = detectors;
+        this.binder = binder;
         ws.repos().stream().flatMap(r -> r.sources().stream())
                 .flatMap(sf -> sf.cu().findAll(ClassOrInterfaceDeclaration.class).stream())
                 .filter(c -> !c.isInterface())
@@ -75,20 +80,23 @@ public final class FlowTracer {
     }
 
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        return walk(handler, service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        return walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
     }
 
     /**
      * {@code stack} maps each method being walked to its depth. {@code partial} holds results cut short by a recursive
      * call back to a method still on the stack: valid until that method returns, so a cycle is walked once, not once
-     * per path into it.
+     * per path into it. {@code args}: what the caller passed to m's parameters.
      */
-    private Result walk(MethodDeclaration m, Repo service, Map<String, String> config, Map<MethodDeclaration, Integer> stack,
-                        Map<MethodDeclaration, Result> partial) {
-        Map<MethodDeclaration, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>());
-        if (done.containsKey(m)) {
-            return new Result(done.get(m), Integer.MAX_VALUE);
+    private Result walk(MethodDeclaration m, Map<String, ArgValue> args, Repo service, Map<String, String> config,
+                        Map<MethodDeclaration, Integer> stack, Map<MethodDeclaration, Result> partial) {
+        Map<Map<String, ArgValue>, List<Found>> done = memo.computeIfAbsent(service, k -> new IdentityHashMap<>())
+                .computeIfAbsent(m, k -> new java.util.HashMap<>());
+        if (done.containsKey(args)) {
+            return new Result(done.get(args), Integer.MAX_VALUE);
         }
+        // shortcut: a cut-short result is reused whatever the arguments; only matters for a cycle walked with two
+        // different argument values at once, key partial by args too if that shows up
         if (partial.containsKey(m)) {
             return partial.get(m);
         }
@@ -105,13 +113,16 @@ public final class FlowTracer {
             Callees c = callees(call);
             List<TypeDeclaration<?>> receiver = receiverTypes(call);
             boolean classified = false;
-            for (MethodDeclaration callee : c.methods()) { // one detection per callee, so via names the right one
-                List<OutboundCall> out = detectors.stream()
-                        .flatMap(d -> d.detect(new CallSite(call, List.of(callee), receiver, service, config)).stream()).toList();
-                // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
-                String label = receiver.isEmpty() || callee.getBody().isPresent() ? label(callee)
-                        : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
-                out.forEach(o -> add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low())));
+            // one detection per callee, so via names the right one; a framework call (WebClient...) has none
+            for (MethodDeclaration callee : c.methods().isEmpty() ? java.util.Collections.<MethodDeclaration>singletonList(null) : c.methods()) {
+                List<OutboundCall> out = detectors.stream().flatMap(d -> d.detect(new CallSite(call,
+                        callee == null ? List.of() : List.of(callee), receiver, service, config, m, args)).stream()).toList();
+                for (OutboundCall o : out) {
+                    // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
+                    String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
+                            ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low()));
+                }
                 classified |= !out.isEmpty();
             }
             if (classified) {
@@ -123,7 +134,9 @@ public final class FlowTracer {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
-                Result r = walk(callee, service, config, stack, partial);
+                Map<String, ArgValue> calleeArgs = call instanceof MethodCallExpr mc
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : Map.of();
+                Result r = walk(callee, calleeArgs, service, config, stack, partial);
                 backTo = Math.min(backTo, r.backTo());
                 for (Found f : r.found()) {
                     List<String> via = new ArrayList<>(List.of(label(callee)));
@@ -136,7 +149,7 @@ public final class FlowTracer {
         partial.values().removeIf(r -> r.backTo() >= depth); // they were cut back to m or below, which is done now
         Result result = new Result(List.copyOf(found.values()), backTo);
         if (backTo >= depth) { // complete: any recursion below came back to m itself, not to a caller still being walked
-            done.put(m, result.found());
+            done.put(args, result.found());
             return new Result(result.found(), Integer.MAX_VALUE);
         }
         partial.put(m, result);
@@ -165,8 +178,10 @@ public final class FlowTracer {
             ResolvedMethodDeclaration r = call instanceof MethodCallExpr mc ? mc.resolve() : ((MethodReferenceExpr) call).resolve();
             return new Callees(r.toAst(MethodDeclaration.class).map(d -> List.of(types.canonical(d))).orElse(List.of()), false);
         } catch (RuntimeException | StackOverflowError e) {
+            // the solver fails on any signature naming a type outside the workspace (every Mono-returning method):
+            // one method of that name and arity on the receiver's declared type is still certain
             List<MethodDeclaration> byName = byName(call);
-            return new Callees(byName, !byName.isEmpty());
+            return new Callees(byName, byName.size() > 1);
         }
     }
 
