@@ -21,7 +21,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Folder | Kind | Stack | Port / base path |
 |---|---|---|---|
 | lib-http-clients | library | Feign, RestClient wrapper | – |
-| lib-common-clients | library | RestTemplate wrapper, `@ConfigurationProperties` | – |
+| lib-common-clients | library | RestTemplate wrapper, `@ConfigurationProperties`, base repository | – |
 | lib-reactive-clients | library | WebClient wrapper, `@HttpExchange`, `Notifier` impls | – |
 | order-service | service | MVC, Java 25 | 8081, context path `/api` |
 | customer-service | service | MVC, Java 25 | 8082, context path `/customers-api` |
@@ -115,15 +115,18 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Service calling itself through a library impl built by `@Bean new SmsNotifier(url)` (`/sms` also fits `/{userId}`: both edges) | notification-service `SmsNotifier` -> `POST /notifications/sms` |
 
 ### Database and Redis
+Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too.
+
 | Case | Location |
 |---|---|
 | JPA `JpaRepository`, `@Table`, derived queries, `@Modifying @Query` JPQL, native `@Query` | order-service |
 | JPA `CrudRepository`, table from `@Entity(name)`, native query with JOIN | customer-service |
-| JPA bare `Repository` + `PagingAndSortingRepository`, table = class name, `EntityManager` | inventory-service |
+| JPA bare `Repository` + `PagingAndSortingRepository`, table = class name (`stock_item`), `exists`/`stream` prefixes, `EntityManager` | inventory-service |
 | `JdbcTemplate` and `JdbcClient` raw SQL (SELECT / INSERT / UPDATE / DELETE) | report-service |
 | R2DBC `ReactiveCrudRepository` + `@Query` JOIN | catalog-service, loyalty-service |
 | R2DBC `R2dbcRepository` | user-profile-service |
-| R2DBC `@Modifying @Query`, `@Table` without a name | audit-service |
+| R2DBC `@Modifying @Query`, `@Table` without a name (`audit_event`) | audit-service |
+| JPA repository extending a library base repository (`AuditedRepository<E, K> extends ListCrudRepository<E, K>`), entity without `@Table` (`tax_rate_snapshot`), inherited `save` + `remove` prefix, 5 hops down the checkout chain | order-service `TaxRateSnapshotRepository` <- `TaxRestUtils`, lib-common-clients `AuditedRepository` |
 | `DatabaseClient.sql(..)`, `R2dbcEntityTemplate.insert/delete` | review-service |
 | `StringRedisTemplate` opsForValue / expire / hasKey, `@Cacheable/@CachePut/@CacheEvict` | customer-service |
 | `RedisTemplate` opsForHash / opsForList / opsForZSet, constant key, `@Cacheable("name")` | tax-service |
@@ -157,7 +160,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 ### Deep call chains (controller -> handler -> service -> other services -> utils)
 | Case | Location |
 |---|---|
-| MVC: controller -> handler interface (one `@Component` impl) -> `CheckoutService` -> `OrderPricingService` -> `OrderTaxService` -> `TaxRestUtils` (`@Component` util doing a RestTemplate call 5 hops down, URL via static `UrlUtils.join` + `HttpPaths` constant) | order-service `POST /orders/{id}/checkout` |
+| MVC: controller -> handler interface (one `@Component` impl) -> `CheckoutService` -> `OrderPricingService` -> `OrderTaxService` -> `TaxRestUtils` (`@Component` util doing a RestTemplate call 5 hops down, URL via static `UrlUtils.join` + `HttpPaths` constant; the same util writes `tax_rate_snapshot` through a repository) | order-service `POST /orders/{id}/checkout` |
 | MVC: same chain, `CheckoutService` -> static library helper `CustomerChecks.requireActive` -> private static `load` -> `CustomerFeignClient.getCustomer` (Feign client passed as an argument; via has 5 hops) | order-service `CheckoutService`, lib-http-clients `CustomerChecks` |
 | MVC: same chain, second branch -> `FulfilmentService` -> pure static `ShippingPayloadUtils`, then Feign + RestTemplate; pure static `MoneyUtils` (no I/O, nothing to report) | order-service `CheckoutService` |
 | WebFlux annotated: controller -> `ProductDetailsHandler` -> `ProductDetailsService` (`Mono.zip`) -> `AvailabilityService` -> `StockLookupService` / `PriceLookupService` -> one static util `ReactiveClientUtils.getJson` called with two different `WebClient` beans (inventory vs pricing) | catalog-service `GET /catalog/products/{sku}/details` |

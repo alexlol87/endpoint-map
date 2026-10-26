@@ -3,7 +3,7 @@ package com.acme.inventory;
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
 
-/** No @Table and no @Entity name -> table name = class name. */
+/** No @Table and no @Entity name -> table name = class name in snake_case (stock_item). */
 @Entity
 public class StockItem {
     @Id

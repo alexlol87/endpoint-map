@@ -87,7 +87,9 @@ class WebClientRestClientTest {
 
     @Test
     void deepCatalogChainFollowsEachWebClientBeanPassedIntoTheSameStaticUtil() {
-        assertEquals(Set.of("inventory-service GET /inventory/{sku}", "pricing-service GET /prices/{sku}"), targetsOf(DETAILS, ""));
+        // plus the products table read by ProductDetailsService (#10)
+        assertEquals(Set.of("db:catalog-service:products", "inventory-service GET /inventory/{sku}", "pricing-service GET /prices/{sku}"),
+                targetsOf(DETAILS, ""));
         JsonNode stock = edge(DETAILS, "inventory-service GET /inventory/{sku}");
         assertEquals(List.of("ProductDetailsHandler.details", "ProductDetailsService.details", "AvailabilityService.available",
                 "StockLookupService.stock", "ReactiveClientUtils.getJson", "WebClient.get"), strings(stock.get("via")));

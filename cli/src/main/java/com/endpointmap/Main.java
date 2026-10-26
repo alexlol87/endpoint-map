@@ -9,6 +9,7 @@ import com.endpointmap.graph.GraphWriter;
 import com.endpointmap.openapi.OpenApi;
 import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
+import com.endpointmap.outbound.RepositoryDetector;
 import com.endpointmap.outbound.RestTemplateDetector;
 import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
@@ -109,7 +110,7 @@ public final class Main {
         endpoints.addAll(routes.detect(profile));
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
-                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls));
+                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), new RepositoryDetector(types, constants));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher, configs);
@@ -142,6 +143,17 @@ public final class Main {
                 // the method holding the call: the one entered before the client method, or the handler itself
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
                 String callSite = at + ":" + f.line();
+                if (f.call().table() != null) { // a database call: its table node is the target, nothing to resolve
+                    String id = "db:" + e.service() + ":" + f.call().table();
+                    targets.putIfAbsent(id, GraphWriter.ordered("id", id, "kind", "db", "tech", f.call().client(), "table", f.call().table()));
+                    Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", id, "kind", "db", "client", f.call().client(),
+                            "op", f.call().op(), "repoMethod", f.call().label(), "via", f.via(), "file", f.file(), "line", f.line());
+                    if (f.lowConfidence()) {
+                        edge.put("confidence", "low");
+                    }
+                    edges.add(edge);
+                    continue;
+                }
                 TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
                 if (ask != null) {
                     String section = ask.key().equals(callSite) ? Resolutions.CALL_SITES : Resolutions.PROPERTIES;
