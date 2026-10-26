@@ -107,6 +107,9 @@ class FeignTraceTest {
         assertEquals("${SHIPPING_SERVICE_URL}",
                 env.node("unresolved:order-service:${SHIPPING_SERVICE_URL} POST /shipments").get("missing").asText());
         assertTrue(env.stdout.contains("unresolved:order-service:feign:pricing-service GET /prices/{sku}"), env.stdout);
+        // "${REWARDS_HOST}/rewards-api": the key is the placeholder, the context path stays on the path
+        assertEquals("${REWARDS_HOST}", env.node("unresolved:notification-service:${REWARDS_HOST} GET /rewards-api/rewards/{userId}")
+                .get("missing").asText());
     }
 
     @Test

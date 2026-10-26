@@ -43,12 +43,19 @@ public final class TargetMatcher {
     private final Map<String, String> serviceByName = new HashMap<>();
     private final Map<String, String> serviceByPort = new HashMap<>();
     private final Map<String, List<Endpoint>> endpointsByService = new HashMap<>();
+    private static final Pattern FIRST_PLACEHOLDER = Pattern.compile("\\$\\{([^}:]+)");
+
     private final Set<String> services = new HashSet<>();
     private final Resolutions resolutions;
+    private final Map<String, Map<String, String>> configs;
+    private final Map<String, Map<String, String>> configSources;
 
-    public TargetMatcher(Workspace ws, Map<String, Map<String, String>> configs, List<Endpoint> endpoints,
-                         Resolutions resolutions) {
+    /** {@code configSources}: per service, property -> the config file name that set it (for hints). */
+    public TargetMatcher(Workspace ws, Map<String, Map<String, String>> configs,
+                         Map<String, Map<String, String>> configSources, List<Endpoint> endpoints, Resolutions resolutions) {
         this.resolutions = resolutions;
+        this.configs = configs;
+        this.configSources = configSources;
         Set<String> sharedPorts = new HashSet<>();
         for (Repo r : ws.repos()) {
             if (r.kind() != Workspace.Kind.service) {
@@ -76,39 +83,50 @@ public final class TargetMatcher {
      * The resolutions.yml entry for a call made at {@code callSite} ("Class.method:line"), null when code alone names
      * the target: {@code feign:<name>} or the property / {@code ${ENV}} placeholder of an unknown base URL, the call
      * site when the URL is not known at all, {@code host:<host[:port]>} when the host was called external by heuristic.
+     * The hint quotes the URL expression from code.
      */
-    public Ask ask(OutboundCall call, String callSite) {
+    public Ask ask(OutboundCall call, String callerService, String callSite) {
+        String code = call.source() == null ? null : "url = " + call.source();
         if (call.baseUrl() == null) {
             if (call.unresolvedKey() == null) {
-                return new Ask(callSite, "the URL is not known from code");
+                return new Ask(callSite, code == null ? "the URL is not known from code" : code + " (not readable from code)");
             }
             String key = call.unresolvedKey();
-            Matcher p = PLACEHOLDER.matcher(key);
             if (key.startsWith("feign:")) {
-                return new Ask(key, "@FeignClient(name = \"" + key.substring(6) + "\") has no url");
+                return new Ask(key, "@FeignClient(name = \"" + key.substring(6) + "\") has no url"
+                        + (code == null ? "" : " (" + code + " is blank)"));
             }
             // a property is named bare (pricing.base-url), an environment variable as written (${PAYMENT_HOST})
-            boolean env = p.matches() && p.group(1).matches("[A-Z0-9_]+");
-            return new Ask(p.matches() && !env ? p.group(1) : key, "url = \"" + key + "\"; "
-                    + (env ? "environment variable" : "property") + " not set in application.yml or the profile file");
+            Matcher p = PLACEHOLDER.matcher(key);
+            boolean env = p.matches() && p.group(1).matches("[A-Z][A-Z0-9_]*");
+            return new Ask(p.matches() && !env ? p.group(1) : key, code + "; " + (env ? "environment variable"
+                    : p.matches() ? "property" : "placeholder") + " " + key + " not set in application.yml or the profile file");
         }
         Matcher u = URL.matcher(call.baseUrl().trim());
         if (!u.matches()) {
-            return new Ask(callSite, "base URL \"" + call.baseUrl() + "\" is not a URL");
+            return new Ask(callSite, code + " gives \"" + call.baseUrl() + "\", which is not a URL");
         }
         if (service(u) != null) {
             return null;
         }
         String host = u.group(2);
         String like = serviceByName.get(host.split("\\.")[0]);
-        return new Ask("host:" + host + (u.group(3) == null ? "" : ":" + u.group(3)), "found in code: " + call.baseUrl()
-                + "; treated as external because the name looks public"
-                + (like == null ? "" : "; its first label is the service " + like + " (write service:" + like + "?)"));
+        return new Ask("host:" + host + (u.group(3) == null ? "" : ":" + u.group(3)), "found in code: "
+                + foundIn(call, callerService) + "; treated as external because the name looks public; leave blank to keep"
+                + " it external, or write service:" + (like == null ? "<repo-name>" : like + " (its first label is that service)"));
+    }
+
+    /** "loyalty.base-url = https://x (application-prod.yml)" when the url comes from a property, else the url. */
+    private String foundIn(OutboundCall call, String service) {
+        Matcher p = call.source() == null ? null : FIRST_PLACEHOLDER.matcher(call.source());
+        String file = p != null && p.find() ? configSources.getOrDefault(service, Map.of()).get(p.group(1)) : null;
+        return file == null ? call.baseUrl() : p.group(1) + " = "
+                + ConfigResolver.resolve(configs.get(service).get(p.group(1)), configs.get(service)) + " (" + file + ")";
     }
 
     public List<Target> match(OutboundCall call, String callerService, String callSite) {
         String path = call.path().replaceAll("[?#].*$", "");
-        Ask ask = ask(call, callSite);
+        Ask ask = ask(call, callerService, callSite);
         Matcher u = call.baseUrl() == null ? null : URL.matcher(call.baseUrl().trim());
         boolean parsed = u != null && u.matches();
         String full = parsed ? UrlPaths.join(u.group(4), path) : path;
@@ -122,18 +140,24 @@ public final class TargetMatcher {
             }
             String service = resolved.substring("service:".length());
             if (!services.contains(service)) {
-                Target t = unresolved(callerService + ":" + ask.key(), call.verb(), full, null, ask.key());
-                t.node().put("reason", "resolutions.yml names " + service + ", which is not a service in the workspace");
-                return List.of(t);
+                String near = services.stream().filter(s -> distance(s, service) <= 2)
+                        .min(java.util.Comparator.comparingInt((String s) -> distance(s, service)).thenComparing(s -> s))
+                        .orElse(null);
+                return List.of(unresolved(callerService + ":" + ask.key(), call.verb(), full, null, ask.key(),
+                        "resolutions.yml names " + service + " for " + ask.key() + ", which is not a service in the workspace"
+                                + (near == null ? "" : " (did you mean " + near + "?)")));
             }
             return endpoints(service, call.verb(), full);
         }
+        String blank = ask == null ? null : "resolutions.yml has no value for " + ask.key() + " (" + callerService + ")";
         if (call.baseUrl() == null) {
             String missing = call.unresolvedKey() == null ? ask.key() : call.unresolvedKey();
-            return List.of(unresolved(callerService + ":" + missing, call.verb(), path, null, missing));
+            return List.of(unresolved(callerService + ":" + missing, call.verb(), path, null, missing,
+                    "base URL unknown: " + blank));
         }
         if (!parsed) {
-            return List.of(unresolved(callerService + ":" + call.baseUrl(), call.verb(), path, null, call.baseUrl()));
+            return List.of(unresolved(callerService + ":" + call.baseUrl(), call.verb(), path, null, call.baseUrl(),
+                    "base URL \"" + call.baseUrl() + "\" is not a URL: " + blank));
         }
         String service = service(u);
         if (service == null) {
@@ -141,6 +165,24 @@ public final class TargetMatcher {
                     + (u.group(3) == null ? "" : ":" + u.group(3)), call.verb(), full));
         }
         return endpoints(service, call.verb(), full);
+    }
+
+    /** Levenshtein distance, for "did you mean". */
+    static int distance(String a, String b) {
+        int[] row = new int[b.length() + 1];
+        for (int j = 0; j <= b.length(); j++) {
+            row[j] = j;
+        }
+        for (int i = 1; i <= a.length(); i++) {
+            int diag = row[0];
+            row[0] = i;
+            for (int j = 1; j <= b.length(); j++) {
+                int up = row[j];
+                row[j] = Math.min(Math.min(row[j] + 1, row[j - 1] + 1), diag + (a.charAt(i - 1) == b.charAt(j - 1) ? 0 : 1));
+                diag = up;
+            }
+        }
+        return row[b.length()];
     }
 
     /** The service a parsed base URL names by host or localhost port, null when it looks external. */
@@ -156,7 +198,8 @@ public final class TargetMatcher {
                 .filter(e -> samePath(e.path(), full))
                 .map(Endpoint::id).distinct().sorted()
                 .map(id -> new Target(id, "http", null)).toList();
-        return hits.isEmpty() ? List.of(unresolved(service, verb, full, service, null)) : hits;
+        return hits.isEmpty() ? List.of(unresolved(service, verb, full, service, null,
+                "no endpoint of " + service + " matches " + verb + " " + full)) : hits;
     }
 
     private static Target external(String origin, String verb, String full) {
@@ -189,16 +232,15 @@ public final class TargetMatcher {
         return segment.startsWith("{") && segment.endsWith("}");
     }
 
-    private static Target unresolved(String what, String verb, String path, String service, String missing) {
+    private static Target unresolved(String what, String verb, String path, String service, String missing, String reason) {
         String id = "unresolved:" + what + " " + verb + " " + path;
         Map<String, Object> n = node("id", id, "kind", "unresolved", "method", verb, "path", path);
         if (service != null) {
             n.put("service", service);
-            n.put("reason", "no matching endpoint");
         } else {
             n.put("missing", missing);
-            n.put("reason", "base URL unknown");
         }
+        n.put("reason", reason);
         return new Target(id, "http", n);
     }
 

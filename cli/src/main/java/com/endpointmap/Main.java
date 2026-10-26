@@ -76,9 +76,9 @@ public final class Main {
     private record Scan(Workspace ws, Map<String, Object> graph, Map<String, Resolutions.Found> asked,
                         List<String> configWarnings, List<String> traceWarnings) {
 
+        /** "id: reason" of every unresolved node. */
         List<String> unresolved() {
-            return ((List<?>) graph.get("nodes")).stream().map(n -> (String) ((Map<?, ?>) n).get("id"))
-                    .filter(id -> id.startsWith("unresolved:")).toList();
+            return DiscoverReport.unresolved(graph);
         }
     }
 
@@ -89,11 +89,13 @@ public final class Main {
         AnnotationEndpointDetector detector = new AnnotationEndpointDetector(ws);
         List<Endpoint> endpoints = detector.detect(profile);
         Map<String, Map<String, String>> configs = new HashMap<>();
-        ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>())));
+        Map<String, Map<String, String>> sources = new HashMap<>();
+        ws.repos().forEach(r -> configs.put(r.name(), ConfigResolver.load(r.dir(), profile, new ArrayList<>(),
+                sources.computeIfAbsent(r.name(), k -> new HashMap<>()))));
         Types types = new Types(ws);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, new ConstantEvaluator(types)));
         FlowTracer tracer = new FlowTracer(ws, types, detectors);
-        TargetMatcher matcher = new TargetMatcher(ws, configs, endpoints, resolutions);
+        TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         List<Map<String, Object>> edges = new ArrayList<>();
         Map<String, Map<String, Object>> targets = new HashMap<>();
         Map<String, Resolutions.Found> asked = new TreeMap<>();
@@ -111,12 +113,12 @@ public final class Main {
                 // the method holding the call: the one entered before the client method, or the handler itself
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
                 String callSite = at + ":" + f.line();
-                TargetMatcher.Ask ask = matcher.ask(f.call(), callSite);
+                TargetMatcher.Ask ask = matcher.ask(f.call(), e.service(), callSite);
                 if (ask != null) {
                     String section = ask.key().equals(callSite) ? Resolutions.CALL_SITES : Resolutions.PROPERTIES;
                     asked.computeIfAbsent(e.service() + "\0" + ask.key(),
                             k -> new Resolutions.Found(e.service(), section, ask.key(), ask.hint(), new TreeSet<>()))
-                            .usages().add(at + " (" + Path.of(f.file()).getFileName() + ":" + f.line() + ")");
+                            .usages().add(at + " (" + f.file() + ":" + f.line() + ")");
                 }
                 for (TargetMatcher.Target t : matcher.match(f.call(), e.service(), callSite)) {
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", t.id(), "kind", t.edgeKind(),
@@ -144,8 +146,8 @@ public final class Main {
         DiscoverReport.write(report, scan.ws(), scan.graph(), scan.asked().values(), old, scan.configWarnings(),
                 scan.traceWarnings(), stats);
         summary(scan, out);
-        out.printf("resolutions: %d entries, %d blank, %d new, %d stale -> %s%n", stats.entries(), stats.blank(),
-                stats.added(), stats.stale(), file);
+        out.printf("resolutions: %d entries, %d blank, %d new, %d stale, %d host: blank (kept external) -> %s%n",
+                stats.entries(), stats.blank(), stats.added(), stats.stale(), stats.hostBlank(), file);
         out.println("report -> " + report);
         return 0;
     }
@@ -161,10 +163,14 @@ public final class Main {
             err.println("--resolutions " + file + " does not exist; run discover first");
             return 2;
         }
-        Scan scan = scan(opts, file == null ? Resolutions.empty() : Resolutions.read(Path.of(file)));
+        // same default as discover, so map applies the file discover just wrote
+        Path res = Path.of(file == null ? "resolutions.yml" : file).toAbsolutePath();
+        boolean use = Files.isRegularFile(res);
+        Scan scan = scan(opts, use ? Resolutions.read(res) : Resolutions.empty());
         Path dir = Files.createDirectories(Path.of(outDir));
         GraphWriter.write(scan.graph(), dir.resolve("graph.json"));
         MapHtmlWriter.write(GraphWriter.toJson(scan.graph()), dir.resolve("map.html"));
+        out.println(use ? "resolutions <- " + res : "resolutions: none (" + res + " not found; run discover to create it)");
         out.println("map -> " + dir);
         summary(scan, out);
         return 0;

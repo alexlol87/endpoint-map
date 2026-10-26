@@ -1,12 +1,18 @@
 package com.endpointmap.resolutions;
 
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.StreamReadFeature;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.dataformat.yaml.YAMLFactory;
 import java.io.IOException;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.nio.file.StandardCopyOption;
+import java.util.ArrayList;
 import java.util.Collection;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
@@ -23,7 +29,20 @@ public final class Resolutions {
     public static final String PROPERTIES = "properties";
     public static final String CALL_SITES = "callSites";
     private static final List<String> SECTIONS = List.of(PROPERTIES, CALL_SITES);
-    private static final ObjectMapper YAML = new ObjectMapper(new YAMLFactory());
+    private static final ObjectMapper YAML = new ObjectMapper(YAMLFactory.builder()
+            .enable(StreamReadFeature.STRICT_DUPLICATE_DETECTION).build());
+    private static final String HEADER = """
+            # endpoint-map resolutions: name every target the code doesn't reveal. Values:
+            #   service:<repo-name>      an internal call, matched to that service's endpoints by verb + path
+            #   external:<https://host>  a call leaving the system
+            #   ""                       unknown: a red unresolved node (a host: entry keeps what code found)
+            # discover rewrites the comments and keeps every value; entries no longer found are marked # stale.
+            # Your own comment lines are kept with the key below them, and a comment after a value stays with it.
+            """;
+    private static final Set<String> HEADER_LINES = Set.copyOf(HEADER.lines().toList());
+    private static final String STALE = "# stale: no longer found in code";
+    /** Path of comments after the last key. */
+    private static final String END = "\u0001end";
     private static final Pattern VALUE = Pattern.compile("|service:\\S+|external:https?://[^/\\s]+\\S*");
     private static final Pattern PLAIN = Pattern.compile("[A-Za-z0-9_.-]+(:[A-Za-z0-9_.-]+)*");
 
@@ -31,11 +50,15 @@ public final class Resolutions {
     public record Found(String service, String section, String key, String hint, Set<String> usages) {
     }
 
-    public record Stats(int entries, int blank, int added, int stale) {
+    /** {@code blank} counts unknowns; a blank {@code host:} entry keeps what code found and is counted in {@code hostBlank}. */
+    public record Stats(int entries, int blank, int added, int stale, int hostBlank) {
     }
 
     /** service -> section -> key -> value ("" when blank). */
     private final Map<String, Map<String, Map<String, String>>> values;
+    /** The user's comment lines above, and the comment after, a line; by path "service\0section\0key" ("" = file top). */
+    private final Map<String, List<String>> notes = new HashMap<>();
+    private final Map<String, String> trailing = new HashMap<>();
 
     private Resolutions(Map<String, Map<String, Map<String, String>>> values) {
         this.values = values;
@@ -51,9 +74,21 @@ public final class Resolutions {
         if (!Files.isRegularFile(file)) {
             return new Resolutions(values);
         }
-        JsonNode root = YAML.readTree(file.toFile());
+        JsonNode root;
+        try {
+            root = YAML.readTree(file.toFile());
+        } catch (JsonProcessingException e) {
+            if (String.valueOf(e.getOriginalMessage()).startsWith("Duplicate field")) {
+                throw new IllegalArgumentException(file + ": line " + e.getLocation().getLineNr() + ": duplicate key "
+                        + e.getOriginalMessage().substring("Duplicate field ".length())
+                        + "; merge the two entries (the file was not changed)");
+            }
+            throw e;
+        }
+        Resolutions r = new Resolutions(values);
+        r.readComments(Files.readString(file));
         if (root == null || root.isMissingNode() || root.isNull()) {
-            return new Resolutions(values);
+            return r;
         }
         if (!root.isObject()) {
             throw new IllegalArgumentException(file + ": expected service names at the top level");
@@ -77,13 +112,86 @@ public final class Resolutions {
                     String v = e.getValue().isNull() ? "" : e.getValue().isValueNode() ? e.getValue().asText().trim() : null;
                     if (v == null || !VALUE.matcher(v).matches()) {
                         throw new IllegalArgumentException(file + ": " + service.getKey() + " " + e.getKey() + ": \""
-                                + e.getValue() + "\" must be service:<repo-name>, external:<https://host> or empty");
+                                + e.getValue().asText() + "\" must be service:<repo-name>, external:<https://host> or empty");
                     }
                     entries.put(e.getKey(), v);
                 }
             }
         }
-        return new Resolutions(values);
+        return r;
+    }
+
+    /**
+     * Keeps the comments the user wrote: a comment line not generated by {@link #write} belongs to the next key (or
+     * the file end), a comment after a key's value to that key.
+     */
+    private void readComments(String text) {
+        List<String> pending = new ArrayList<>();
+        List<Integer> indents = new ArrayList<>();
+        List<String> names = new ArrayList<>();
+        for (String line : text.replace("\uFEFF", "").split("\\R")) {
+            String t = line.strip();
+            if (t.startsWith("#")) {
+                if (!(HEADER_LINES.contains(t) || t.startsWith("# used by ") || t.startsWith("# hint: ")
+                        || t.startsWith("# stale"))) {
+                    pending.add(t);
+                }
+                continue;
+            }
+            int comment = commentStart(line);
+            String name = keyOf(comment < 0 ? line : line.substring(0, comment));
+            if (name == null) {
+                continue;
+            }
+            int indent = line.length() - line.stripLeading().length();
+            while (!indents.isEmpty() && indents.getLast() >= indent) {
+                indents.removeLast();
+                names.removeLast();
+            }
+            indents.add(indent);
+            names.add(name);
+            String path = String.join("\0", names);
+            if (!pending.isEmpty()) {
+                notes.put(path, pending);
+                pending = new ArrayList<>();
+            }
+            String after = comment < 0 ? "" : line.substring(comment).replace(STALE, "").strip();
+            if (!after.isEmpty() && !after.equals("#")) {
+                trailing.put(path, after);
+            }
+        }
+        if (!pending.isEmpty()) {
+            notes.put(END, pending);
+        }
+    }
+
+    /** The key of a "key: value" line, null for anything else. */
+    private static String keyOf(String line) {
+        try {
+            JsonNode n = YAML.readTree(line.strip());
+            return n != null && n.isObject() && n.size() == 1 ? n.fieldNames().next() : null;
+        } catch (IOException | RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** Index of the {@code #} that starts a comment on a line (outside quotes, after a blank), -1 if none. */
+    private static int commentStart(String line) {
+        char quote = 0;
+        for (int i = 0; i < line.length(); i++) {
+            char c = line.charAt(i);
+            boolean afterBlank = i == 0 || Character.isWhitespace(line.charAt(i - 1));
+            if (quote == 0 && (c == '"' || c == '\'') && (afterBlank || line.charAt(i - 1) == ':')) {
+                quote = c;
+            } else if (quote == '"' && c == '\\') {
+                i++;
+            } else if (quote != 0 && c == quote) {
+                quote = 0;
+            } else if (quote == 0 && c == '#' && afterBlank) {
+                return i;
+            }
+        }
+        return -1;
     }
 
     /** The user's value for a key of a service, null when absent or blank. */
@@ -106,26 +214,29 @@ public final class Resolutions {
         int blank = 0;
         int added = 0;
         int stale = 0;
-        StringBuilder out = new StringBuilder("""
-                # endpoint-map resolutions: name every target the code doesn't reveal. Values:
-                #   service:<repo-name>      an internal call, matched to that service's endpoints by verb + path
-                #   external:<https://host>  a call leaving the system
-                #   ""                       unknown: a red unresolved node (a host: entry keeps what code found)
-                # discover rewrites the comments and keeps every value; entries no longer found are marked # stale.
-                """);
+        int hostBlank = 0;
+        StringBuilder out = new StringBuilder(HEADER);
+        note(out, "", "");
         for (String service : services) {
-            out.append(quote(service)).append(":\n");
+            note(out, "", service);
+            out.append(quote(service)).append(':').append(after(service)).append('\n');
             for (String section : SECTIONS) {
                 Map<String, Found> current = now.getOrDefault(service, Map.of()).getOrDefault(section, Map.of());
                 Map<String, String> old = values.getOrDefault(service, Map.of()).getOrDefault(section, Map.of());
                 Set<String> keys = new java.util.TreeSet<>(current.keySet());
                 keys.addAll(old.keySet());
-                out.append("  ").append(section).append(keys.isEmpty() ? ": {}\n" : ":\n");
+                String sectionPath = service + "\0" + section;
+                note(out, "  ", sectionPath);
+                out.append("  ").append(section).append(keys.isEmpty() ? ": {}" : ":").append(after(sectionPath)).append('\n');
                 for (String key : keys) {
                     Found f = current.get(key);
                     String value = old.getOrDefault(key, "");
+                    String path = sectionPath + "\0" + key;
                     entries++;
-                    blank += value.isEmpty() ? 1 : 0;
+                    boolean host = key.startsWith("host:");
+                    blank += value.isEmpty() && !host ? 1 : 0;
+                    hostBlank += value.isEmpty() && host ? 1 : 0;
+                    note(out, "    ", path);
                     added += old.containsKey(key) ? 0 : 1;
                     if (f == null) {
                         stale++;
@@ -136,12 +247,32 @@ public final class Resolutions {
                         }
                     }
                     out.append("    ").append(quote(key)).append(": ").append(value.isEmpty() ? "\"\"" : quote(value))
-                            .append(f == null ? "  # stale: no longer found in code\n" : "\n");
+                            .append(after(path)).append(f == null ? "  " + STALE + "\n" : "\n");
                 }
             }
         }
-        Files.writeString(file, out);
-        return new Stats(entries, blank, added, stale);
+        note(out, "", END);
+        // temp file + atomic move: a killed run never leaves the user's file half written
+        Path tmp = Files.createTempFile(file.toAbsolutePath().getParent(), ".resolutions", ".tmp");
+        try {
+            Files.writeString(tmp, out);
+            try {
+                Files.move(tmp, file, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+            } catch (AtomicMoveNotSupportedException e) {
+                Files.move(tmp, file, StandardCopyOption.REPLACE_EXISTING);
+            }
+        } finally {
+            Files.deleteIfExists(tmp);
+        }
+        return new Stats(entries, blank, added, stale, hostBlank);
+    }
+
+    private void note(StringBuilder out, String indent, String path) {
+        notes.getOrDefault(path, List.of()).forEach(l -> out.append(indent).append(l).append('\n'));
+    }
+
+    private String after(String path) {
+        return trailing.containsKey(path) ? "  " + trailing.get(path) : "";
     }
 
     private static String quote(String s) {

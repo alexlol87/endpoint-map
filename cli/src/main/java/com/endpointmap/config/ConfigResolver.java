@@ -29,27 +29,43 @@ public final class ConfigResolver {
 
     /** Files that could not be read are added to {@code problems} and skipped. */
     public static Map<String, String> load(Path repoDir, String profile, List<String> problems) {
+        return load(repoDir, profile, problems, new TreeMap<>());
+    }
+
+    /** As {@link #load(Path, String, List)}, also filling {@code sources}: key -> the file name that set it. */
+    public static Map<String, String> load(Path repoDir, String profile, List<String> problems, Map<String, String> sources) {
         Path res = repoDir.resolve("src/main/resources");
         Map<String, String> props = new TreeMap<>();
         List<Map<String, String>> profileDocs = new ArrayList<>();
+        List<String> profileDocFiles = new ArrayList<>();
         for (String ext : List.of("yml", "yaml", "properties")) {
-            for (Map<String, String> doc : read(res.resolve("application." + ext), problems)) {
+            String name = "application." + ext;
+            for (Map<String, String> doc : read(res.resolve(name), problems)) {
                 String onProfile = doc.getOrDefault("spring.config.activate.on-profile", doc.get("spring.profiles"));
                 if (onProfile == null) {
-                    props.putAll(doc);
+                    put(props, doc, sources, name);
                 } else if (profile != null && Arrays.stream(onProfile.split(","))
                         .map(String::trim).anyMatch(profile::equals)) {
                     profileDocs.add(doc);
+                    profileDocFiles.add(name);
                 }
             }
         }
-        profileDocs.forEach(props::putAll);
+        for (int i = 0; i < profileDocs.size(); i++) {
+            put(props, profileDocs.get(i), sources, profileDocFiles.get(i));
+        }
         if (profile != null) {
             for (String ext : List.of("yml", "yaml", "properties")) {
-                read(res.resolve("application-" + profile + "." + ext), problems).forEach(props::putAll);
+                String name = "application-" + profile + "." + ext;
+                read(res.resolve(name), problems).forEach(doc -> put(props, doc, sources, name));
             }
         }
         return props;
+    }
+
+    private static void put(Map<String, String> props, Map<String, String> doc, Map<String, String> sources, String file) {
+        props.putAll(doc);
+        doc.keySet().forEach(k -> sources.put(k, file));
     }
 
     private static List<Map<String, String>> read(Path file, List<String> problems) {

@@ -19,7 +19,7 @@ public final class DiscoverReport {
                              Resolutions resolutions, List<String> configWarnings, List<String> traceWarnings,
                              Resolutions.Stats stats) throws IOException {
         List<Map<?, ?>> nodes = ((List<?>) graph.get("nodes")).stream().<Map<?, ?>>map(n -> (Map<?, ?>) n).toList();
-        List<String> unresolved = nodes.stream().map(n -> (String) n.get("id")).filter(id -> id.startsWith("unresolved:")).toList();
+        List<String> unresolved = unresolved(graph);
         long services = ws.repos().stream().filter(r -> r.kind() == Workspace.Kind.service).count();
         StringBuilder md = new StringBuilder("# endpoint-map discover report\n\n"
                 + "Read-only: rewritten by every `discover`. Edit `resolutions.yml` instead.\n\n## Stats\n\n");
@@ -30,7 +30,8 @@ public final class DiscoverReport {
                 .append("- unresolved targets (with current resolutions): ").append(unresolved.size()).append('\n')
                 .append("- files that failed to parse: ").append(ws.parseFailures().size()).append('\n')
                 .append("- resolutions.yml: ").append(stats.entries()).append(" entries, ").append(stats.blank())
-                .append(" blank, ").append(stats.added()).append(" new, ").append(stats.stale()).append(" stale\n");
+                .append(" blank, ").append(stats.added()).append(" new, ").append(stats.stale()).append(" stale, ")
+                .append(stats.hostBlank()).append(" host: blank (kept external)\n");
 
         section(md, "Files that failed to parse (skipped)", ws.parseFailures().stream()
                 .map(f -> "`" + f.relPath() + "`: " + f.error()).toList());
@@ -38,13 +39,20 @@ public final class DiscoverReport {
         section(md, "Hosts treated as external by heuristic", asked.stream().filter(f -> f.key().startsWith("host:"))
                 .map(f -> "`" + f.service() + "` -> `" + f.key().substring(5) + "`: "
                         + valueOrBlank(resolutions.value(f.service(), f.key())) + ". " + f.hint()).toList());
-        section(md, "Unresolved targets", unresolved.stream().map(id -> "`" + id + "`").toList());
+        section(md, "Unresolved targets", unresolved.stream().map(u -> "`" + u.replaceFirst(": ", "`: ")).toList());
         section(md, "Endpoints mapped by more than one handler", nodes.stream().filter(n -> n.containsKey("alsoHandledBy"))
                 .map(n -> "`" + n.get("id") + "`: " + n.get("handler") + ", " + n.get("alsoHandledBy")).toList());
         section(md, "Tracing problems", traceWarnings);
         md.append("\n## OpenAPI vs code mismatches\n\n_Not checked yet (#9)._\n\n");
         md.append("## Routes not understood\n\n_Not checked yet (#8)._\n");
         Files.writeString(file, md);
+    }
+
+    /** "id: reason" of every unresolved node of the graph, in graph order. */
+    public static List<String> unresolved(Map<String, Object> graph) {
+        return ((List<?>) graph.get("nodes")).stream().map(n -> (Map<?, ?>) n)
+                .filter(n -> ((String) n.get("id")).startsWith("unresolved:"))
+                .map(n -> n.get("id") + ": " + n.get("reason")).toList();
     }
 
     private static String valueOrBlank(String v) {
