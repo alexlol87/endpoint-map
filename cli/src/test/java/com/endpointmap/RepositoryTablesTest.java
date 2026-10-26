@@ -204,6 +204,7 @@ class RepositoryTablesTest {
                   protected CrudSvc(JpaRepository<E, Long> repo, Base<E, Long> base) { this.repo = repo; this.base = base; }
                   public java.util.List<E> all() { return repo.findAll(); }
                   public java.util.List<E> all2() { return base.findAll(); }
+                  public void keep(java.util.List<E> es) { es.forEach(base::save); }
                   public static <T> long size(Base<T, Long> any) { return any.count(); }
                 }
                 """);
@@ -213,7 +214,8 @@ class RepositoryTablesTest {
         write(s.resolve("App.java"), "package s;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
         write(s.resolve("Entities.java"), """
                 package s;
-                @jakarta.persistence.Entity @jakarta.persistence.Table(name = "orders") class Order {}
+                @jakarta.persistence.Entity @jakarta.persistence.Table(name = "orders")
+                @jakarta.persistence.NamedQuery(name = "Order.recent", query = "select o from Order o") class Order {}
                 @jakarta.persistence.Entity class Pet {}
                 @jakarta.persistence.Entity @jakarta.persistence.Table(name = "\\"Audit Log\\"", schema = "ops") class Audit {}
                 @jakarta.persistence.Entity(name = "`Line`") class Line {}
@@ -241,7 +243,13 @@ class RepositoryTablesTest {
                 }
                 interface OrderRepository extends org.springframework.data.jpa.repository.JpaRepository<Order, Long>, OrderRepositoryCustom {
                   @Query("select o from Order o") java.util.List<Order> everything();
+                  @org.springframework.data.jpa.repository.query.Procedure("archive_all") int archiveAll();
+                  java.util.List<Order> recent();
                 }
+                // not Spring Data: another library's Repository types, and a plain interface whose *Impl is no implementation
+                interface LegacyRepository extends com.legacy.CrudRepository<Line, Long> {}
+                interface Notifier { void send(); }
+                class NotifierImpl { AuditRepository audit; public void send() { audit.save(null); } }
                 interface LineRepository extends CrudRepository<Line, Long> { int compact(); }
                 class LineRepositoryImpl { AuditRepository audit; public int compact() { audit.deleteAll(); return 0; } }
                 interface AuditRepository extends CrudRepository<Audit, Long> {}
@@ -255,6 +263,13 @@ class RepositoryTablesTest {
                 @RestController
                 public class Ctl {
                   OrderSvc svc; lib.Base<Pet, Long> pets; OrderRepository orders; LineRepository lines; SessRepository sess; DocRepository docs;
+                  PetSvc petSvc; CrudSvc<?> anySvc; LegacyRepository legacy; com.legacy.Repository<Line> legacy2; Notifier notifier;
+                  @GetMapping("/petsAll") public Object petsAll() { return petSvc.all(); }
+                  @GetMapping("/any") public Object any() { return anySvc.all(); }
+                  @PostMapping("/keep") public void keep() { svc.keep(null); }
+                  @PostMapping("/proc") public Object proc() { return orders.archiveAll(); }
+                  @GetMapping("/recent") public Object recent() { return orders.recent(); }
+                  @PostMapping("/legacy") public void legacy() { legacy.save(null); legacy2.save(null); notifier.send(); }
                   @GetMapping("/all") public Object all() { return svc.all(); }
                   @GetMapping("/all2") public Object all2() { return svc.all2(); }
                   @GetMapping("/pets") public Object pets() { return pets.findAll(); }
@@ -274,19 +289,24 @@ class RepositoryTablesTest {
         JsonNode graph = JSON.readTree(o.resolve("graph.json").toFile());
         List<String> got = list(graph.get("edges")).stream().filter(e -> e.get("kind").asText().equals("db"))
                 .map(e -> e.get("from").asText().substring("s-service ".length()) + " -> " + e.get("to").asText() + " "
-                        + e.get("op").asText() + " " + e.get("repoMethod").asText()).sorted().toList();
+                        + e.get("op").asText() + " " + e.get("repoMethod").asText() + (e.has("confidence") ? " low" : "")).sorted().toList();
         assertEquals(List.of(
-                // E bound by every subclass in the service, also through Mid<X>: one edge per binding; JpaRepository<E, Long> too
+                // E bound by the receiver's type on the path (svc is an OrderSvc extends CrudSvc<Order>), also through Mid<X>
                 "GET /all -> db:s-service:orders read JpaRepository.findAll",
-                "GET /all -> db:s-service:pet read JpaRepository.findAll",
                 "GET /all2 -> db:s-service:orders read Base.findAll",
-                "GET /all2 -> db:s-service:pet read Base.findAll",
+                // CrudSvc<?>: nothing on the path binds E, so each subclass's entity, as a guess
+                "GET /any -> db:s-service:orders read JpaRepository.findAll low",
+                "GET /any -> db:s-service:pet read JpaRepository.findAll low",
                 "GET /archived -> db:s-service:ops.Audit Log read AuditRepository.findAll", // fragment impl walked, even findX
                 "GET /everything -> db:s-service:orders read OrderRepository.everything", // @Query; getClass/hashCode no call
                 "GET /pets -> db:s-service:pet read Base.findAll",                        // field typed Base<Pet, Long>
+                "GET /petsAll -> db:s-service:pet read JpaRepository.findAll",            // PetSvc extends Mid<Pet>
+                "GET /recent -> db:s-service:orders read OrderRepository.recent",         // @NamedQuery on the entity
                 "GET /size -> unresolved:db s-service Base.count read Base.count",        // a method's own <T>: nothing binds it
                 "POST /archive -> db:s-service:ops.Audit Log write AuditRepository.save",
-                "POST /compact -> db:s-service:ops.Audit Log delete AuditRepository.deleteAll"), got); // LineRepositoryImpl by name
+                "POST /compact -> db:s-service:ops.Audit Log delete AuditRepository.deleteAll", // LineRepositoryImpl by name
+                "POST /keep -> db:s-service:orders write Base.save",                      // method reference on the field
+                "POST /proc -> db:s-service:orders read OrderRepository.archiveAll"), got); // @Procedure: read fallback
         Map<String, JsonNode> n = byId(graph);
         assertEquals("unresolved", n.get("unresolved:db s-service Base.count").get("kind").asText());
         assertTrue(md.contains("unresolved:db s-service Base.count`: the entity of Base is the type variable T"), md);

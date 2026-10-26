@@ -134,6 +134,23 @@ public final class Types {
         return node.findCompilationUnit().map(relPathOf::get).orElse("");
     }
 
+    /** A workspace type by its qualified name, the one in {@code context}'s repo first. */
+    public Optional<TypeDeclaration<?>> byQualifiedName(String qualifiedName, Node context) {
+        return pick(byQualifiedName.get(qualifiedName), context);
+    }
+
+    /**
+     * Whether a reference to a type outside the workspace names one from {@code pkgPrefix} ("org.springframework.data."):
+     * written fully qualified, or imported by its own or an on-demand import.
+     */
+    public static boolean fromPackage(ClassOrInterfaceType type, String pkgPrefix) {
+        String name = type.getNameWithScope();
+        String first = name.split("\\.")[0];
+        return name.startsWith(pkgPrefix) || type.findCompilationUnit().stream().flatMap(cu -> cu.getImports().stream())
+                .anyMatch(i -> !i.isStatic() && i.getNameAsString().startsWith(pkgPrefix)
+                        && (i.isAsterisk() || i.getName().getIdentifier().equals(first)));
+    }
+
     private Optional<TypeDeclaration<?>> pick(List<TypeDeclaration<?>> candidates, Node context) {
         if (candidates == null || candidates.isEmpty()) {
             return Optional.empty();

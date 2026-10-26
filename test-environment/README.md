@@ -115,7 +115,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Service calling itself through a library impl built by `@Bean new SmsNotifier(url)` (`/sms` also fits `/{userId}`: both edges) | notification-service `SmsNotifier` -> `POST /notifications/sms` |
 
 ### Database and Redis
-Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too. Explicit names are kept as written minus quotes/backticks, with `@Table(schema)` as `schema.table`. A custom fragment method (`OrderRepositoryCustom`) is no repository call: its `*Impl` is walked instead.
+Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too. Explicit names are kept as written minus quotes/backticks, with `@Table(schema)` as `schema.table`. A custom fragment method (`OrderRepositoryCustom`) is no repository call: its `*Impl` is walked instead. `<Name>Impl` is looked up by name only for a Spring Data repository or a fragment one extends, in the same repo. An entity given as a generic service's type variable (`CrudSvc<E>`) is the one the caller's receiver binds (`OrderSvc extends CrudSvc<Order>`); when nothing on the path binds it, each subclass's entity, low confidence when there are several (covered by `RepositoryTablesTest` temp fixtures).
 
 | Case | Location |
 |---|---|
