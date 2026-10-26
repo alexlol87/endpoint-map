@@ -22,11 +22,16 @@ final class Sql {
     }
 
     private static final Map<String, String> VERBS = Map.of("select", "read", "insert", "write", "merge", "write",
-            "update", "write", "delete", "delete");
+            "update", "write", "delete", "delete", "replace", "write");
     private static final Pattern NOISE = Pattern.compile("'(?:[^']|'')*'|--[^\\n]*|/\\*.*?\\*/", Pattern.DOTALL);
     private static final Pattern TABLE = Pattern.compile(
             "(?i)\\b(FROM|JOIN|INTO|UPDATE)\\s+(?:(?:ONLY|LATERAL|FETCH)\\s+)?([\\w.$\"`\\[\\]{}*]+)(\\s*\\()?");
-    private static final Pattern CTE = Pattern.compile("(?i)\\b(\\w+)\\s*(?:\\([^()]*\\))?\\s+AS\\s*\\(");
+    private static final Pattern CTE = Pattern.compile("(?i)\\b(\\w+)\\s*(?:\\([^()]*\\))?\\s+AS\\s*(?:(?:NOT\\s+)?MATERIALIZED\\s*)?\\(");
+    /** The next item of a comma list after a FROM name: {@code [AS] [alias] , <name>} (FROM a x, b y). */
+    private static final Pattern LIST = Pattern.compile("(?i)\\G(?:\\s+(?:AS\\s+)?\\w+)?\\s*,\\s*([\\w.$\"`\\[\\]{}*]+)(\\s*\\()?");
+    /** MySQL's upsert tail: its UPDATE names columns, not a table. */
+    private static final Pattern UPSERT = Pattern.compile("(?i)\\bON\\s+DUPLICATE\\s+KEY\\s+UPDATE\\b.*", Pattern.DOTALL);
+    private static final Pattern DEFAULT_SCHEMA = Pattern.compile("^(public|dbo)\\.");
     private static final Pattern WORD = Pattern.compile("[A-Za-z_]+");
     /** Words that may follow UPDATE/INTO/FROM without naming a table: ON CONFLICT DO UPDATE SET, FOR UPDATE OF. */
     private static final Set<String> NOT_NAMES = Set.of("set", "of", "nowait", "skip", "select", "values");
@@ -34,11 +39,10 @@ final class Sql {
     private Sql() {
     }
 
-    // shortcut: only the first name after FROM is seen (FROM a, b misses b), nor MERGE ... USING src; add a list
-    // reader when real code needs it
+    // shortcut: MERGE ... USING src and a list item after a subquery (FROM (..) x, b) are not read; add them when real code needs it
     /** Null when the statement is not understood (no leading verb); empty when it names no table. */
     static List<Access> parse(String sql, boolean jpql) {
-        String s = NOISE.matcher(sql).replaceAll(m -> m.group().startsWith("'") ? "''" : " ");
+        String s = UPSERT.matcher(NOISE.matcher(sql).replaceAll(m -> m.group().startsWith("'") ? "''" : " ")).replaceAll("");
         int[] depth = new int[s.length() + 1];
         boolean[] inCall = new boolean[s.length() + 1]; // inside the parentheses of a function call, not a subquery
         List<Boolean> stack = new ArrayList<>();
@@ -60,6 +64,9 @@ final class Sql {
         Set<String> ctes = new HashSet<>();
         int verbAt = w.start();
         String verb = w.group().toLowerCase(Locale.ROOT);
+        if (jpql && verb.equals("from")) {
+            verb = "select"; // HQL: from Order o where ..
+        }
         if (verb.equals("with")) {
             Matcher cte = CTE.matcher(s);
             while (cte.find()) {
@@ -78,23 +85,35 @@ final class Sql {
         if (op == null) {
             return null;
         }
-        List<Access> out = new ArrayList<>();
+        record Name(String kw, String name, boolean function, int at) {
+        }
+        List<Name> names = new ArrayList<>();
         Matcher m = TABLE.matcher(s);
-        boolean targetSeen = op.equals("read");
-        String target = null;
         while (m.find()) {
             String kw = m.group(1).toLowerCase(Locale.ROOT);
-            String name = m.group(2).replaceAll("[\"`\\[\\]]", "");
             boolean function = m.group(3) != null && (kw.equals("from") || kw.equals("join"));
-            if (inCall[m.start()] || function || NOT_NAMES.contains(name.toLowerCase(Locale.ROOT))
-                    || ctes.contains(name.toLowerCase(Locale.ROOT)) || jpql && kw.equals("join") && name.contains(".")) {
+            names.add(new Name(kw, m.group(2), function, m.start()));
+            if (kw.equals("from") && !function) { // FROM a x, b y: every item of the list
+                Matcher l = LIST.matcher(s).region(m.end(), s.length());
+                while (l.find()) {
+                    names.add(new Name(kw, l.group(1), l.group(2) != null, m.start()));
+                }
+            }
+        }
+        List<Access> out = new ArrayList<>();
+        boolean targetSeen = op.equals("read");
+        String target = null;
+        for (Name n : names) {
+            String name = jpql ? n.name().replaceAll("[\"`\\[\\]]", "") : normalize(n.name());
+            if (inCall[n.at()] || n.function() || NOT_NAMES.contains(name.toLowerCase(Locale.ROOT))
+                    || ctes.contains(name.toLowerCase(Locale.ROOT)) || jpql && n.kw().equals("join") && name.contains(".")) {
                 continue; // a JPQL path join (join o.lines l) names an association, not an entity
             }
             if (jpql && name.contains(".")) {
                 name = name.substring(name.lastIndexOf('.') + 1); // a fully qualified entity class
             }
             String table = name.matches(".*[{}$*].*") ? null : name;
-            if (!targetSeen && m.start() >= verbAt) {
+            if (!targetSeen && n.at() >= verbAt) {
                 targetSeen = true;
                 target = table;
                 out.add(new Access(table, op));
@@ -104,5 +123,19 @@ final class Sql {
         }
         String written = target;
         return out.stream().filter(a -> !a.op().equals("read") || a.table() == null || !a.table().equals(written)).distinct().toList();
+    }
+
+    /**
+     * A SQL table name as one node: unquoted parts lower-cased (SQL folds them), quoted ones kept as written, quotes
+     * dropped; the default schema ({@code public.}, {@code dbo.}) dropped.
+     */
+    // shortcut: only public/dbo count as the default schema; read spring.jpa.properties.hibernate.default_schema when needed
+    static String normalize(String name) {
+        StringBuilder out = new StringBuilder();
+        for (String part : name.split("\\.", -1)) {
+            boolean quoted = part.matches("[\"`\\[].*");
+            out.append(out.isEmpty() ? "" : ".").append(quoted ? part.replaceAll("[\"`\\[\\]]", "") : part.toLowerCase(Locale.ROOT));
+        }
+        return DEFAULT_SCHEMA.matcher(out).replaceFirst("");
     }
 }

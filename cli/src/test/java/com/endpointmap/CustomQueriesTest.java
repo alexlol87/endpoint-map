@@ -45,7 +45,7 @@ class CustomQueriesTest {
     /** "to op repoMethod [low]" of every db edge from {@code from}. */
     static List<String> dbEdges(List<JsonNode> edges, String from) {
         return edges.stream().filter(e -> e.get("from").asText().equals(from) && e.get("kind").asText().equals("db"))
-                .map(e -> e.get("to").asText() + " " + e.get("op").asText() + " " + e.get("repoMethod").asText()
+                .map(e -> e.get("to").asText() + " " + e.path("op").asText("-") + " " + e.get("repoMethod").asText()
                         + (e.has("confidence") ? " low" : "")).distinct().sorted().toList();
     }
 
@@ -64,8 +64,11 @@ class CustomQueriesTest {
     @Test
     void queryAnnotationsGiveTablesAndOpFromTheirSql() {
         // native JOIN: both tables read
+        // and @NativeQuery with a comma join, CUSTOMER_ACCOUNTS and public.customer_preferences: the same two tables
         assertEquals(List.of("db:customer-service:customer_accounts read CustomerRepository.findPreferencesJson",
-                        "db:customer-service:customer_preferences read CustomerRepository.findPreferencesJson"),
+                        "db:customer-service:customer_accounts read CustomerRepository.preferenceCount",
+                        "db:customer-service:customer_preferences read CustomerRepository.findPreferencesJson",
+                        "db:customer-service:customer_preferences read CustomerRepository.preferenceCount"),
                 dbEdges(edges, "customer-service GET /customers-api/customers/{id}/preferences"));
         assertTrue(dbEdges(edges, "catalog-service GET /catalog/products").containsAll(List.of(
                 "db:catalog-service:categories read ProductRepository.findByCategory",
@@ -99,7 +102,7 @@ class CustomQueriesTest {
                 "db:inventory-service:stock_item read EntityManager.createQuery",
                 "db:inventory-service:stock_item read EntityManager.find",                 // find(StockItem.class, ..)
                 "db:inventory-service:stock_item write EntityManager.merge",
-                "unresolved:db inventory-service EntityManager.createNativeQuery write EntityManager.createNativeQuery"),
+                "unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery write EntityManager.createNativeQuery"),
                 dbEdges(edges, "inventory-service PATCH /inventory/{sku}/quantity").stream().filter(e -> e.contains("EntityManager")).toList());
         List<String> via = edges.stream().filter(e -> e.get("from").asText().equals("inventory-service PATCH /inventory/{sku}/quantity")
                 && e.get("op").asText("").equals("delete") && e.get("to").asText().endsWith("stock_audit")).map(e -> strings(e.get("via"))).findFirst().orElseThrow();
@@ -108,10 +111,10 @@ class CustomQueriesTest {
         assertEquals(List.of("db:inventory-service:stock_audit read EntityManager.createNativeQuery",
                 "db:inventory-service:stock_item read StockRepository.findBySku"), dbEdges(edges, "inventory-service GET /inventory/{sku}"));
         // a table name built at runtime: unresolved, with the SQL as the reason, never a guessed table
-        JsonNode u = nodes.get("unresolved:db inventory-service EntityManager.createNativeQuery");
+        JsonNode u = nodes.get("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery");
         assertEquals("unresolved", u.get("kind").asText());
         assertTrue(u.get("reason").asText().startsWith("table name not known from code: INSERT INTO stock_audit_{*}"), u.toString());
-        assertTrue(report.contains("unresolved:db inventory-service EntityManager.createNativeQuery"), report);
+        assertTrue(report.contains("unresolved:db inventory-service StockAuditService.archive:41 EntityManager.createNativeQuery"), report);
         assertFalse(nodes.keySet().stream().anyMatch(id -> id.contains("stock_audit_")), nodes.keySet().toString());
     }
 
@@ -207,22 +210,108 @@ class CustomQueriesTest {
         assertEquals(List.of(
                 "db:s-service:ghost read OrderRepository.ghost low",          // no such @Entity: snake_case name, as a guess
                 "db:s-service:line_item read OrderRepository.withItems",       // fully qualified entity in a subquery
-                "db:s-service:orders read OrderRepository.withItems",          // @Entity(name = "Purchase"); path join skipped
-                "unresolved:db s-service OrderRepository.spel read OrderRepository.spel"), dbEdges(got, "s-service GET /a"));
+                "db:s-service:orders read OrderRepository.spel",               // #{#entityName}: the repository's entity
+                "db:s-service:orders read OrderRepository.withItems"),         // @Entity(name = "Purchase"); path join skipped
+                dbEdges(got, "s-service GET /a"));
         assertEquals(List.of(
                 "db:s-service:line_item read OrderRepository.totals",
                 "db:s-service:order_totals write OrderRepository.totals",      // ON CONFLICT DO UPDATE SET is no table
                 "db:s-service:orders read OrderRepository.lock",               // FOR UPDATE is no table
                 "db:s-service:orders read OrderRepository.totals",
                 "db:s-service:orders write OrderRepository.archive",           // CTE: its name is no table; the target is not also read
-                "unresolved:db s-service OrderRepository.call read OrderRepository.call",   // CALL: no verb read,
-                "unresolved:db s-service OrderRepository.noTable read OrderRepository.noTable"), dbEdges(got, "s-service POST /b"));
+                "unresolved:db s-service Ctl.b:6 OrderRepository.call read OrderRepository.call",   // CALL: no verb read,
+                "unresolved:db s-service Ctl.b:6 OrderRepository.noTable read OrderRepository.noTable"), dbEdges(got, "s-service POST /b"));
         assertEquals(List.of(
                 "db:s-service:line_item write EntityManager.persist",          // Dao<E>.save: E bound by LineItemDao
                 "db:s-service:orders read R2dbcEntityTemplate.select",
-                "unresolved:db s-service DatabaseClient.sql unknown DatabaseClient.sql",
-                "unresolved:db s-service EntityManager.createNamedQuery unknown EntityManager.createNamedQuery",
-                "unresolved:db s-service EntityManager.createNativeQuery read EntityManager.createNativeQuery",
-                "unresolved:db s-service EntityManager.persist write EntityManager.persist"), dbEdges(got, "s-service POST /c"));
+                "unresolved:db s-service Svc.run:15 EntityManager.createNamedQuery - EntityManager.createNamedQuery", // op unknown: none
+                "unresolved:db s-service Svc.run:16 EntityManager.persist write EntityManager.persist",
+                "unresolved:db s-service Svc.run:17 EntityManager.createNativeQuery read EntityManager.createNativeQuery",
+                "unresolved:db s-service Svc.run:18 DatabaseClient.sql - DatabaseClient.sql"), dbEdges(got, "s-service POST /c"));
+    }
+
+    /** Review of PR #29: SQL idioms that were wrong or dropped, and one unresolved node per call site. */
+    @Test
+    void sqlIdiomsAndUnresolvedCallSites(@TempDir Path root) throws Exception {
+        Path s = root.resolve("s-service/src/main/java/s");
+        write(s.resolve("App.java"), "package s;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(s.resolve("Entities.java"), """
+                package s;
+                @jakarta.persistence.Entity(name = "Customer") @jakarta.persistence.Table(name = "customer_accounts") class Customer {}
+                @jakarta.persistence.Entity class Pref {}
+                """);
+        write(s.resolve("Repos.java"), """
+                package s;
+                import org.springframework.data.jpa.repository.*;
+                @org.springframework.data.repository.NoRepositoryBean
+                interface BaseRepo<T> extends JpaRepository<T, Long> {
+                  @Query("select e from #{#entityName} e where e.id = ?1") T latest(long id);
+                }
+                interface CustomerRepository extends BaseRepo<Customer> {
+                  @Query("from Customer c where c.id = ?1") Customer hql(long id);
+                  @Query("select c from Customer c, Pref p where p.id = c.id") java.util.List<Customer> pairs();
+                  @Modifying @Query(value = "INSERT INTO customer_accounts (id, name) VALUES (?1, ?2) ON DUPLICATE KEY UPDATE name = VALUES(name)",
+                      nativeQuery = true) int upsert(long id, String name);
+                  @Query(value = "SELECT c.* FROM CUSTOMER_ACCOUNTS c, public.pref p, \\"Pref\\" q WHERE p.id = c.id", nativeQuery = true)
+                  java.util.List<Customer> upper();
+                  @NativeQuery("WITH x AS MATERIALIZED (SELECT id FROM pref) SELECT * FROM customer_accounts JOIN x ON true")
+                  java.util.List<Customer> topPrefs();
+                  @Modifying @NativeQuery("REPLACE INTO pref VALUES (1)") int replace();
+                }
+                """);
+        write(s.resolve("Svc.java"), """
+                package s;
+                import org.springframework.jdbc.core.JdbcTemplate;
+                @org.springframework.stereotype.Service class Svc {
+                  JdbcTemplate jdbc; jakarta.persistence.EntityManager em;
+                  void run(String id) {
+                    jdbc.update("DELETE FROM tmp_" + id);
+                    jdbc.update("UPDATE audit_" + id + " SET x = 1");
+                    em.createNamedQuery("Customer.recent");
+                  }
+                }
+                """);
+        write(s.resolve("Ctl.java"), """
+                package s;
+                import org.springframework.web.bind.annotation.*;
+                @RestController class Ctl {
+                  CustomerRepository repo; Svc svc;
+                  @GetMapping("/a") Object a() {
+                    repo.latest(1); repo.hql(1); repo.pairs(); repo.upsert(1, "n"); repo.upper(); repo.topPrefs();
+                    return repo.replace();
+                  }
+                  @PostMapping("/b") void b(@RequestParam String id) { svc.run(id); }
+                }
+                """);
+        Path o = root.resolve("out");
+        run("discover", root, "--resolutions", root.resolve("res.yml").toString());
+        String md = Files.readString(root.resolve("discover-report.md"));
+        run("map", root, "--out", o.toString());
+        JsonNode graph = JSON.readTree(o.resolve("graph.json").toFile());
+        List<JsonNode> got = list(graph.get("edges"));
+        assertEquals(List.of(
+                "db:s-service:Pref read CustomerRepository.upper",              // quoted: kept as written
+                "db:s-service:customer_accounts read CustomerRepository.hql",   // HQL without SELECT
+                "db:s-service:customer_accounts read CustomerRepository.latest", // #{#entityName} in a generic base repository
+                "db:s-service:customer_accounts read CustomerRepository.pairs",
+                "db:s-service:customer_accounts read CustomerRepository.topPrefs", // @NativeQuery; MATERIALIZED CTE is no table
+                "db:s-service:customer_accounts read CustomerRepository.upper", // upper case: the same table
+                "db:s-service:customer_accounts write CustomerRepository.upsert", // ON DUPLICATE KEY UPDATE names no table
+                "db:s-service:pref read CustomerRepository.pairs",              // JPQL comma join
+                "db:s-service:pref read CustomerRepository.topPrefs",
+                "db:s-service:pref read CustomerRepository.upper",              // comma join; public. is the default schema
+                "db:s-service:pref write CustomerRepository.replace"),          // REPLACE INTO
+                dbEdges(got, "s-service GET /a"));
+        // each runtime-built statement its own node, with its own SQL; an unknown op is left out of the edge
+        assertEquals(List.of(
+                "unresolved:db s-service Svc.run:6 JdbcTemplate.update delete JdbcTemplate.update",
+                "unresolved:db s-service Svc.run:7 JdbcTemplate.update write JdbcTemplate.update",
+                "unresolved:db s-service Svc.run:8 EntityManager.createNamedQuery - EntityManager.createNamedQuery"),
+                dbEdges(got, "s-service POST /b"));
+        Map<String, JsonNode> n = byId(graph);
+        assertTrue(n.get("unresolved:db s-service Svc.run:6 JdbcTemplate.update").get("reason").asText().contains("DELETE FROM tmp_{*}"));
+        assertTrue(n.get("unresolved:db s-service Svc.run:7 JdbcTemplate.update").get("reason").asText().contains("UPDATE audit_{*}"));
+        assertTrue(md.contains("UPDATE audit_{*}") && md.contains("DELETE FROM tmp_{*}"), md);
+        assertFalse(n.containsKey("db:s-service:name") || n.containsKey("db:s-service:x"), n.keySet().toString());
     }
 }

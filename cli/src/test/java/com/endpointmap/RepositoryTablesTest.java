@@ -302,14 +302,14 @@ class RepositoryTablesTest {
                 "GET /pets -> db:s-service:pet read Base.findAll",                        // field typed Base<Pet, Long>
                 "GET /petsAll -> db:s-service:pet read JpaRepository.findAll",            // PetSvc extends Mid<Pet>
                 "GET /recent -> db:s-service:orders read OrderRepository.recent",         // @NamedQuery on the entity
-                "GET /size -> unresolved:db s-service Base.count read Base.count",        // a method's own <T>: nothing binds it
+                "GET /size -> unresolved:db s-service CrudSvc.size:10 Base.count read Base.count", // a method's own <T>: nothing binds it
                 "POST /archive -> db:s-service:ops.Audit Log write AuditRepository.save",
                 "POST /compact -> db:s-service:ops.Audit Log delete AuditRepository.deleteAll", // LineRepositoryImpl by name
                 "POST /keep -> db:s-service:orders write Base.save",                      // method reference on the field
                 "POST /proc -> db:s-service:orders read OrderRepository.archiveAll"), got); // @Procedure: read fallback
         Map<String, JsonNode> n = byId(graph);
-        assertEquals("unresolved", n.get("unresolved:db s-service Base.count").get("kind").asText());
-        assertTrue(md.contains("unresolved:db s-service Base.count`: the entity of Base is the type variable T"), md);
+        assertEquals("unresolved", n.get("unresolved:db s-service CrudSvc.size:10 Base.count").get("kind").asText());
+        assertTrue(md.contains("unresolved:db s-service CrudSvc.size:10 Base.count`: the entity of Base is the type variable T"), md);
         assertFalse(n.containsKey("db:s-service:e"), n.keySet().toString());
         assertFalse(n.containsKey("db:s-service:line") || n.containsKey("db:s-service:`Line`"), n.keySet().toString());
     }

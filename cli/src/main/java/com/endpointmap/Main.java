@@ -146,15 +146,18 @@ public final class Main {
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
                 String callSite = at + ":" + f.line();
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
-                    // no table: an entity type variable nothing binds; the node says why (listed in the report)
+                    // no table (SQL or entity not known from code): one node per call site, saying why (listed in the report)
                     String id = f.call().table() != null ? "db:" + e.service() + ":" + f.call().table()
-                            : "unresolved:db " + e.service() + " " + f.call().label();
+                            : "unresolved:db " + e.service() + " " + callSite + " " + f.call().label();
                     targets.putIfAbsent(id, f.call().table() != null
                             ? GraphWriter.ordered("id", id, "kind", "db", "tech", f.call().client(), "table", f.call().table())
                             : GraphWriter.ordered("id", id, "kind", "unresolved", "service", e.service(), "tech", f.call().client(),
                                     "reason", f.call().source()));
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", id, "kind", "db", "client", f.call().client(),
                             "op", f.call().op(), "repoMethod", f.call().label(), "via", f.via(), "file", f.file(), "line", f.line());
+                    if (f.call().op().equals("unknown")) {
+                        edge.remove("op"); // PLAN.md's op is read|write|delete: an unknown one is left out
+                    }
                     if (f.lowConfidence()) {
                         edge.put("confidence", "low");
                     }

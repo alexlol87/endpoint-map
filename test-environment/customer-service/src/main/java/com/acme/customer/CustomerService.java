@@ -38,6 +38,9 @@ public class CustomerService {
     public Map<String, String> preferences(long id) {
         String cached = redis.opsForValue().get("prefs:" + id);
         if (cached == null) {
+            if (repository.preferenceCount(id) == 0) {
+                return Map.of();
+            }
             cached = repository.findPreferencesJson(id);
             redis.opsForValue().set("prefs:" + id, cached, Duration.ofMinutes(10));
         }
