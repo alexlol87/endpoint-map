@@ -25,7 +25,7 @@ import java.util.Set;
  * Redis: {@code RedisTemplate}, {@code StringRedisTemplate} and their reactive forms, {@code opsForValue/Hash/List/
  * Set/ZSet().<op>(key, ..)} (also through an {@code XxxOperations} variable) and {@code delete/expire/hasKey}; the key
  * is evaluated like a URL and cut at its first unknown part ({@code "cart:" + id} -> {@code cart:*}; nothing known:
- * {@code *}, low confidence). A call to a workspace method with {@code @Cacheable/@CachePut/@CacheEvict} (also inside
+ * {@code *}). A call to a workspace method with {@code @Cacheable/@CachePut/@CacheEvict} (also inside
  * {@code @Caching}, names defaulting to the class's {@code @CacheConfig}) touches {@code <cacheName>::*}, Spring's
  * default Redis cache key; such a call is still walked into.
  */
@@ -82,7 +82,7 @@ public final class RedisDetector implements OutboundDetector {
         List<String> patterns = urls.each(Env.of(site), env -> pattern(urls.string(e, env).text())).stream().distinct().toList();
         // shortcut: several possible keys keep only the first; list them all if a real service builds keys by branches
         String p = patterns.isEmpty() ? "*" : patterns.get(0);
-        return OutboundCall.redis(p, null, op, label, p.equals("*"));
+        return OutboundCall.redis(p, null, op, label, false); // redis:* itself says the key is unknown
     }
 
     /** The key's literal prefix up to the first part not known from code, then {@code *}. */
