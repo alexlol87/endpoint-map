@@ -45,6 +45,7 @@ public final class DiscoverReport {
         section(md, "Endpoints mapped by more than one handler", nodes.stream().filter(n -> n.containsKey("alsoHandledBy"))
                 .map(n -> "`" + n.get("id") + "`: " + n.get("handler") + ", " + n.get("alsoHandledBy")).toList());
         section(md, "Tracing problems", traceWarnings);
+        section(md, "OpenAPI files used", openapi.used());
         section(md, "OpenAPI vs code mismatches: only in OpenAPI", openapi.onlyInOpenApi());
         section(md, "OpenAPI vs code mismatches: only in code", openapi.onlyInCode());
         section(md, "External calls not in their OpenAPI", openapi.externalNotInSpec());

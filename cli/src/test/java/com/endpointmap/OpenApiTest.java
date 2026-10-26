@@ -45,7 +45,8 @@ class OpenApiTest {
 
     @Test
     void orderServiceOpenApi3WithServersPrefix() {
-        openapiOnly("order-service GET /api/orders/{id}/invoice", "order-service/openapi.json", 20, "invoice");
+        openapiOnly("order-service GET /api/orders/{id}/invoice", "order-service/openapi.json", 20, "(OpenAPI only)");
+        assertEquals("invoice", nodes.get("order-service GET /api/orders/{id}/invoice").get("operationId").asText());
         codeOnly("order-service POST /api/orders/{id}/cancel", "order-service/openapi.json");
         assertEquals("annotation", nodes.get("order-service POST /api/orders/{id}/cancel").get("source").asText());
         assertEquals("annotation", nodes.get("order-service GET /api/orders/{id}").get("source").asText(), "documented and in code");
@@ -144,7 +145,8 @@ class OpenApiTest {
                   @GetMapping("/v2/extra") public void extra() { }
                 }
                 """);
-        write(root.resolve("svc-b/openapi.json"), "{\"openapi\":\"3.0.0\",\"paths\":{\"/ignored\":{\"get\":{}}}}"); // --openapi-dir wins
+        // auto-found too, but none of its operations is in code: not used
+        write(root.resolve("svc-b/openapi.json"), "{\"openapi\":\"3.0.0\",\"paths\":{\"/ignored\":{\"get\":{}}}}");
         Path docs = root.resolve("docs");
         write(docs.resolve("b/swagger.json"), """
                 {"swagger": "2.0", "host": "svc-b", "basePath": "/v2",
@@ -175,7 +177,7 @@ class OpenApiTest {
 
         assertEquals("openapi-only", n.get("svc-b GET /v2/items/{itemId}").get("source").asText(), n.keySet().toString());
         assertTrue(edges.contains("svc-a GET /x -> svc-b GET /v2/items/{itemId}"), "a call reaches an openapi-only endpoint: " + edges);
-        assertNull(n.get("svc-b GET /ignored"), "auto-find is off with --openapi-dir");
+        assertNull(n.get("svc-b GET /ignored"), "a file matching no service's code adds nothing");
         assertTrue(md.contains("`svc-b GET /v2/extra` (Api.extra, svc-b/src/main/java/b/Api.java:6) is not in `"), md);
         assertFalse(md.contains("`svc-b GET /v2/other`"), md);
         JsonNode thing = n.get("external:https://api.vendor.com GET /base/things/{id}");

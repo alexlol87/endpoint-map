@@ -112,7 +112,7 @@ public final class Main {
                 new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
-        OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher);
+        OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher, configs);
         List<Endpoint> openapiOnly = openapi.crossCheck(endpoints);
         endpoints.addAll(openapiOnly);
         matcher.addEndpoints(openapiOnly); // calls to an endpoint only OpenAPI knows still reach it
@@ -166,9 +166,11 @@ public final class Main {
                 }
             }
         }
-        targets.values().forEach(openapi::annotate);
-        return new Scan(ws, GraphWriter.build(ws, endpoints, edges, targets.values()), asked, detector.warnings(), warnings,
-                routes.notUnderstood(), openapi);
+        Map<String, Object> graph = GraphWriter.build(ws, endpoints, edges, targets.values());
+        @SuppressWarnings("unchecked")
+        List<Map<String, Object>> nodes = (List<Map<String, Object>>) graph.get("nodes");
+        nodes.forEach(openapi::annotate);
+        return new Scan(ws, graph, asked, detector.warnings(), warnings, routes.notUnderstood(), openapi);
     }
 
     private static int discover(Map<String, String> opts, PrintStream out) throws Exception {
