@@ -63,6 +63,13 @@ public final class HttpExchangeDetector implements OutboundDetector {
             if (base == null && implementedIn.getOrDefault(owner.get(), List.of()).contains(site.service())) {
                 continue; // the service's own controller, injected
             }
+            // @HttpExchange(method = "POST") on the interface is the default verb of its methods
+            String typeVerb = owner.get().getAnnotationByName("HttpExchange")
+                    .filter(com.github.javaparser.ast.expr.NormalAnnotationExpr.class::isInstance)
+                    .flatMap(a -> ((com.github.javaparser.ast.expr.NormalAnnotationExpr) a).getPairs().stream()
+                            .filter(p -> p.getNameAsString().equals("method") && p.getValue().isStringLiteralExpr())
+                            .map(p -> p.getValue().asStringLiteralExpr().asString().toUpperCase()).findFirst())
+                    .orElse("GET");
             for (String prefix : mappings.typePrefixes(owner.get())) {
                 for (String verb : mapping.get().verbs()) {
                     for (String path : mapping.get().paths()) {
@@ -71,7 +78,7 @@ public final class HttpExchangeDetector implements OutboundDetector {
                         String uri = !absolute ? UrlPaths.join(prefix, path)
                                 : path.isBlank() ? prefix : prefix.replaceAll("/+$", "") + UrlPaths.join(path);
                         UrlEvaluator.Resolved r = UrlEvaluator.toCall(base, uri, site.config());
-                        out.add(new OutboundCall("httpexchange", verb.equals("ANY") ? "GET" : verb, r.baseUrl(), r.path(),
+                        out.add(new OutboundCall("httpexchange", verb.equals("ANY") ? typeVerb : verb, r.baseUrl(), r.path(),
                                 r.key(), "\"" + r.raw() + "\"", null));
                     }
                 }

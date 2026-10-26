@@ -84,8 +84,29 @@ public final class FlowTracer {
                 .forEach(c -> supertypes(c).forEach(s -> subtypes.computeIfAbsent(s, k -> new ArrayList<>()).add(c)));
     }
 
+    /** Distinct URLs one call site may give a handler; more is one callSites entry (argument combinations multiply). */
+    public static final int MAX_URLS_PER_CALL_SITE = 4;
+
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        return walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        List<Found> all = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        Map<String, List<Found>> bySite = new LinkedHashMap<>();
+        all.forEach(f -> bySite.computeIfAbsent(f.file() + ":" + f.line(), k -> new ArrayList<>()).add(f));
+        List<Found> out = new ArrayList<>();
+        for (List<Found> site : bySite.values()) {
+            if (site.size() <= MAX_URLS_PER_CALL_SITE) {
+                out.addAll(site);
+                continue;
+            }
+            // too many: one unknown URL (a callSites entry) instead, and none of the partly unknown {*} values
+            Found first = site.stream().min(java.util.Comparator.comparingInt(f -> f.via().size())).orElseThrow();
+            OutboundCall c = first.call();
+            String verb = site.stream().map(f -> f.call().verb()).distinct().count() == 1 ? c.verb() : "ANY";
+            String eg = site.stream().filter(f -> f.call().baseUrl() != null).findFirst().orElse(first).call().source();
+            out.add(new Found(new OutboundCall(c.client(), verb, null, "{*}", null,
+                    "one of " + site.size() + " combinations, e.g. " + eg, c.label()), first.via(), first.file(),
+                    first.line(), first.lowConfidence()));
+        }
+        return out;
     }
 
     /**

@@ -67,6 +67,8 @@ class RestTemplateHttpExchangeTest {
         // library wrapper: put(url) and exchange(HttpMethod.PUT passed in by the caller, url)
         assertEquals(List.of("ReportService.export", "InternalRestTemplateClient.exchange", "RestTemplate.exchange"),
                 strings(edge("report-service POST /reports/export", "unresolved:report-service:${REPORT_EXPORT_URL} PUT /{*}/x").get("via")));
+        // known limit (#5's evaluator): UrlTemplates.join(taxUrl, "tax", "rates", s) varargs are not joined, the right
+        // value is /tax-api/tax/rates/{*}; this pins today's lossy output so a fix shows up here
         edge("billing-service POST /billing/tenants/{tenant}/sync", "unresolved:tax-service PUT /tax-api{*}");
     }
 
@@ -258,6 +260,178 @@ class RestTemplateHttpExchangeTest {
         // a relative URL on a RestTemplate whose root nobody can tell (built by hand): a call site to ask about
         assertTrue(has(g, "svc-a GET /relative", "unresolved:svc-a:Wrapper.go:5 GET /b/items/1"), g.toString());
         assertTrue(YAML.readTree(res.toFile()).get("svc-a").get("callSites").has("Wrapper.go:5"));
+    }
+
+    @Test
+    void argumentCombinationsAcrossThreeLevelsAreCappedPerCallSite(@TempDir Path root) throws Exception {
+        // every level passes 3 String args, each a ternary of 2 values: hundreds of URL combinations at L3's call
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("Api.java"), """
+                package a;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class Api {
+                  private final L1 l;
+                  Api(L1 l) { this.l = l; }
+                  @GetMapping("/x/{t}") void x(@PathVariable String t) {
+                    l.go(t.isEmpty() ? "/a" : "/b", t.isBlank() ? "/c" : "/d", t.equals("q") ? "/e" : "/f");
+                  }
+                }
+                """);
+        for (int i = 1; i <= 2; i++) {
+            write(a.resolve("L" + i + ".java"), ("package a;\n@org.springframework.stereotype.Service\npublic class L%d {\n"
+                    + "  private final L%d nx; L%d(L%d nx) { this.nx = nx; } boolean k = Math.random() > .5;\n"
+                    + "  public void go(String p, String q, String r) { nx.go(k ? p + \"/%da\" : p + \"/%db\", k ? q : q + \"/%dc\","
+                    + " k ? r + \"/%dd\" : r); nx.go(p, q, r); }\n}\n").formatted(i, i + 1, i, i + 1, i, i, i, i));
+        }
+        write(a.resolve("L3.java"), """
+                package a;
+                @org.springframework.stereotype.Service
+                public class L3 {
+                  private final org.springframework.web.client.RestTemplate rt = new org.springframework.web.client.RestTemplate();
+                  boolean k = Math.random() > .5;
+                  public void go(String p, String q, String r) { rt.getForObject("http://svc-b" + (k ? "/items" : "/other") + p + q + r, String.class); }
+                }
+                """);
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("Items.java"), """
+                package b;
+                @org.springframework.web.bind.annotation.RestController
+                public class Items { @org.springframework.web.bind.annotation.GetMapping("/items/{p}/{q}/{r}") void y() { } }
+                """);
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        List<JsonNode> g = map(root, res, root.resolve("out"));
+        List<JsonNode> from = g.stream().filter(e -> e.get("from").asText().equals("svc-a GET /x/{t}")).toList();
+        assertTrue(from.size() <= 4, from.toString());
+        assertTrue(has(g, "svc-a GET /x/{t}", "unresolved:svc-a:L3.go:6 GET {*}"), from.toString());
+        assertFalse(from.stream().anyMatch(e -> e.get("to").asText().matches(".*\\S\\{\\*}.*")), "no partly unknown edge: " + from);
+        assertTrue(YAML.readTree(res.toFile()).get("svc-a").get("callSites").has("L3.go:6"));
+        String yml = Files.readString(res);
+        assertTrue(yml.contains("# hint: url = one of ") && yml.contains("combinations, e.g. \"http://svc-b/"), yml);
+    }
+
+    @Test
+    void restOperationsSubclassesAndQualifiedComponentBeans(@TempDir Path root) throws Exception {
+        write(root.resolve("shared/src/main/java/s/ItemsApi.java"), """
+                package s;
+                import org.springframework.web.service.annotation.*;
+                public interface ItemsApi {
+                  @GetExchange("/items/{id}") String get(@org.springframework.web.bind.annotation.PathVariable String id);
+                }
+                """);
+        write(root.resolve("shared/src/main/java/s/TypeVerbApi.java"), """
+                package s;
+                import org.springframework.web.service.annotation.*;
+                @HttpExchange(url = "/tv", method = "POST")
+                public interface TypeVerbApi { @HttpExchange("/do") String go(); }
+                """);
+        Path a = root.resolve("svc-a/src/main/java/a");
+        write(a.resolve("App.java"), "package a;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(a.resolve("AcmeTemplate.java"), "package a;\npublic class AcmeTemplate extends org.springframework.web.client.RestTemplate {}\n");
+        write(a.resolve("Config.java"), """
+                package a;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.web.client.*;
+                import org.springframework.web.client.support.RestClientAdapter;
+                import org.springframework.web.service.invoker.HttpServiceProxyFactory;
+                @org.springframework.context.annotation.Configuration
+                public class Config {
+                  @Bean RestOperations ops() { return new RestTemplate(); }
+                  @Bean s.TypeVerbApi tv() {
+                    return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(RestClient.create("http://svc-b"))).build()
+                        .createClient(s.TypeVerbApi.class);
+                  }
+                }
+                """);
+        write(a.resolve("Api.java"), """
+                package a;
+                import org.springframework.http.*;
+                import org.springframework.web.bind.annotation.*;
+                import org.springframework.security.oauth2.client.OAuth2RestTemplate;
+                @RestController
+                public class Api {
+                  private final org.springframework.web.client.RestOperations ops;
+                  private final OAuth2RestTemplate oauth;
+                  private final AcmeTemplate acme = new AcmeTemplate();
+                  private final s.TypeVerbApi tv;
+                  Api(org.springframework.web.client.RestOperations ops, OAuth2RestTemplate oauth, s.TypeVerbApi tv) { this.ops = ops; this.oauth = oauth; this.tv = tv; }
+                  @GetMapping("/ops") String ops() { return ops.getForObject("http://svc-b/items/1", String.class); }
+                  @GetMapping("/oauth") String oauth() { return oauth.getForObject("/items/2", String.class); }
+                  @GetMapping("/acme") void acme() { acme.delete("http://svc-b/items/3"); }
+                  @GetMapping("/re") void re() { acme.exchange(RequestEntity.post(java.net.URI.create("http://svc-b/items")).build(), String.class); }
+                  @GetMapping("/tern/{f}") void tern(boolean f) { acme.exchange("http://svc-b/items", f ? HttpMethod.POST : HttpMethod.GET, null, String.class); }
+                  @GetMapping("/tv") String tv() { return tv.go(); }
+                }
+                """);
+        Path b = root.resolve("svc-b/src/main/java/b");
+        write(b.resolve("App.java"), "package b;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(b.resolve("Config.java"), """
+                package b;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.web.client.RestClient;
+                import org.springframework.web.client.support.RestClientAdapter;
+                import org.springframework.web.service.invoker.HttpServiceProxyFactory;
+                @org.springframework.context.annotation.Configuration
+                public class Config {
+                  @Bean @org.springframework.beans.factory.annotation.Qualifier("peer") s.ItemsApi peerItems() {
+                    return HttpServiceProxyFactory.builderFor(RestClientAdapter.create(RestClient.create("http://svc-a"))).build()
+                        .createClient(s.ItemsApi.class);
+                  }
+                }
+                """);
+        write(b.resolve("ItemsController.java"), """
+                package b;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class ItemsController implements s.ItemsApi {
+                  @Override public String get(String id) { return id; }
+                  @PostMapping("/items") void post() { }
+                  @GetMapping("/items") void list() { }
+                  @PostMapping("/tv/do") void tv() { }
+                  @DeleteMapping("/items/{id}") void delete() { }
+                }
+                """);
+        write(b.resolve("Peer.java"), """
+                package b;
+                import org.springframework.beans.factory.annotation.Qualifier;
+                import org.springframework.web.bind.annotation.*;
+                @RestController
+                public class Peer {
+                  private final s.ItemsApi peer;
+                  private final s.ItemsApi local;
+                  private final s.ItemsApi nope;
+                  Peer(@Qualifier("peer") s.ItemsApi peer, @Qualifier("itemsController") s.ItemsApi local, @Qualifier("nope") s.ItemsApi nope) {
+                    this.peer = peer; this.local = local; this.nope = nope;
+                  }
+                  @GetMapping("/peer/{id}") String peer(String id) { return peer.get(id); }
+                  @GetMapping("/local/{id}") String local(String id) { return local.get(id); }
+                  @GetMapping("/nope/{id}") String nope(String id) { return nope.get(id); }
+                }
+                """);
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        List<JsonNode> g = map(root, res, root.resolve("out"));
+        // RestOperations bean, OAuth2RestTemplate (outside the workspace), a workspace subclass of RestTemplate
+        assertTrue(has(g, "svc-a GET /ops", "svc-b GET /items/{id}"), g.toString());
+        assertTrue(has(g, "svc-a GET /acme", "svc-b DELETE /items/{id}"), g.toString());
+        assertTrue(g.stream().anyMatch(e -> e.get("from").asText().equals("svc-a GET /oauth")
+                && e.get("to").asText().startsWith("unresolved:svc-a:Api.oauth:")), g.toString());
+        // exchange(RequestEntity, type): a call site, verb read from RequestEntity.post
+        assertTrue(g.stream().anyMatch(e -> e.get("from").asText().equals("svc-a GET /re")
+                && e.get("to").asText().matches("unresolved:svc-a:Api.re:\\d+ POST \\{\\*}")), g.toString());
+        // a verb chosen by a ternary: one edge per branch
+        assertTrue(has(g, "svc-a GET /tern/{f}", "svc-b POST /items"), g.toString());
+        assertTrue(has(g, "svc-a GET /tern/{f}", "svc-b GET /items"), g.toString());
+        // @HttpExchange(method = "POST") on the interface
+        assertTrue(has(g, "svc-a GET /tv", "svc-b POST /tv/do"), g.toString());
+        // qualified: the proxy bean is a call to svc-a, the qualified local controller and an unmatched qualifier are not
+        assertTrue(has(g, "svc-b GET /peer/{id}", "unresolved:svc-a GET /items/{id}"), g.toString());
+        assertFalse(g.stream().anyMatch(e -> e.get("from").asText().equals("svc-b GET /local/{id}")), g.toString());
+        assertFalse(g.stream().anyMatch(e -> e.get("from").asText().equals("svc-b GET /nope/{id}")
+                && e.get("to").asText().startsWith("svc-a")), g.toString());
     }
 
     // --- helpers ---

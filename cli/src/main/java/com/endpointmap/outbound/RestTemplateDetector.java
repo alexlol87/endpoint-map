@@ -7,8 +7,10 @@ import com.endpointmap.url.UrlEvaluator;
 import com.endpointmap.url.UrlEvaluator.Env;
 import com.github.javaparser.ast.expr.Expression;
 import com.github.javaparser.ast.expr.MethodCallExpr;
+import com.github.javaparser.ast.expr.NameExpr;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * {@code restTemplate.getForObject(url, ..)} and the other RestTemplate methods: the verb from the method name, or
@@ -32,7 +34,6 @@ public final class RestTemplateDetector implements OutboundDetector {
 
     @Override
     public List<OutboundCall> detect(CallSite site) {
-        // shortcut: exchange(RequestEntity, ..) (one argument carrying verb and URL) is not read; add it if it shows up
         if (!(site.call() instanceof MethodCallExpr call) || !VERBS.containsKey(call.getNameAsString())
                 || call.getScope().isEmpty() || call.getArguments().isEmpty()
                 || VERBS.get(call.getNameAsString()).isEmpty() && call.getArguments().size() < 2
@@ -42,8 +43,14 @@ public final class RestTemplateDetector implements OutboundDetector {
         Expression client = call.getScope().get();
         Env env = Env.of(site);
         String fixed = VERBS.get(call.getNameAsString());
-        String verb = fixed.isEmpty() ? urls.verb(call.getArgument(1), env) : fixed;
+        if (call.getNameAsString().equals("exchange") && call.getArguments().size() == 2) {
+            // shortcut: exchange(RequestEntity, type) (the only 2-argument exchange) is a callSites entry; its verb is
+            // read from RequestEntity.post(..)/method(m, ..) when written inline, its URL is not
+            return List.of(new OutboundCall("resttemplate", requestEntityVerb(call.getArgument(0), env), null,
+                    UrlEvaluator.ANY, null, call.getArgument(0).toString(), "RestTemplate.exchange"));
+        }
         return urls.each(env, e -> {
+            String verb = fixed.isEmpty() ? urls.verb(call.getArgument(1), e) : fixed;
             String base = urls.client(client, e).text();
             String path = urls.string(call.getArgument(0), e).text();
             UrlEvaluator.Resolved r = UrlEvaluator.toCall(base, path, site.config());
@@ -51,5 +58,17 @@ public final class RestTemplateDetector implements OutboundDetector {
             return new OutboundCall("resttemplate", verb, r.baseUrl(), r.path(), r.key(), source,
                     "RestTemplate." + call.getNameAsString());
         }).stream().distinct().toList();
+    }
+
+    private String requestEntityVerb(Expression e, Env env) {
+        while (e instanceof MethodCallExpr mc && mc.getScope().isPresent()) {
+            if (mc.getScope().get() instanceof NameExpr n && n.getNameAsString().equals("RequestEntity")) {
+                String name = mc.getNameAsString();
+                return name.equals("method") && !mc.getArguments().isEmpty() ? urls.verb(mc.getArgument(0), env)
+                        : Set.of("get", "post", "put", "patch", "delete", "head", "options").contains(name) ? name.toUpperCase() : "ANY";
+            }
+            e = mc.getScope().get();
+        }
+        return "ANY";
     }
 }

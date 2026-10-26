@@ -151,14 +151,21 @@ public final class UrlEvaluator implements ArgumentBinder {
     private record Bean(MethodDeclaration method, Set<String> names, String qualifier, boolean primary, String type) {
     }
 
+    /** A stereotype class (a local controller implementing an @HttpExchange interface): bean name(s), qualifier. */
+    private record Component(ClassOrInterfaceDeclaration type, Set<String> names, String qualifier, boolean primary) {
+    }
+
     private final Types types;
     private final ConstantEvaluator constants;
     private final List<Bean> beans = new ArrayList<>();
+    private final List<Component> components = new ArrayList<>();
     /** Simple names of classes the workspace builds with {@code new X(..)} outside {@code @Bean} methods. */
     private final Set<String> newed = new HashSet<>();
     /** Workspace classes by the simple name of the class they extend. */
     private final Map<String, List<ClassOrInterfaceDeclaration>> subclasses = new HashMap<>();
     private final Map<String, AnnotationDeclaration> annotations = new HashMap<>();
+    /** Workspace classes and interfaces by simple name, for client types by assignability. */
+    private final Map<String, List<ClassOrInterfaceDeclaration>> declared = new HashMap<>();
 
     public UrlEvaluator(Workspace ws, Types types, ConstantEvaluator constants) {
         this.types = types;
@@ -178,10 +185,24 @@ public final class UrlEvaluator implements ArgumentBinder {
             cu.findAll(ObjectCreationExpr.class).stream()
                     .filter(o -> o.findAncestor(MethodDeclaration.class).filter(m -> Workspace.hasAnnotation(m, "Bean")).isEmpty())
                     .forEach(o -> newed.add(o.getType().getNameAsString()));
-            cu.findAll(ClassOrInterfaceDeclaration.class).forEach(c -> c.getExtendedTypes()
-                    .forEach(t -> subclasses.computeIfAbsent(t.getNameAsString(), k -> new ArrayList<>()).add(c)));
+            cu.findAll(ClassOrInterfaceDeclaration.class).forEach(c -> {
+                c.getExtendedTypes().forEach(t -> subclasses.computeIfAbsent(t.getNameAsString(), k -> new ArrayList<>()).add(c));
+                declared.computeIfAbsent(c.getNameAsString(), k -> new ArrayList<>()).add(c);
+            });
             cu.findAll(AnnotationDeclaration.class).forEach(a -> annotations.putIfAbsent(a.getNameAsString(), a));
         });
+        declared.values().stream().flatMap(List::stream).filter(c -> !c.isInterface() && stereotyped(c, new HashSet<>()))
+                .forEach(c -> {
+                    Set<String> names = new HashSet<>();
+                    c.getAnnotations().stream().filter(a -> STEREOTYPES.contains(a.getName().getIdentifier()))
+                            .forEach(a -> memberValue(a, "value").flatMap(v -> constants.eval(v, v)).ifPresent(names::add));
+                    if (names.isEmpty()) {
+                        String n = c.getNameAsString(); // Spring's default name: ItemsController -> itemsController, URLApi stays
+                        names.add(n.length() > 1 && Character.isUpperCase(n.charAt(1)) ? n : Character.toLowerCase(n.charAt(0)) + n.substring(1));
+                    }
+                    List<String> q = annotationValues(c, "Qualifier", "value");
+                    components.add(new Component(c, names, q.isEmpty() ? null : q.get(0), Workspace.hasAnnotation(c, "Primary")));
+                });
     }
 
     /**
@@ -215,12 +236,13 @@ public final class UrlEvaluator implements ArgumentBinder {
         for (int i = 0; i < params.size() && i < args.size(); i++) {
             Parameter p = params.get(i);
             String type = simpleName(p.getType());
-            if (p.isVarArgs() || !BOUND.contains(type)) {
+            boolean isClient = clientIn(type).isPresent();
+            if (p.isVarArgs() || !BOUND.contains(type) && !isClient) {
                 continue; // varargs fill template variables, they are never the URL itself
             }
             Expression a = args.get(i);
             int d = depth + 1;
-            List<ArgValue> vs = CLIENTS.contains(type) ? List.of(client(a, env, d))
+            List<ArgValue> vs = isClient ? List.of(client(a, env, d))
                     : type.equals("HttpMethod") ? List.of(verbValue(a, env, d))
                     : env.choices() != null ? List.of(string(a, env, d)) : each(env, e -> string(a, e, d));
             // outside a run of each() (the tracer's bind runs one per combination) several values leave it unbound
@@ -509,9 +531,30 @@ public final class UrlEvaluator implements ArgumentBinder {
         return Optional.empty();
     }
 
-    private static Optional<String> clientIn(String type) {
-        // WebClient, org...WebClient, WebClient.Builder (a builder chain still ends in build())
-        return CLIENTS.stream().filter(c -> type.equals(c) || type.endsWith("." + c) || type.startsWith(c + ".")).findFirst();
+    private Optional<String> clientIn(String type) {
+        return clientIn(type.replaceAll("<.*>", ""), new HashSet<>());
+    }
+
+    /**
+     * By assignability: the client itself (WebClient, org...WebClient, WebClient.Builder: a builder chain still ends
+     * in build()), RestOperations, a workspace type extending/implementing one; a type outside the workspace named
+     * ...RestTemplate / ...RestOperations (OAuth2RestTemplate) is a RestTemplate.
+     */
+    private Optional<String> clientIn(String type, Set<String> seen) {
+        Optional<String> direct = CLIENTS.stream().filter(c -> type.equals(c) || type.endsWith("." + c) || type.startsWith(c + ".")).findFirst();
+        String simple = type.substring(type.lastIndexOf('.') + 1);
+        if (direct.isPresent() || !seen.add(simple)) {
+            return direct;
+        }
+        if (simple.equals("RestOperations")) {
+            return Optional.of("RestTemplate");
+        }
+        List<ClassOrInterfaceDeclaration> ws = declared.getOrDefault(simple, List.of());
+        if (ws.isEmpty()) {
+            return simple.endsWith("RestTemplate") || simple.endsWith("RestOperations") ? Optional.of("RestTemplate") : Optional.empty();
+        }
+        return ws.stream().flatMap(c -> java.util.stream.Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream()))
+                .map(t -> clientIn(t.getNameAsString(), seen)).flatMap(Optional::stream).findFirst();
     }
 
     /** Base URL of a client expression: text "" when it has none, null when it can't be told. */
@@ -564,7 +607,7 @@ public final class UrlEvaluator implements ArgumentBinder {
             if (type.equals("DefaultUriBuilderFactory")) {
                 return o.getArguments().size() == 1 ? string(o.getArgument(0), env, d) : known("");
             }
-            return type.equals("RestTemplate") ? known("") : unknown();
+            return clientIn(type).filter("RestTemplate"::equals).isPresent() ? known("") : unknown();
         }
         return unknown();
     }
@@ -572,25 +615,49 @@ public final class UrlEvaluator implements ArgumentBinder {
     /** The bean a client parameter/field is injected with: by type, then @Qualifier or bean name, then @Primary. */
     private ArgValue bean(Type type, Node annotated, String name, Env env, int d) {
         String t = simpleName(type);
-        List<Bean> candidates = beans.stream().filter(b -> b.type().equals(t)).filter(b -> {
+        // a RestOperations / RestTemplate injection point also takes a bean of a subclass (OAuth2RestTemplate)
+        boolean general = Set.of("RestOperations", "RestTemplate", "WebClient", "RestClient").contains(t);
+        List<Bean> candidates = beans.stream().filter(b -> b.type().equals(t)
+                || general && clientIn(b.type()).isPresent() && clientIn(b.type()).equals(clientIn(t))).filter(b -> {
             Repo r = types.repo(b.method());
+            return r == env.service() || r != null && r.kind() == Workspace.Kind.library;
+        }).toList();
+        // stereotype classes of the type are beans too: as a client their base is unknown (null), which makes the
+        // @HttpExchange detector see the service's own implementation
+        List<Component> local = components.stream().filter(c -> assignable(c.type(), t, new HashSet<>())).filter(c -> {
+            Repo r = types.repo(c.type());
             return r == env.service() || r != null && r.kind() == Workspace.Kind.library;
         }).toList();
         List<String> q = annotated instanceof com.github.javaparser.ast.nodeTypes.NodeWithAnnotations<?> na
                 ? annotationValues(na, "Qualifier", "value") : List.of();
         List<Bean> hit;
-        if (!q.isEmpty()) {
+        List<Component> localHit;
+        if (!q.isEmpty()) { // a qualifier nothing matches is unknown, never an unqualified pick
             hit = candidates.stream().filter(b -> q.get(0).equals(b.qualifier()) || b.names().contains(q.get(0))).toList();
-        } else if (candidates.size() == 1) {
+            localHit = local.stream().filter(c -> q.get(0).equals(c.qualifier()) || c.names().contains(q.get(0))).toList();
+        } else if (candidates.size() + local.size() == 1) {
             hit = candidates;
+            localHit = local;
         } else {
             hit = candidates.stream().filter(b -> b.names().contains(name)).toList();
-            if (hit.isEmpty()) {
+            localHit = local.stream().filter(c -> c.names().contains(name)).toList();
+            if (hit.size() + localHit.size() == 0) {
                 hit = candidates.stream().filter(Bean::primary).toList();
+                localHit = local.stream().filter(Component::primary).toList();
             }
         }
         // shortcut: no bean, or several that the injection point can't tell apart: unknown (a callSites entry)
-        return hit.size() == 1 ? returned(hit.get(0).method(), env.outside(), d, true) : unknown();
+        return hit.size() == 1 && localHit.isEmpty() ? returned(hit.get(0).method(), env.outside(), d, true) : unknown();
+    }
+
+    /** {@code c} is, extends or implements (transitively, by simple name in the workspace) a type named {@code t}. */
+    private boolean assignable(ClassOrInterfaceDeclaration c, String t, Set<String> seen) {
+        if (c.getNameAsString().equals(t)) {
+            return true;
+        }
+        return seen.add(c.getNameAsString()) && java.util.stream.Stream.concat(c.getExtendedTypes().stream(), c.getImplementedTypes().stream())
+                .anyMatch(s -> s.getNameAsString().equals(t) || declared.getOrDefault(s.getNameAsString(), List.of()).stream()
+                        .anyMatch(x -> assignable(x, t, seen)));
     }
 
     /**
@@ -674,7 +741,9 @@ public final class UrlEvaluator implements ArgumentBinder {
                         || target instanceof NameExpr n && n.getNameAsString().equals(name);
                 if (self && a.getOperator() == AssignExpr.Operator.ASSIGN) {
                     ArgValue r = asClient ? client(a.getValue(), outside, d) : string(a.getValue(), outside, d);
-                    if (asClient ? r.text() != null : !r.text().equals(ANY)) {
+                    // this.x = x from an injected parameter: its own lookup (with its @Qualifier) is the answer
+                    boolean fromParam = a.getValue() instanceof NameExpr n && declaration(n).filter(Parameter.class::isInstance).isPresent();
+                    if (asClient ? r.text() != null || fromParam && springBean(c) : !r.text().equals(ANY)) {
                         return r;
                     }
                 }
@@ -772,6 +841,19 @@ public final class UrlEvaluator implements ArgumentBinder {
     }
 
     private ArgValue verbValue(Expression e, Env env, int d) {
+        if (e instanceof EnclosedExpr en) {
+            return verbValue(en.getInner(), env, d + 1);
+        }
+        if (e instanceof ConditionalExpr c && d < MAX_DEPTH) { // each branch in its own run of each()
+            Optional<Boolean> test = condition(c.getCondition(), env, d + 1);
+            if (test.isPresent()) {
+                return verbValue(test.get() ? c.getThenExpr() : c.getElseExpr(), env, d + 1);
+            }
+            ArgValue a = verbValue(c.getThenExpr(), env, d + 1);
+            ArgValue b = verbValue(c.getElseExpr(), env, d + 1);
+            int i = java.util.Objects.equals(a.text(), b.text()) ? -1 : env.pick(2);
+            return i == 0 ? a : i == 1 ? b : java.util.Objects.equals(a.text(), b.text()) ? a : unknown();
+        }
         if (e instanceof FieldAccessExpr fa && fa.getScope() instanceof NameExpr n && n.getNameAsString().equals("HttpMethod")) {
             return known(fa.getNameAsString());
         }
