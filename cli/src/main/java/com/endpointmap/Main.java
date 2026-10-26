@@ -116,6 +116,10 @@ public final class Main {
             if (e.decl() == null) { // a route handler the walker couldn't read: listed under routes not understood
                 continue;
             }
+            if (tracer.bodiless(e.decl(), repo)) {
+                warnings.add("tracing " + e.id() + ": its handler " + e.handler() + " has no body and no implementation was found, not traced");
+                continue;
+            }
             try {
                 found = tracer.trace(e.decl(), repo, configs.get(repo.name()));
             } catch (OutOfMemoryError | StackOverflowError err) { // one pathological endpoint must not lose the whole map

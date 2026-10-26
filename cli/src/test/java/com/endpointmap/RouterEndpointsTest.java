@@ -52,7 +52,7 @@ class RouterEndpointsTest {
         endpoint("search-service GET /search/history/{userId}", "SearchHandler.history"); // .nest(path(..), b -> ..)
         endpoint("search-service POST /search/admin/reindex", "SearchHandler.reindex"); // .add(adminRoutes(handler))
         endpoint("search-service DELETE /search/admin/index", "SearchHandler.dropIndex");
-        JsonNode lambda = endpoint("search-service POST /search/suggest", "SearchRoutes.searchRouter$lambda@L41");
+        JsonNode lambda = endpoint("search-service POST /search/suggest", "SearchRoutes.searchRouter$lambda");
         assertEquals("search-service/src/main/java/com/acme/search/SearchRoutes.java", lambda.get("file").asText());
         assertEquals(41, lambda.get("line").asInt());
         JsonNode ref = nodes.get("search-service GET /search");
@@ -65,17 +65,17 @@ class RouterEndpointsTest {
         endpoint("recommendation-service POST /recs/feedback", "RecommendationHandler.feedback");
         endpoint("recommendation-service GET /recs/popular", "RecommendationHandler.popular"); // path(..).and(method(GET))
         endpoint("recommendation-service DELETE /recs/admin/cache", "RecommendationHandler.clearCache");
-        endpoint("recommendation-service PUT /recs/admin/models/{model}", "RecommendationRouter.recommendationRoutes$lambda@L42");
+        endpoint("recommendation-service PUT /recs/admin/models/{model}", "RecommendationRouter.recommendationRoutes$lambda");
         endpoint("recommendation-service GET /recs/v2/users/{userId}/bundle", "RecommendationHandler.bundle"); // .and(v2Routes(..))
     }
 
     @Test
     void mixedServiceAndBasePathAndConstants() {
-        endpoint("loyalty-service POST /loyalty/{userId}/simulate", "LoyaltyRoutes.loyaltyRouter$lambda@L17");
+        endpoint("loyalty-service POST /loyalty/{userId}/simulate", "LoyaltyRoutes.loyaltyRouter$lambda");
         assertEquals("annotation", nodes.get("loyalty-service GET /loyalty/{userId}/tier").get("source").asText());
         // spring.webflux.base-path + path(CONSTANT, () -> route(GET(CONST + CONST), ..).andRoute(..))
-        endpoint("user-profile-service GET /profile-api/profiles/{userId}/summary", "ProfileRoutes.profileRouter$lambda@L27");
-        endpoint("user-profile-service GET /profile-api/profiles/ping", "ProfileRoutes.profileRouter$lambda@L30");
+        endpoint("user-profile-service GET /profile-api/profiles/{userId}/summary", "ProfileRoutes.profileRouter$lambda");
+        endpoint("user-profile-service GET /profile-api/profiles/ping", "ProfileRoutes.profileRouter$lambda");
         assertEquals("annotation", nodes.get("user-profile-service GET /profile-api/profiles/{userId}").get("source").asText());
     }
 
@@ -145,6 +145,127 @@ class RouterEndpointsTest {
         List<String> ids = new ArrayList<>();
         g.get("nodes").forEach(n -> ids.add(n.get("id").asText()));
         assertTrue(ids.contains("svc PUT /d") && ids.contains("svc GET /c"), ids.toString()); // unknown handler: endpoint kept
+    }
+
+    @Test
+    void splitRouterLocalsHelpersMethodRefsInterfaceHandlerAndNestVerb() {
+        // local String/RequestPredicate, a helper filling the builder, a method ref supplying nested routes
+        endpoint("recommendation-service GET /recs/split/users/{userId}", "RecommendationHandler.forUser");
+        edge("recommendation-service GET /recs/split/users/{userId}", "user-profile-service GET /profile-api/profiles/{userId}", null);
+        // handler injected by its interface: its implementation is traced
+        endpoint("recommendation-service GET /recs/split/trending", "TrendingHandler.top");
+        edge("recommendation-service GET /recs/split/trending", "unresolved:recommendation-service:${CATALOG_URL} GET /catalog/products",
+                "[\"TrendingHandlerImpl.top\",\"TrendingHandlerImpl.topIn\",\"CatalogExchange.byCategory\"]");
+        endpoint("recommendation-service POST /recs/split/feedback", "RecommendationHandler.feedback"); // nest(POST(..), route(path(..)))
+        assertFalse(nodes.containsKey("recommendation-service ANY /recs/split/feedback"));
+        assertFalse(report.contains("RecommendationSplitRoutes"), report);
+    }
+
+    @Test
+    void realisticRouterShapesInATempService(@TempDir Path root) throws Exception {
+        Path pkg = root.resolve("shop/src/main/java/com/shop/web");
+        Files.createDirectories(pkg);
+        Files.createDirectories(root.resolve("shop/src/main/resources"));
+        Files.writeString(root.resolve("shop/src/main/resources/application.properties"), "spring.webflux.base-path=/shop\n");
+        String imports = """
+                package com.shop.web;
+                import static org.springframework.web.reactive.function.server.RequestPredicates.*;
+                import static org.springframework.web.reactive.function.server.RouterFunctions.*;
+                import org.springframework.context.annotation.*;
+                import org.springframework.http.MediaType;
+                import org.springframework.web.reactive.function.server.*;
+                import org.springframework.web.reactive.function.client.WebClient;
+                import reactor.core.publisher.Mono;
+                """;
+        Files.writeString(pkg.resolve("OrderHandler.java"), imports + """
+                public class OrderHandler {
+                  private final WebClient web = WebClient.create("https://api.stripe.com");
+                  public Mono<ServerResponse> list(String q) { return null; }
+                  public Mono<ServerResponse> list(ServerRequest r) { return web.get().uri("/v1/list").retrieve().bodyToMono(String.class).then(); }
+                  public Mono<ServerResponse> get(ServerRequest r) { return null; }
+                  public Mono<ServerResponse> pick(String a) { return null; }
+                  public Mono<ServerResponse> pick(Integer a) { return null; }
+                }
+                """);
+        Files.writeString(pkg.resolve("PayHandler.java"), imports + "public interface PayHandler { Mono<ServerResponse> pay(ServerRequest r); }\n");
+        Files.writeString(pkg.resolve("PayHandlerImpl.java"), imports + """
+                public class PayHandlerImpl implements PayHandler {
+                  private final WebClient web = WebClient.create("https://api.stripe.com");
+                  public Mono<ServerResponse> pay(ServerRequest r) { return web.post().uri("/v1/charges").retrieve().bodyToMono(String.class).then(); }
+                }
+                """);
+        Files.writeString(pkg.resolve("NoImpl.java"), imports + "public interface NoImpl { Mono<ServerResponse> run(ServerRequest r); }\n");
+        Files.writeString(pkg.resolve("BaseHandler.java"), imports
+                + "public abstract class BaseHandler { public Mono<ServerResponse> health(ServerRequest r) { return null; } }\n");
+        Files.writeString(pkg.resolve("ItemHandler.java"), imports + "public class ItemHandler extends BaseHandler { }\n");
+        Files.writeString(pkg.resolve("Routes.java"), imports + """
+                @Configuration
+                public class Routes {
+                  @Bean
+                  RouterFunction<ServerResponse> orders(OrderHandler h) {
+                    return nest(path("/api"), route(GET("/orders"), h::list)
+                        .andRoute(org.springframework.web.reactive.function.server.RequestPredicates.POST("/orders"), h::get));
+                  }
+                  @Bean
+                  RouterFunction<ServerResponse> composed(RouterFunction<ServerResponse> orders, ItemHandler items, PayHandler pay, NoImpl none, OrderHandler h) {
+                    return RouterFunctions.route()
+                        .path("/m", b -> b.add(orders))
+                        .GET("/health", items::health)
+                        .POST("/pay", pay::pay)
+                        .GET("/none", none::run)
+                        .GET("/pick", h::pick)
+                        .GET(System.getenv("X"), h::get)
+                        .path("/b", b -> common(b, h))
+                        .nest(path("/c"), this::moreRoutes)
+                        .nest(POST("/post-only"), b -> b.route(path("/a"), h::get).GET("/clash", h::get))
+                        .build();
+                  }
+                  private RouterFunctions.Builder common(RouterFunctions.Builder b, OrderHandler h) { return b.GET("/x", h::get); }
+                  private void moreRoutes(RouterFunctions.Builder b) { b.GET("/y", r -> null); }
+                  @Bean
+                  RouterFunction<ServerResponse> withLocals(OrderHandler h) {
+                    RequestPredicate json = accept(MediaType.APPLICATION_JSON);
+                    String base = "/locals";
+                    RouterFunctions.Builder b = route();
+                    b.GET(base + "/one", json, h::get);
+                    RouterFunction<ServerResponse> more = route(PUT(base).and(json), h::get);
+                    return b.build().and(more).and(nest(POST("/nv"), route(path("/a"), h::get)));
+                  }
+                }
+                """);
+        Path res = root.resolve("resolutions.yml");
+        run(root, "discover", "--resolutions", res.toString());
+        String md = Files.readString(root.resolve("discover-report.md"));
+        run(root, "map", "--resolutions", res.toString(), "--out", root.resolve("out").toString());
+        JsonNode g = JSON.readTree(root.resolve("out/graph.json").toFile());
+        Map<String, String> handlers = new HashMap<>();
+        g.get("nodes").forEach(n -> handlers.put(n.get("id").asText(), n.path("handler").asText()));
+        List<String> links = new ArrayList<>();
+        g.get("edges").forEach(e -> links.add(e.get("from").asText() + " -> " + e.get("to").asText() + " " + e.get("via")));
+        String S = "shop GET /shop";
+        // overload: the ServerRequest one, traced
+        assertEquals("OrderHandler.list", handlers.get(S + "/api/orders"));
+        assertTrue(links.contains("shop GET /shop/api/orders -> external:https://api.stripe.com GET /v1/list [\"WebClient.get\"]"), links.toString());
+        assertTrue(handlers.containsKey("shop POST /shop/api/orders"), "fully qualified RequestPredicates");
+        // interface handler: its implementation is traced
+        assertEquals("PayHandler.pay", handlers.get("shop POST /shop/pay"));
+        assertTrue(links.contains("shop POST /shop/pay -> external:https://api.stripe.com POST /v1/charges [\"PayHandlerImpl.pay\",\"WebClient.post\"]"),
+                links.toString());
+        assertTrue(md.contains("tracing shop GET /shop/none: its handler NoImpl.run has no body and no implementation was found"), md);
+        assertEquals("BaseHandler.health", handlers.get(S + "/health")); // inherited
+        assertEquals("OrderHandler.list", handlers.get(S + "/m/api/orders")); // injected RouterFunction bean, prefixed
+        assertTrue(handlers.containsKey("shop POST /shop/m/api/orders"));
+        assertEquals("OrderHandler.get", handlers.get(S + "/b/x")); // Builder helper
+        assertEquals("Routes.moreRoutes$lambda", handlers.get(S + "/c/y")); // method ref Consumer<Builder>
+        assertEquals("OrderHandler.get", handlers.get("shop POST /shop/post-only/a")); // nest verb carried down
+        assertEquals("OrderHandler.get", handlers.get(S + "/locals/one")); // builder, String and predicate locals
+        assertEquals("OrderHandler.get", handlers.get("shop PUT /shop/locals"));
+        assertEquals("OrderHandler.get", handlers.get("shop POST /shop/nv/a"));
+        assertTrue(handlers.keySet().stream().noneMatch(id -> id.startsWith("shop ANY ") || id.contains("/clash")), handlers.keySet().toString());
+        assertTrue(md.contains("`shop/src/main/java/com/shop/web/Routes.java:27`: route GET /clash inside a POST-only nest matches no request"), md);
+        assertTrue(md.contains("`shop/src/main/java/com/shop/web/Routes.java:24`: route path not understood: System.getenv(\"X\")"), md);
+        assertTrue(md.contains("handler of GET /shop/pick not understood (endpoint kept, not traced): h::pick"), md); // two overloads, no ServerRequest
+        assertFalse(md.contains("not a single") || md.contains("router expression not understood") || md.contains("builder not understood"), md);
     }
 
     private static JsonNode endpoint(String id, String handler) {

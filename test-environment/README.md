@@ -65,6 +65,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Builder routes: `route().path(..)`, `.nest(path(..))` 3 levels deep, `accept(..)`, lambda handler, `.add(otherRouter())` | search-service `SearchRoutes.searchRouter` / `adminRoutes` |
 | Routes the walker cannot understand (built in a loop) -> report | search-service `SearchRoutes.facetRouter` |
 | Static routes: `route(..).andRoute(..)`, `path(..).and(method(GET))`, `andNest`, `nest(path, route(..))`, `.and(privateMethod())`, lambda | recommendation-service `RecommendationRouter` |
+| Router split into parts: local `String`/`RequestPredicate` variables, a helper filling `RouterFunctions.Builder`, `.nest(.., this::trendingRoutes)`, handler injected by interface (`TrendingHandler` -> `TrendingHandlerImpl`), `nest(POST(..), route(path(..), ..))` gives POST | recommendation-service `RecommendationSplitRoutes` |
 | Annotated and functional endpoints in one service | loyalty-service |
 | Functional routes under `spring.webflux.base-path`, paths from constants, Supplier-style `.path(CONST, () -> route(..).andRoute(..))`, block-body lambda handler | user-profile-service `ProfileRoutes` |
 

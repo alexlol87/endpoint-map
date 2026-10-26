@@ -116,7 +116,21 @@ public final class FlowTracer {
 
     /** {@code handler}: a handler method, or a route's handler lambda (its body is walked, see RouterEndpointDetector). */
     public List<Found> trace(Node handler, Repo service, Map<String, String> config) {
-        Result r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        List<MethodDeclaration> impls = handler instanceof MethodDeclaration md ? implementations(md, service) : List.of();
+        Result r;
+        if (impls.isEmpty() || impls.get(0) == handler) {
+            r = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+        } else { // a route handler typed as an interface: each implementation is walked, as for a call to it
+            List<Found> all = new ArrayList<>();
+            Set<String> lossyAll = new java.util.TreeSet<>();
+            for (MethodDeclaration impl : impls) {
+                Result ri = walk(impl, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>());
+                lossyAll.addAll(ri.lossy());
+                ri.found().forEach(f -> all.add(new Found(f.call(), Stream.concat(Stream.of(label(impl)), f.via().stream()).toList(),
+                        f.file(), f.line(), f.lowConfidence(), f.sites(), f.wrapper(), f.lossy())));
+            }
+            r = new Result(all, Integer.MAX_VALUE, Set.copyOf(lossyAll));
+        }
         lossy = r.lossy();
         // a result reused across arguments may pair a URL with the wrong path: those URLs are capped per client call
         // site, not per path, so a mixed-up pairing never stands as a confident edge
@@ -139,6 +153,11 @@ public final class FlowTracer {
                     first.line(), first.lowConfidence(), first.sites(), first.wrapper(), first.lossy()));
         }
         return List.copyOf(out.values());
+    }
+
+    /** A handler with no body and no implementation in {@code service} or a library: nothing to trace. */
+    public boolean bodiless(Node handler, Repo service) {
+        return handler instanceof MethodDeclaration md && md.getBody().isEmpty() && implementations(md, service).get(0) == md;
     }
 
     /** Clusters of the last {@link #trace} explored only partly (some paths through them may be missing), sorted. */
@@ -295,7 +314,10 @@ public final class FlowTracer {
                 .flatMap(c -> c.getMethodsByName(m.getNameAsString()).stream())
                 .filter(i -> i.getBody().isPresent() && i.getParameters().size() == m.getParameters().size())
                 .toList();
-        return impls.isEmpty() ? List.of(m) : impls;
+        // an overload of the same arity (top(String) beside top(ServerRequest)) is not an implementation; by arity only
+        // when no parameter types match as written (generic parameters)
+        List<MethodDeclaration> same = impls.stream().filter(i -> paramTypes(i).equals(paramTypes(m))).toList();
+        return impls.isEmpty() ? List.of(m) : same.isEmpty() ? impls : same;
     }
 
     /** Fallback when the solver fails: methods of the scope's type (and its supertypes) with that name and arity. */
@@ -388,6 +410,10 @@ public final class FlowTracer {
             }
         }
         return new ArrayList<>(out);
+    }
+
+    private static List<String> paramTypes(MethodDeclaration m) {
+        return m.getParameters().stream().map(p -> p.getType().asString()).toList();
     }
 
     private boolean library(Node n) {
