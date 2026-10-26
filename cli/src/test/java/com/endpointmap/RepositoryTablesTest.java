@@ -361,6 +361,7 @@ class RepositoryTablesTest {
                   @GetMapping("/if/all") public Object all() { return os.all(); }
                   @GetMapping("/any") public Object any() { return any.all2(); }
                   @GetMapping("/ping") public Object ping() { return ping.ping(); }
+                  @GetMapping("/both") public Object both() { any.all2(); return os.all(); }
                 }
                 """);
         Path res = root.resolve("resolutions.yml");
@@ -376,6 +377,10 @@ class RepositoryTablesTest {
                 "GET /any -> db:s-service:orders low", "GET /any -> db:s-service:t0 low", "GET /any -> db:s-service:t1 low",
                 "GET /any -> db:s-service:t2 low", "GET /any -> db:s-service:t3 low", "GET /any -> db:s-service:t4 low",
                 "GET /any -> db:s-service:t5 low",
+                // the same repository call guessed (any) and certain (os): one edge per table, the certain one wins
+                "GET /both -> db:s-service:orders", "GET /both -> db:s-service:t0 low", "GET /both -> db:s-service:t1 low",
+                "GET /both -> db:s-service:t2 low", "GET /both -> db:s-service:t3 low", "GET /both -> db:s-service:t4 low",
+                "GET /both -> db:s-service:t5 low",
                 "GET /g/orders/list -> db:s-service:orders",   // inherited handler: E from the controller it was found on
                 "GET /g/t1/list -> db:s-service:t1",
                 "GET /if/all -> db:s-service:orders",          // interface method implemented only by the inherited CrudSvc.all
@@ -383,6 +388,46 @@ class RepositoryTablesTest {
                 "GET /ping -> external:http://ping-service GET /p")); // inherited from BasePing
         assertEquals(want, got);
         assertFalse(Files.readString(res).contains("CrudSvc"), Files.readString(res));
+    }
+
+    @Test
+    void genericServiceInterfaceFollowsOnlyImplementationsTheReceiverCanBe(@TempDir Path root) throws Exception {
+        Path s = root.resolve("s-service/src/main/java/s");
+        write(s.resolve("App.java"), "package s;\n@org.springframework.boot.autoconfigure.SpringBootApplication\npublic class App {}\n");
+        write(s.resolve("X.java"), """
+                package s;
+                import org.springframework.web.bind.annotation.*;
+                @jakarta.persistence.Entity @jakarta.persistence.Table(name = "orders") class Order {}
+                @jakarta.persistence.Entity @jakarta.persistence.Table(name = "items") class Item {}
+                interface CrudService<E> { java.util.List<E> all(); }
+                abstract class AbstractCrudService<E> implements CrudService<E> {
+                  protected org.springframework.data.jpa.repository.JpaRepository<E, Long> repo;
+                  public java.util.List<E> all() { return repo.findAll(); }
+                }
+                interface OrderService extends CrudService<Order> {}
+                interface ItemService extends CrudService<Item> {}
+                @org.springframework.stereotype.Service class OrderServiceImpl extends AbstractCrudService<Order> implements OrderService {}
+                @org.springframework.stereotype.Service class ItemServiceImpl extends AbstractCrudService<Item> implements ItemService {}
+                abstract class CrudController<E> { CrudService<E> svc; @GetMapping("/list") Object list() { return svc.all(); } }
+                @RestController @RequestMapping("/g/orders") class OrderController extends CrudController<Order> {}
+                @RestController
+                class Ctl {
+                  OrderService os; CrudService<Item> cs; AbstractCrudService<Order> ab;
+                  @GetMapping("/os") Object a() { return os.all(); }
+                  @GetMapping("/cs") Object b() { return cs.all(); }
+                  @GetMapping("/ab") Object c() { return ab.all(); }
+                }
+                """);
+        Path res = root.resolve("resolutions.yml");
+        run("discover", root, "--resolutions", res.toString());
+        Path o = root.resolve("out");
+        run("map", root, "--resolutions", res.toString(), "--out", o.toString());
+        List<String> got = list(JSON.readTree(o.resolve("graph.json").toFile()).get("edges")).stream()
+                .map(e -> e.get("from").asText().substring("s-service ".length()) + " -> " + e.get("to").asText()
+                        + (e.has("confidence") ? " low" : "")).sorted().toList();
+        // one confident edge each: no other entity's implementation, no unbound walk of the abstract base, no low twin
+        assertEquals(List.of("GET /ab -> db:s-service:orders", "GET /cs -> db:s-service:items",
+                "GET /g/orders/list -> db:s-service:orders", "GET /os -> db:s-service:orders"), got);
     }
 
     private static void node(String id, String tech, String table) {

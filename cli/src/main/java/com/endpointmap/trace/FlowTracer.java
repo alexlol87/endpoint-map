@@ -62,6 +62,15 @@ public final class FlowTracer {
 
     /** A method walked for a call; {@code on}: the implementing class it was found for, whose clauses bind type variables. */
     private record Impl(MethodDeclaration method, ClassOrInterfaceDeclaration on) {
+        @Override
+        public boolean equals(Object o) { // by identity: a Node's equals walks its whole AST
+            return o instanceof Impl i && i.method == method && i.on == on;
+        }
+
+        @Override
+        public int hashCode() {
+            return System.identityHashCode(method) * 31 + System.identityHashCode(on);
+        }
     }
 
     /** A receiver's static type; {@code exact} when found by the solver, a scoped declaration or Java's import rules. */
@@ -249,7 +258,15 @@ public final class FlowTracer {
             if (classified) {
                 continue;
             }
-            for (Impl impl : c.methods().stream().flatMap(d -> impls(d, service).stream()).distinct().toList()) {
+            Map<String, ArgValue> receiverArgs = typeArgs(call, receiverType, args);
+            List<Impl> all = c.methods().stream().flatMap(d -> impls(d, service).stream()).distinct().toList();
+            // only classes the receiver can be: subtypes of its static type, binding no type variable otherwise than it
+            // (OrderService extends CrudService<Order>: not ItemServiceImpl); none left, a guessed receiver type: all
+            List<Impl> fitting = all.stream().filter(i -> i.on() == null || (receiver.isEmpty() || i.on() == receiver.get(0)
+                    || subtypes.getOrDefault(receiver.get(0), List.of()).contains(i.on()))
+                    && ownTypeArgs(i.on(), args).entrySet().stream().allMatch(e -> !receiverArgs.containsKey(e.getKey())
+                            || receiverArgs.get(e.getKey()).text().equals(e.getValue().text()))).toList();
+            for (Impl impl : fitting.isEmpty() ? all : fitting) {
                 MethodDeclaration callee = impl.method();
                 Integer at = stack.get(callee);
                 if (at != null) {
@@ -258,8 +275,9 @@ public final class FlowTracer {
                 }
                 List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
                         ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, method, args, receiverType)) : List.of(Map.of());
-                Map<String, ArgValue> typeArgs = new HashMap<>(typeArgs(call, receiverType, args));
-                typeArgs.putAll(ownTypeArgs(impl.on(), args)); // the implementation that runs: OrderServiceImpl extends CrudSvc<Order>
+                // the implementation that runs adds what the receiver leaves open: OrderServiceImpl extends CrudSvc<Order>
+                Map<String, ArgValue> typeArgs = new HashMap<>(ownTypeArgs(impl.on(), args));
+                typeArgs.putAll(receiverArgs);
                 for (Map<String, ArgValue> calleeArgs : typeArgs.isEmpty() ? bound : bound.stream().map(b -> {
                     Map<String, ArgValue> both = new HashMap<>(b);
                     both.putAll(typeArgs);
@@ -300,7 +318,9 @@ public final class FlowTracer {
      * a cycle can carry a longer, looping chain), then the first found.
      */
     private static void add(Map<Key, Found> found, Found f) {
-        found.merge(new Key(f.call(), f.file(), f.line()), f, (a, b) -> {
+        OutboundCall c = f.call(); // a guessed table and a certain one at the same site are one edge, the certain one kept
+        found.merge(new Key(c.low() ? new OutboundCall(c.client(), c.verb(), c.baseUrl(), c.path(), c.unresolvedKey(), c.source(),
+                c.label(), c.table(), c.op(), false) : c, f.file(), f.line()), f, (a, b) -> {
             Found w = a.lowConfidence() != b.lowConfidence() ? (a.lowConfidence() ? b : a) : b.via().size() < a.via().size() ? b : a;
             return a.lossy() || b.lossy() // lossy if either path was, so the capped grouping still sees it
                     ? new Found(w.call(), w.via(), w.file(), w.line(), w.lowConfidence(), w.sites(), w.wrapper(), true) : w;
@@ -351,6 +371,8 @@ public final class FlowTracer {
         // declared in the class, else inherited from its nearest superclass declaring it (PingServiceImpl extends BasePing)
         List<Impl> impls = owner.map(o -> subtypes.getOrDefault(o, List.of())).orElse(List.of()).stream()
                 .filter(c -> types.repo(c) == service || types.repo(c).kind() == Workspace.Kind.library)
+                .filter(c -> !c.isAbstract() || subtypes.getOrDefault(c, List.of()).stream().noneMatch(k -> !k.isAbstract()
+                        && (types.repo(k) == service || types.repo(k).kind() == Workspace.Kind.library))) // its concrete subclasses run instead
                 .flatMap(c -> Stream.concat(Stream.of(c), supertypes(c).stream())
                         .filter(t -> t instanceof ClassOrInterfaceDeclaration k && !k.isInterface())
                         .map(t -> declaring(t, m)).filter(l -> !l.isEmpty()).findFirst().orElse(List.of())
