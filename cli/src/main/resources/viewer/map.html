@@ -41,7 +41,7 @@
   <div class="seg" role="group" aria-label="Direction">
     <button id="down" type="button">Downstream</button><button id="up" type="button">Upstream</button>
   </div>
-  <label>Depth <input id="depth" type="range" min="1" max="10" value="10" aria-label="Depth"> <span id="depthv">all</span></label>
+  <label>Depth <input id="depth" type="range" min="1" max="11" value="11" aria-label="Depth"> <span id="depthv">all</span></label>
   <input id="search" type="search" placeholder="Search endpoints, tables, Redis keys" aria-label="Search start points">
   <button id="clear" type="button">Show all</button>
   <span class="stats" id="stats"></span>
@@ -80,7 +80,7 @@ const l1Label = id => id.startsWith('svc:') ? id.slice(4) : id.startsWith('db:')
 // a whole L2 map of hundreds of endpoints takes dagre many seconds; start big workspaces at L1
 let level = endpoints.length > 300 ? 'L1' : 'L2';
 let roots = new Set(); // selected node ids; empty = whole map
-let dir = 'down', depth = 10; // depth 10 = unlimited
+let dir = 'down', depth = 11; // depth 11 = unlimited
 const inc = {};
 GRAPH.edges.forEach(e => (inc[e.to] = inc[e.to] || []).push(e));
 // pick list: endpoints, then a table across all services that use it, then Redis keys
@@ -96,7 +96,7 @@ function reach() {
   const adj = dir === 'down' ? out : inc, end = e => dir === 'down' ? e.to : e.from;
   const nodes = new Set(roots), edges = [];
   let front = [...roots];
-  for (let d = 0; front.length && (depth >= 10 || d < depth); d++) {
+  for (let d = 0; front.length && (depth >= 11 || d < depth); d++) {
     const next = [];
     front.forEach(id => (adj[id] || []).forEach(e => {
       edges.push(e);
@@ -130,7 +130,9 @@ function elements() {
   } else {
     nodes.forEach(id => {
       const n = nodeById[id], l1 = l1Of(n);
-      add(l1, { label: l1Label(l1), color: n.service ? colorOf[n.service] : '#ffffff' }, l1.startsWith('svc:') ? 'service1' : n.kind);
+      // db/redis keep their own id at L1, so they carry kind and stay clickable start points
+      add(l1, { label: l1Label(l1), color: n.service ? colorOf[n.service] : '#ffffff', kind: l1 === id ? n.kind : undefined },
+        l1.startsWith('svc:') ? 'service1' : n.kind === 'redis' ? 'db redis' : n.kind);
     });
     edges.forEach(e => link(l1Of(nodeById[e.from]), l1Of(nodeById[e.to]), e));
   }
@@ -174,26 +176,41 @@ const cy = cytoscape({
   ]
 });
 
+const BIG = 300;
 function render() {
+  if (level === 'L2' && !roots.size && endpoints.length > BIG) {
+    level = 'L1';
+    alert(`${endpoints.length} endpoints are too many to lay out at L2 at once. Pick start points first.`);
+  }
   cy.elements().remove();
   cy.add(elements());
   cy.nodes().forEach(n => n.toggleClass('root', roots.has(n.id()) ||
     (level === 'L1' && [...roots].some(r => l1Of(nodeById[r]) === n.id()))));
-  cy.layout({ name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
+  // shortcut: dagre takes seconds above ~400 edges; breadthfirst is fast but rougher. Upgrade with a web-worker layout if needed.
+  cy.layout(cy.edges().length > 400 ? { name: 'breadthfirst', directed: true, spacingFactor: 0.8 }
+    : { name: 'dagre', rankDir: 'LR', nodeSep: 12, rankSep: 90 }).run();
   cy.fit(undefined, 30);
   document.getElementById('l1').classList.toggle('on', level === 'L1');
   document.getElementById('l2').classList.toggle('on', level === 'L2');
   document.getElementById('down').classList.toggle('on', dir === 'down');
   document.getElementById('up').classList.toggle('on', dir === 'up');
-  document.getElementById('depthv').textContent = depth >= 10 ? 'all' : depth;
+  document.getElementById('depthv').textContent = depth >= 11 ? 'all' : depth;
   showPicks();
+  dim();
   document.getElementById('stats').textContent = roots.size
     ? `${dir}stream of ${roots.size} node(s): ${cy.edges().length} link(s)`
     : `${endpoints.length} endpoints, ${GRAPH.edges.length} calls`;
 }
 
-const legend = (el, items) => el.innerHTML = items.map(([label, css]) =>
-  `<div class="row"><span class="sw ${css.cls || ''}" style="${css.style}"></span>${label}</div>`).join('');
+// DOM + textContent: service names come from scanned folders and must not become markup
+const legend = (el, items) => items.forEach(([label, css]) => {
+  const row = document.createElement('div'), sw = document.createElement('span');
+  row.className = 'row';
+  sw.className = 'sw ' + (css.cls || '');
+  sw.style.cssText = css.style;
+  row.append(sw, label);
+  el.append(row);
+});
 legend(document.getElementById('verbs'), Object.entries(VERB).map(([v, c]) => [v, { cls: 'verb', style: 'border-color:' + c }]));
 legend(document.getElementById('kinds'), [
   ['external API', { style: 'border:2px dashed #57606a' }],
@@ -247,17 +264,18 @@ function showPicks() {
     box.append(l);
   });
 }
-search.addEventListener('input', () => {
-  showPicks();
+function dim() {
   const q = search.value.trim().toLowerCase();
   cy.batch(() => cy.nodes('.endpoint, .service1, .db').forEach(n => {
     const hit = !q || (n.data('id') + ' ' + (n.data('handler') || '')).toLowerCase().includes(q);
     n.toggleClass('dim', !hit);
   }));
-});
+}
+search.addEventListener('input', () => { showPicks(); dim(); });
 document.getElementById('down').onclick = () => { dir = 'down'; render(); };
 document.getElementById('up').onclick = () => { dir = 'up'; render(); };
-document.getElementById('depth').oninput = ev => { depth = +ev.target.value; render(); };
+// onchange: one relayout when the slider is released, not one per step dragged
+document.getElementById('depth').onchange = ev => { depth = +ev.target.value; render(); };
 document.getElementById('l1').onclick = () => { level = 'L1'; render(); };
 document.getElementById('l2').onclick = () => { level = 'L2'; render(); };
 document.getElementById('clear').onclick = () => { roots = new Set(); details.textContent = 'Nothing selected.'; render(); };
