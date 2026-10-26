@@ -11,6 +11,7 @@ import com.endpointmap.workspace.Workspace;
 import com.endpointmap.workspace.Workspace.Repo;
 import com.github.javaparser.ast.Node;
 import com.github.javaparser.ast.NodeList;
+import com.github.javaparser.ast.body.BodyDeclaration;
 import com.github.javaparser.ast.body.ClassOrInterfaceDeclaration;
 import com.github.javaparser.ast.body.MethodDeclaration;
 import com.github.javaparser.ast.body.TypeDeclaration;
@@ -23,6 +24,7 @@ import com.github.javaparser.ast.expr.SingleMemberAnnotationExpr;
 import com.github.javaparser.ast.type.ClassOrInterfaceType;
 import com.github.javaparser.ast.type.Type;
 import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
 import java.util.IdentityHashMap;
 import java.util.List;
@@ -60,12 +62,16 @@ public final class RepositoryDetector implements OutboundDetector {
     private static final Set<String> OBJECT = Set.of("getClass", "hashCode", "equals", "toString", "notify", "notifyAll", "wait");
     /** Entities of other Spring Data stores (Redis, Mongo, Neo4j) on the same CrudRepository interfaces: no table. */
     private static final Set<String> NOT_TABLES = Set.of("RedisHash", "Document", "Node");
+    /** Stands for {@code #{#entityName}} while the SQL is read (never a real name: Sql keeps it as written). */
+    private static final String ENTITY = "__entityname__";
 
     private final Workspace ws;
     private final Types types;
     private final ConstantEvaluator constants;
     /** Each workspace type's direct subtypes, as their extends/implements clause (lazy: only generic bases need it). */
     private Map<TypeDeclaration<?>, List<ClassOrInterfaceType>> subClauses;
+    /** Workspace {@code @Entity} types by entity name (lazy: only JPQL needs it). */
+    private Map<String, List<TypeDeclaration<?>>> entities;
 
     public RepositoryDetector(Workspace ws, Types types, ConstantEvaluator constants) {
         this.ws = ws;
@@ -103,26 +109,95 @@ public final class RepositoryDetector implements OutboundDetector {
         String label = repoName + "." + name;
         String tech = base.get().tech();
         ClassOrInterfaceType entity = base.get().entity();
-        Node owner = FlowTracer.typeVariableOwner(entity);
-        String key = owner == null ? null : FlowTracer.typeArgKey(owner, entity.getNameAsString()); // null: a method's own <T>
-        ArgValue bound = key == null ? null : site.args().get(key);
-        List<String> tables;
-        if (owner == null) {
-            tables = table(entity).stream().toList();
-        } else if (bound != null) { // bound on the path into this code
-            tables = types.byQualifiedName(bound.text(), site.call()).map(this::table)
-                    .orElseGet(() -> Optional.of(snake(bound.text().substring(bound.text().lastIndexOf('.') + 1)))).stream().toList();
-        } else {
-            List<ClassOrInterfaceType> entities = owner instanceof ClassOrInterfaceDeclaration c
-                    ? bindings(c, entity.getNameAsString(), site.service(), 0) : List.of();
-            if (entities.isEmpty()) {
-                return List.of(new OutboundCall(tech, null, null, null, null, "the entity of " + repoName + " is the type variable "
-                        + entity + ", bound to no entity class in " + site.service().name(), label, null, op, false));
-            }
-            tables = entities.stream().map(this::table).flatMap(Optional::stream).distinct().toList();
+        Optional<AnnotationExpr> query = declared == null ? Optional.empty()
+                : declared.getAnnotationByName("Query").or(() -> declared.getAnnotationByName("NativeQuery"));
+        List<String> tables = tables(entity, site);
+        if (query.isPresent()) { // R2DBC's @Query is always SQL; JPA's is JPQL unless nativeQuery = true or @NativeQuery
+            String kind = query.get().getName().getIdentifier();
+            boolean jpql = tech.equals("jpa") && kind.equals("Query") && !(query.get() instanceof NormalAnnotationExpr n && n.getPairs().stream()
+                    .anyMatch(p -> p.getNameAsString().equals("nativeQuery") && p.getValue().toString().equals("true")));
+            // Spring's #{#entityName} stands for the repository's entity: its tables
+            String sql = attr(declared, kind, "value").map(q -> q.replace("#{#entityName}", ENTITY)).orElse(null);
+            List<OutboundCall> calls = sqlCalls(sql == null ? null : List.of(sql), query.get().toString(), jpql, tech, label, declared, op);
+            return calls.stream().flatMap(c -> !ENTITY.equals(c.table()) ? Stream.of(c) : tables.isEmpty()
+                    ? Stream.of(new OutboundCall(tech, null, null, null, null, "the entity of " + repoName + " (#{#entityName}) is "
+                            + entity + ", bound to no entity class in " + site.service().name(), label, null, c.op(), false))
+                    : tables.stream().sorted().map(t -> OutboundCall.db(tech, t, c.op(), label, tables.size() > 1))).distinct().toList();
+        }
+        if (tables.isEmpty() && FlowTracer.typeVariableOwner(entity) != null) {
+            return List.of(new OutboundCall(tech, null, null, null, null, "the entity of " + repoName + " is the type variable "
+                    + entity + ", bound to no entity class in " + site.service().name(), label, null, op, false));
         }
         boolean guess = tables.size() > 1; // any one of several subclasses' entities
         return tables.stream().sorted().map(t -> OutboundCall.db(tech, t, op, label, guess)).toList();
+    }
+
+    /**
+     * The tables an entity type may stand for at this call: its own, or for a type variable the one the path into the
+     * code bound ({@code orderSvc.all()}, OrderSvc extends CrudSvc&lt;Order&gt;), else every subclass binding in the
+     * calling service. Empty: another store's entity, or a type variable nothing binds.
+     */
+    List<String> tables(ClassOrInterfaceType entity, CallSite site) {
+        Node owner = FlowTracer.typeVariableOwner(entity);
+        String key = owner == null ? null : FlowTracer.typeArgKey(owner, entity.getNameAsString()); // null: a method's own <T>
+        ArgValue bound = key == null ? null : site.args().get(key);
+        if (owner == null) {
+            return table(entity).stream().toList();
+        } else if (bound != null) { // bound on the path into this code
+            return types.byQualifiedName(bound.text(), site.call()).map(this::table)
+                    .orElseGet(() -> Optional.of(snake(bound.text().substring(bound.text().lastIndexOf('.') + 1)))).stream().toList();
+        }
+        List<ClassOrInterfaceType> entities = owner instanceof ClassOrInterfaceDeclaration c
+                ? bindings(c, entity.getNameAsString(), site.service(), 0) : List.of();
+        return entities.stream().map(this::table).flatMap(Optional::stream).distinct().toList();
+    }
+
+    /**
+     * Db calls of a statement: one per table it touches, op from its verb ({@link Sql}). {@code texts} are the values
+     * the SQL may have, {@code {*}} where code does not tell; null when it is no string at all. A statement not
+     * understood, or a table name not known from code, gives an unresolved db target (op {@code fallbackOp} when the
+     * verb is unknown) rather than a guess. JPQL names entities: each is mapped to its table.
+     */
+    List<OutboundCall> sqlCalls(List<String> texts, String shown, boolean jpql, String tech, String label, Node context, String fallbackOp) {
+        List<OutboundCall> out = new ArrayList<>();
+        for (String sql : texts == null ? Collections.<String>singletonList(null) : texts) {
+            List<Sql.Access> accesses = sql == null ? null : Sql.parse(sql, jpql);
+            if (accesses == null || accesses.isEmpty()) {
+                String why = sql == null || sql.contains("{*}") ? "SQL not known from code: "
+                        : accesses == null ? "SQL not understood: " : "no table in SQL: ";
+                out.add(new OutboundCall(tech, null, null, null, null, why + (sql == null ? shown : sql.replaceAll("\\s+", " ").strip()),
+                        label, null, fallbackOp, false));
+                continue;
+            }
+            for (Sql.Access a : accesses) {
+                if (a.table() == null) {
+                    out.add(new OutboundCall(tech, null, null, null, null, "table name not known from code: "
+                            + sql.replaceAll("\\s+", " ").strip(), label, null, a.op(), false));
+                } else if (!jpql || a.table().equals(ENTITY)) {
+                    out.add(OutboundCall.db(tech, a.table(), a.op(), label, false));
+                } else {
+                    Optional<TypeDeclaration<?>> e = entity(a.table(), context);
+                    // shortcut: an entity name no workspace @Entity has is taken as its snake_case table, low confidence
+                    out.add(e.isPresent() ? e.flatMap(this::table).map(t -> OutboundCall.db(tech, t, a.op(), label, false)).orElse(null)
+                            : OutboundCall.db(tech, snake(a.table()), a.op(), label, true));
+                }
+            }
+        }
+        return out.stream().filter(java.util.Objects::nonNull).distinct().toList();
+    }
+
+    /** The JPA entity a JPQL statement names: {@code @Entity(name)}, else the class name; the one in context's repo first. */
+    private Optional<TypeDeclaration<?>> entity(String name, Node context) {
+        if (entities == null) {
+            entities = new HashMap<>();
+            ws.repos().stream().flatMap(r -> r.sources().stream()).flatMap(sf -> sf.cu().findAll(TypeDeclaration.class).stream())
+                    .filter(t -> t.getAnnotationByName("Entity").isPresent())
+                    .forEach(t -> entities.computeIfAbsent(attr(t, "Entity", "name").map(RepositoryDetector::unquote)
+                            .orElse(t.getNameAsString()), k -> new ArrayList<>()).add(t));
+        }
+        List<TypeDeclaration<?>> found = entities.getOrDefault(name, List.of());
+        Repo repo = types.repo(context);
+        return found.stream().filter(t -> types.repo(t) == repo).findFirst().or(() -> found.stream().findFirst());
     }
 
     /** The Spring interface reached from {@code t} and its entity argument, type variables bound along the way. */
@@ -194,28 +269,27 @@ public final class RepositoryDetector implements OutboundDetector {
     }
 
     /**
-     * Explicit names as written, quotes or backticks dropped; {@code schema.table} when {@code @Table(schema)} is set.
+     * Explicit names as SQL reads them ({@link Sql#normalize}); {@code schema.table} when {@code @Table(schema)} is set.
      * Empty for another store's entity ({@code @RedisHash}, {@code @Document}).
      */
-    private Optional<String> table(ClassOrInterfaceType entityRef) {
+    Optional<String> table(ClassOrInterfaceType entityRef) {
         return types.resolve(entityRef).map(this::table).orElseGet(() -> Optional.of(snake(entityRef.getNameAsString())));
     }
 
-    private Optional<String> table(TypeDeclaration<?> e) {
+    Optional<String> table(TypeDeclaration<?> e) {
         if (e.getAnnotations().stream().anyMatch(a -> NOT_TABLES.contains(a.getName().getIdentifier()))) {
             return Optional.empty();
         }
-        String name = attr(e, "Table", "name", "value").or(() -> attr(e, "Entity", "name")).map(RepositoryDetector::unquote)
-                .orElseGet(() -> snake(e.getNameAsString()));
-        return Optional.of(attr(e, "Table", "schema").map(sch -> unquote(sch) + "." + name).orElse(name));
+        String name = attr(e, "Table", "name", "value").or(() -> attr(e, "Entity", "name")).orElseGet(() -> snake(e.getNameAsString()));
+        return Optional.of(Sql.normalize(attr(e, "Table", "schema").map(sch -> sch + "." + name).orElse(name)));
     }
 
     private static String unquote(String name) {
         return name.replaceAll("^[\"`]+|[\"`]+$", "");
     }
 
-    /** A non-blank String attribute of the type's annotation {@code simpleName}. */
-    private Optional<String> attr(TypeDeclaration<?> t, String simpleName, String... names) {
+    /** A non-blank String attribute of the type's or method's annotation {@code simpleName}. */
+    private Optional<String> attr(BodyDeclaration<?> t, String simpleName, String... names) {
         Optional<AnnotationExpr> a = t.getAnnotations().stream().filter(x -> x.getName().getIdentifier().equals(simpleName)).findFirst();
         if (a.isEmpty()) {
             return Optional.empty();
@@ -234,8 +308,6 @@ public final class RepositoryDetector implements OutboundDetector {
      * implementation: no call, so its implementation is walked. Null too for a default method. {@code @Procedure}, or
      * a named query on the entity ({@code @NamedQuery(name = "Order.archived")}), counts as {@code @Query}.
      */
-    // shortcut: @Query/@Modifying methods get their op from the name and the entity's table, not from the SQL;
-    // #11 parses the query (DELETE FROM other_table) and adds EntityManager/DatabaseClient
     private String op(String name, MethodDeclaration declared, ClassOrInterfaceType entity) {
         String byName = null;
         for (Map.Entry<String, List<String>> e : OPS.entrySet()) {
@@ -252,7 +324,8 @@ public final class RepositoryDetector implements OutboundDetector {
             return null;
         }
         boolean modifying = declared.getAnnotationByName("Modifying").isPresent();
-        if (!modifying && declared.getAnnotationByName("Query").isEmpty() && declared.getAnnotationByName("Procedure").isEmpty()
+        if (!modifying && declared.getAnnotationByName("Query").isEmpty() && declared.getAnnotationByName("NativeQuery").isEmpty()
+                && declared.getAnnotationByName("Procedure").isEmpty()
                 && !namedQuery(entity, name)) {
             boolean fragment = declared.getParentNode().filter(TypeDeclaration.class::isInstance)
                     .map(t -> base((TypeDeclaration<?>) t, Map.of(), 0).isEmpty()).orElse(true);

@@ -76,7 +76,7 @@ class RestTemplateHttpExchangeTest {
     void reportServiceTernaryUrlGivesOneEdgePerBranch() {
         // String source = "daily".equals(type) ? ordersUrl + "/orders" : ordersUrl + "/orders/search"; http.fetch(source)
         assertEquals(Set.of("order-service GET /api/orders", "order-service GET /api/orders/search", "order-service GET /api/orders/{id}"),
-                targetsOf(REPORT, ""));
+                targetsOf(REPORT, "order-service")); // its JDBC tables (#11) are db edges
         assertEquals(List.of("ReportService.build", "InternalRestTemplateClient.fetch", "RestTemplate.getForObject"),
                 strings(edge(REPORT, "order-service GET /api/orders/search").get("via")));
     }

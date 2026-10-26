@@ -10,6 +10,7 @@ import com.endpointmap.openapi.OpenApi;
 import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
 import com.endpointmap.outbound.RepositoryDetector;
+import com.endpointmap.outbound.SqlDetector;
 import com.endpointmap.outbound.RestTemplateDetector;
 import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
@@ -109,8 +110,9 @@ public final class Main {
         RouterEndpointDetector routes = new RouterEndpointDetector(ws, types, constants);
         endpoints.addAll(routes.detect(profile));
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
+        RepositoryDetector repos = new RepositoryDetector(ws, types, constants);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
-                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), new RepositoryDetector(ws, types, constants));
+                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), repos, new SqlDetector(repos, urls, types));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher, configs);
@@ -144,15 +146,20 @@ public final class Main {
                 String at = f.via().size() > 1 ? f.via().get(f.via().size() - 2) : e.handler();
                 String callSite = at + ":" + f.line();
                 if (f.call().op() != null) { // a database call: its table node is the target, nothing to resolve
-                    // no table: an entity type variable nothing binds; the node says why (listed in the report)
+                    // no table (SQL or entity not known from code): one node per call site, saying why (listed in the report)
                     String id = f.call().table() != null ? "db:" + e.service() + ":" + f.call().table()
-                            : "unresolved:db " + e.service() + " " + f.call().label();
+                            // the reason's hash too: a helper running SQL its callers pass in is one call site, many statements
+                            : "unresolved:db " + e.service() + " " + callSite + " " + f.call().label() + " #"
+                                    + String.format("%08x", f.call().source().hashCode());
                     targets.putIfAbsent(id, f.call().table() != null
                             ? GraphWriter.ordered("id", id, "kind", "db", "tech", f.call().client(), "table", f.call().table())
                             : GraphWriter.ordered("id", id, "kind", "unresolved", "service", e.service(), "tech", f.call().client(),
                                     "reason", f.call().source()));
                     Map<String, Object> edge = GraphWriter.ordered("from", e.id(), "to", id, "kind", "db", "client", f.call().client(),
                             "op", f.call().op(), "repoMethod", f.call().label(), "via", f.via(), "file", f.file(), "line", f.line());
+                    if (f.call().op().equals("unknown")) {
+                        edge.remove("op"); // PLAN.md's op is read|write|delete: an unknown one is left out
+                    }
                     if (f.lowConfidence()) {
                         edge.put("confidence", "low");
                     }
