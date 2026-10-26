@@ -36,6 +36,9 @@ public final class ConstantEvaluator {
         if (e instanceof StringLiteralExpr s) {
             return Optional.of(s.asString());
         }
+        if (e instanceof com.github.javaparser.ast.expr.TextBlockLiteralExpr t) {
+            return Optional.of(t.asString());
+        }
         if (e instanceof EnclosedExpr en) {
             return eval(en.getInner(), context, depth + 1);
         }

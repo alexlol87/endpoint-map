@@ -117,12 +117,15 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 ### Database and Redis
 Table name: `@Table(name)` (JPA or `spring.data.relational`), else `@Entity(name)`, else the entity class name in snake_case (Spring Boot's default naming: `StockItem` -> `stock_item`). Op from the method name prefix; inherited CRUD methods (`save`, `findById`, `deleteById`, `flush`) count too. Explicit names are kept as written minus quotes/backticks, with `@Table(schema)` as `schema.table`. A custom fragment method (`OrderRepositoryCustom`) is no repository call: its `*Impl` is walked instead. `<Name>Impl` is looked up by name only for a Spring Data repository or a fragment one extends, in the same repo. An entity given as a generic service's type variable (`CrudSvc<E>`) is the one the caller's receiver binds (`OrderSvc extends CrudSvc<Order>`); when nothing on the path binds it, each subclass's entity, low confidence when there are several (covered by `RepositoryTablesTest` temp fixtures).
 
+Custom queries and raw SQL (#11): `@Query` SQL (native, and always for R2DBC) and JPQL (entity names map to the entity's table) give their tables and op from the statement: the leading verb's op on its target table (`UPDATE x`, `INSERT INTO x`, `DELETE FROM x`), read on every other `FROM/JOIN` table. Same for `EntityManager.createQuery/createNativeQuery`, `DatabaseClient.sql(..)`, `JdbcTemplate`/`JdbcClient`; `EntityManager.persist/merge/remove/find` and `R2dbcEntityTemplate` take the entity's table. SQL is evaluated like a URL (constants, text blocks, arguments passed into utils). A table name built at runtime gives an unresolved db target, never a guess.
+
 | Case | Location |
 |---|---|
 | JPA `JpaRepository`, `@Table`, derived queries, `@Modifying @Query` JPQL, native `@Query` | order-service |
-| Custom repository fragment `OrderRepositoryCustom.purgeLines` implemented by `OrderRepositoryImpl` (`EntityManager` native DELETE, #11): walked, no `OrderRepository.purgeLines` edge | order-service `DELETE /api/orders/{id}` |
+| Custom repository fragment `OrderRepositoryCustom.purgeLines` implemented by `OrderRepositoryImpl`: walked, no `OrderRepository.purgeLines` edge; its `EntityManager` native DELETE gives `order_lines` delete | order-service `DELETE /api/orders/{id}` |
 | JPA `CrudRepository`, table from `@Entity(name)`, native query with JOIN | customer-service |
-| JPA bare `Repository` + `PagingAndSortingRepository`, table = class name (`stock_item`), `exists`/`stream` prefixes, `EntityManager` | inventory-service |
+| JPA bare `Repository` + `PagingAndSortingRepository`, table = class name (`stock_item`), `exists`/`stream` prefixes, `@Modifying` native UPDATE / DELETE on another table (`stock_reservations`), `EntityManager` find/merge/remove + JPQL `delete from StockItem` | inventory-service `StockService` |
+| `EntityManager` 3 hops down: `persist(new StockAudit(..))`, a constant native DELETE passed into the static util `NativeQueries.execute`, a text-block constant with `EXTRACT(.. FROM ..)` and a quoted `'FROM'`, JPQL joining two entities, `INSERT INTO <table built at runtime>` (unresolved db target) | inventory-service `PATCH /inventory/{sku}/quantity`, `GET /inventory/{sku}` -> `StockAuditService` -> `NativeQueries` |
 | `JdbcTemplate` and `JdbcClient` raw SQL (SELECT / INSERT / UPDATE / DELETE) | report-service |
 | R2DBC `ReactiveCrudRepository` + `@Query` JOIN | catalog-service, loyalty-service |
 | R2DBC `R2dbcRepository` | user-profile-service |

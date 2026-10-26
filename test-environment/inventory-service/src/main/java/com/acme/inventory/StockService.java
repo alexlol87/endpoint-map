@@ -1,5 +1,6 @@
 package com.acme.inventory;
 
+import com.acme.inventory.audit.StockAuditService;
 import jakarta.persistence.EntityManager;
 import java.util.List;
 import java.util.Map;
@@ -11,15 +12,17 @@ public class StockService {
 
     private final StockRepository repository;
     private final EntityManager entityManager;
+    private final StockAuditService audit;
 
-    public StockService(StockRepository repository, EntityManager entityManager) {
+    public StockService(StockRepository repository, EntityManager entityManager, StockAuditService audit) {
         this.repository = repository;
         this.entityManager = entityManager;
+        this.audit = audit;
     }
 
     public Map<String, Object> get(String sku) {
         StockItem item = repository.findBySku(sku).orElse(null);
-        return Map.of("sku", sku, "available", item == null ? 0 : item.getQuantity());
+        return Map.of("sku", sku, "available", item == null ? 0 : item.getQuantity(), "history", audit.monthly(sku));
     }
 
     @Transactional
@@ -45,6 +48,10 @@ public class StockService {
             entityManager.merge(item);
         }
         entityManager.createQuery("delete from StockItem s where s.quantity < 0").executeUpdate();
+        audit.record(sku, item.getQuantity());
+        if (!audit.negativeStock().isEmpty()) {
+            audit.archive(sku);
+        }
     }
 
     public List<StockItem> byWarehouse(String code) {

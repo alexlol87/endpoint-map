@@ -14,7 +14,6 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.TreeSet;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -46,10 +45,11 @@ class RepositoryTablesTest {
 
     @Test
     void dbNodesCarryTechAndTableFromTableThenEntityThenSnakeCaseClassName() {
-        assertEquals(new TreeSet<>(List.of("db:audit-service:audit_event", "db:catalog-service:products",
+        // tables named only in SQL (#11: @Query, EntityManager, DatabaseClient, JDBC) are covered by CustomQueriesTest
+        assertTrue(nodes.keySet().containsAll(List.of("db:audit-service:audit_event", "db:catalog-service:products",
                 "db:customer-service:customer_accounts", "db:inventory-service:stock_item", "db:loyalty-service:loyalty_points",
                 "db:order-service:orders", "db:order-service:tax_rate_snapshot", "db:user-profile-service:user_profiles")),
-                new TreeSet<>(nodes.keySet().stream().filter(id -> id.startsWith("db:")).toList()));
+                nodes.keySet().toString());
         node("db:order-service:orders", "jpa", "orders");                     // jakarta @Table(name)
         node("db:customer-service:customer_accounts", "jpa", "customer_accounts"); // @Entity(name), no @Table
         node("db:inventory-service:stock_item", "jpa", "stock_item");          // bare @Entity: StockItem -> stock_item
@@ -74,17 +74,17 @@ class RepositoryTablesTest {
         assertTrue(edges.stream().noneMatch(e -> e.get("repoMethod") != null && e.get("repoMethod").asText().contains("purgeLines")),
                 edges.toString());
         db("order-service POST /api/orders/{id}/cancel", "orders", "write", "OrderRepository.updateStatus"); // @Modifying @Query
-        // CrudRepository + a native @Query (op from the name for now)
+        // CrudRepository + a native @Query: its tables come from the SQL (#11)
         db("customer-service GET /customers-api/customers/{id}", "customer_accounts", "read", "CustomerRepository.findById");
         db("customer-service PUT /customers-api/customers/{id}", "customer_accounts", "write", "CustomerRepository.save");
         db("customer-service GET /customers-api/customers/{id}/preferences", "customer_accounts", "read",
                 "CustomerRepository.findPreferencesJson");
-        // bare Repository + PagingAndSortingRepository: exists/stream prefixes, @Modifying without a known prefix = write
+        // bare Repository + PagingAndSortingRepository: exists/stream prefixes; @Modifying @Query tables and op from the SQL (#11)
         db("inventory-service GET /inventory/{sku}", "stock_item", "read", "StockRepository.findBySku");
         db("inventory-service PUT /inventory/{sku}/reserve", "stock_item", "read", "StockRepository.existsBySku");
         db("inventory-service PUT /inventory/{sku}/reserve", "stock_item", "write", "StockRepository.decrement");
         db("inventory-service GET /inventory/warehouse/{code}/items", "stock_item", "read", "StockRepository.streamAllByWarehouse");
-        db("inventory-service DELETE /inventory/{sku}/reservation", "stock_item", "delete", "StockRepository.deleteReservationsBySku");
+        db("inventory-service DELETE /inventory/{sku}/reservation", "stock_reservations", "delete", "StockRepository.deleteReservationsBySku");
         JsonNode e = db("order-service GET /api/orders/{id}", "orders", "read", "OrderRepository.findById");
         assertEquals("jpa", e.get("client").asText());
         assertEquals("order-service/src/main/java/com/acme/order/service/OrderService.java", e.get("file").asText());
@@ -472,25 +472,25 @@ class RepositoryTablesTest {
         return hit.get(0);
     }
 
-    private static Map<String, JsonNode> byId(JsonNode graph) {
+    static Map<String, JsonNode> byId(JsonNode graph) {
         Map<String, JsonNode> m = new HashMap<>();
         graph.get("nodes").forEach(n -> m.put(n.get("id").asText(), n));
         return m;
     }
 
-    private static List<JsonNode> list(JsonNode array) {
+    static List<JsonNode> list(JsonNode array) {
         List<JsonNode> l = new ArrayList<>();
         array.forEach(l::add);
         return l;
     }
 
-    private static List<String> strings(JsonNode array) {
+    static List<String> strings(JsonNode array) {
         List<String> l = new ArrayList<>();
         array.forEach(x -> l.add(x.asText()));
         return l;
     }
 
-    private static void run(String command, Path root, String... more) {
+    static void run(String command, Path root, String... more) {
         List<String> args = new ArrayList<>(List.of(command, "--root", root.toString(), "--profile", "prod"));
         args.addAll(List.of(more));
         ByteArrayOutputStream o = new ByteArrayOutputStream();
@@ -499,7 +499,7 @@ class RepositoryTablesTest {
         assertEquals(0, code, e.toString());
     }
 
-    private static void write(Path file, String content) throws Exception {
+    static void write(Path file, String content) throws Exception {
         Files.createDirectories(file.getParent());
         Files.writeString(file, content);
     }

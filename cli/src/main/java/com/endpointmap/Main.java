@@ -10,6 +10,7 @@ import com.endpointmap.openapi.OpenApi;
 import com.endpointmap.outbound.FeignDetector;
 import com.endpointmap.outbound.HttpExchangeDetector;
 import com.endpointmap.outbound.RepositoryDetector;
+import com.endpointmap.outbound.SqlDetector;
 import com.endpointmap.outbound.RestTemplateDetector;
 import com.endpointmap.outbound.WebClientDetector;
 import com.endpointmap.report.DiscoverReport;
@@ -109,8 +110,9 @@ public final class Main {
         RouterEndpointDetector routes = new RouterEndpointDetector(ws, types, constants);
         endpoints.addAll(routes.detect(profile));
         UrlEvaluator urls = new UrlEvaluator(ws, types, constants);
+        RepositoryDetector repos = new RepositoryDetector(ws, types, constants);
         List<OutboundDetector> detectors = List.of(new FeignDetector(detector, constants), new WebClientDetector(urls),
-                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), new RepositoryDetector(ws, types, constants));
+                new RestTemplateDetector(urls), new HttpExchangeDetector(ws, types, detector, urls), repos, new SqlDetector(repos, urls, types));
         FlowTracer tracer = new FlowTracer(ws, types, detectors, urls);
         TargetMatcher matcher = new TargetMatcher(ws, configs, sources, endpoints, resolutions);
         OpenApi openapi = new OpenApi(ws, opts.get("--openapi-dir"), matcher, configs);
