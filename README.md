@@ -42,10 +42,10 @@ open out/map.html
 
 - A controller in a library repo is attributed to the library, not to the services that include it.
 - Every implementation of an interface is followed (`@Qualifier`/`@Primary` are not used yet), and `flows` (the L3 tree) stays empty: both come with M4. Circuit-breaker fallback methods are not traced yet.
-- Only Feign is detected; WebClient, RestClient, RestTemplate and `@HttpExchange` clients come with M2.
+- Feign, WebClient, RestClient, RestTemplate and `@HttpExchange` clients are detected (`client`: `feign`, `webclient`, `restclient`, `resttemplate`, `httpexchange`). A RestTemplate's root URI is read from `RestTemplateBuilder.rootUri(..)` / `DefaultUriBuilderFactory(..)`; an `@HttpExchange` proxy's base URL from the client wrapped by the `HttpServiceProxyFactory` + `WebClientAdapter`/`RestClientAdapter`/`RestTemplateAdapter` that creates it. `exchange(RequestEntity, ..)` is not read yet.
 
 ## Layout
 
-- `cli/`: the tool, a Maven project with packages `com.endpointmap.{workspace,config,endpoints,trace,outbound,url,graph,viewer}`. `trace.FlowTracer` walks method bodies and asks each `trace.OutboundDetector` (today `outbound.FeignDetector`) to classify every call; `url.TargetMatcher` turns a classified call into target nodes.
+- `cli/`: the tool, a Maven project with packages `com.endpointmap.{workspace,config,endpoints,trace,outbound,url,graph,viewer}`. `trace.FlowTracer` walks method bodies and asks each `trace.OutboundDetector` (`outbound.FeignDetector`, `WebClientDetector`, `RestTemplateDetector`, `HttpExchangeDetector`, the last three on top of `url.UrlEvaluator`) to classify every call; `url.TargetMatcher` turns a classified call into target nodes.
 - `cli/src/main/resources/viewer/`: the `map.html` template and the vendored JS that is inlined into every generated map: Cytoscape.js 3.30.4, dagre 0.8.5, cytoscape-dagre 2.5.0 (from the npm registry).
 - `test-environment/`: fake services that are scanned but never run. Its README maps every detection case to a fixture file.

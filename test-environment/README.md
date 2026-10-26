@@ -57,7 +57,7 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | `@RequestMapping(method = {GET, PATCH})` | customer-service `CustomerController.preferences` |
 | Plain `@Controller` + `@ResponseBody`, single `method = RequestMethod.POST`, prefix and path from another class's constants, unmapped public method | tax-service `TaxAdminController` / `TaxPaths` |
 | No class prefix, prefix without a leading slash (`"payments"`, `"charge"`) | pricing-service `PriceController`, payment-service `PaymentController` |
-| Controller implementing an `@HttpExchange` interface | shipping-service `ShipmentApi` / `ShipmentController` |
+| Controller implementing an `@HttpExchange` interface | shipping-service `ShipmentApi` / `ShipmentController`; tax-service `TaxController` implements lib-common-clients `TaxRatesApi` |
 | Same simple class name (`ApiPaths`) in two repos with different values, used as the class prefix | billing-service / notification-service `ApiPaths` |
 | Mapping inherited from an abstract base controller | warehouse-service `BaseController` / `WarehouseController` |
 | Servlet context path (yml and .properties) | order-service, customer-service, tax-service |
@@ -90,13 +90,15 @@ Stack: Spring Boot 4.0.9, Spring Cloud 2025.1.4 (OpenFeign), Resilience4j annota
 | Feign, env-var url `${SHIPPING_SERVICE_URL}` | order-service `ShippingFeignClient` |
 | Feign, env-var host plus context path `${REWARDS_HOST}/rewards-api` -> resolutions.yml key `${REWARDS_HOST}`, `/rewards-api` kept in front of the path | notification-service `RewardsClient` |
 | Feign, `${property}` url set in application-prod.yml to an internal DNS name that looks public (`https://loyalty-service.prod.acme.io`) -> external by heuristic, `host:` entry in resolutions.yml | notification-service `LoyaltyClient` |
-| RestTemplate: `postForEntity`, `postForObject`, `getForObject`, `exchange`, `put`, `execute`, `delete` | order-service `PaymentClient`, payment-service `PaymentGateway`, lib-common-clients |
+| RestTemplate: `postForEntity`, `postForObject`, `getForObject`, `getForEntity`, `patchForObject`, `exchange`, `put`, `execute`, `delete` | order-service `PaymentClient` / `RestockService`, payment-service `PaymentGateway`, lib-common-clients |
+| RestTemplate root URI: `RestTemplateBuilder.rootUri(..)`, `setUriTemplateHandler(new DefaultUriBuilderFactory(..))`, bean picked by `@Qualifier` | order-service `RestClientsConfig`, `RestockService` (`POST /orders/restock/{sku}`) |
 | RestClient: `baseUrl` builder, `RestClient.create(url)`, `uri(Function)` URI builder | pricing-service `PriceService`, shipping-service carriers |
 | WebClient: `WebClient.create(url)`, builder `baseUrl`, two beans told apart by `@Qualifier`/bean name | catalog-service `WebClientConfig`, user-profile-service `ClientsConfig` |
 | WebClient `.method(HttpMethod.PATCH)` in a static util with the bean, verb and URI from the caller; bean picked by field name among two (no `@Qualifier`); `.patch()` + `UriComponentsBuilder.fromPath(..).pathSegment(..)`; RestClient `.patch()` + `String.format`, an unset property (-> `properties`) and a URL from the request body (-> `callSites`) | review-service `moderation/*` (`POST /reviews/{id}/moderate`) |
 | `@HttpExchange` client via `RestClientAdapter` | shipping-service `BillingExchangeClient` + `ClientConfig` |
 | `@HttpExchange` client via `WebClientAdapter`, inline and through a factory bean | recommendation-service `ExchangeConfig`, loyalty-service `CartClientConfig` |
 | `@HttpExchange` interface shared from a library | lib-reactive-clients `ShippingExchange`, used by warehouse-service |
+| `@HttpExchange` client via `RestTemplateAdapter`; the library interface is implemented by another service's controller (still an outbound call) | order-service `RestClientsConfig` + `RestockService` -> lib-common-clients `TaxRatesApi` -> tax-service `TaxController` |
 | Library wrapper, URL/verb passed as parameters | billing-service -> `ApiGateway`, `InternalRestTemplateClient`; search-service -> `ReactiveHttp` |
 | Parameter chain 4 levels deep (beyond constant propagation) -> callSites | billing-service `syncTenant` -> `DeepChainCaller` |
 | `static final` constants, constant concatenation | lib-http-clients `HttpPaths`, used by pricing-service and billing-service |

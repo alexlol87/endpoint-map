@@ -226,7 +226,8 @@ public final class AnnotationEndpointDetector {
                 .findFirst();
     }
 
-    private List<String> typePrefixes(ClassOrInterfaceDeclaration type) {
+    /** Paths of a type-level {@code @RequestMapping}/{@code @HttpExchange}; {@code [""]} when it has none. */
+    public List<String> typePrefixes(ClassOrInterfaceDeclaration type) {
         return type.getAnnotations().stream()
                 .filter(a -> TYPE_MAPPINGS.contains(a.getName().getIdentifier()))
                 .findFirst()

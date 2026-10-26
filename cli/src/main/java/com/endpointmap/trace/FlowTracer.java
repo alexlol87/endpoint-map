@@ -43,8 +43,11 @@ import java.util.stream.Stream;
  */
 public final class FlowTracer {
 
-    /** An outbound call reached from a method: {@code via} lists every method entered on the way, client method last. */
-    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence) {
+    /**
+     * An outbound call reached from a method: {@code via} lists every method entered on the way, client method last;
+     * {@code sites} the position (file:line:column) of each call on that path, the client call last.
+     */
+    public record Found(OutboundCall call, List<String> via, String file, int line, boolean lowConfidence, List<String> sites) {
     }
 
     private record Callees(List<MethodDeclaration> methods, boolean low) {
@@ -84,8 +87,32 @@ public final class FlowTracer {
                 .forEach(c -> supertypes(c).forEach(s -> subtypes.computeIfAbsent(s, k -> new ArrayList<>()).add(c)));
     }
 
+    /**
+     * Distinct URLs one call path (the same chain of call sites) may give a handler; more is one callSites entry.
+     * Argument combinations multiply along one path; separate calls through a shared helper each keep their edge.
+     */
+    public static final int MAX_URLS_PER_CALL_SITE = 4;
+
     public List<Found> trace(MethodDeclaration handler, Repo service, Map<String, String> config) {
-        return walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        List<Found> all = walk(handler, Map.of(), service, config, new IdentityHashMap<>(), new IdentityHashMap<>()).found();
+        Map<List<String>, List<Found>> byPath = new LinkedHashMap<>();
+        all.forEach(f -> byPath.computeIfAbsent(f.sites(), k -> new ArrayList<>()).add(f));
+        Map<Key, Found> out = new LinkedHashMap<>(); // several capped paths to one site give the same {*} edge
+        for (List<Found> site : byPath.values()) {
+            if (site.size() <= MAX_URLS_PER_CALL_SITE) {
+                site.forEach(f -> add(out, f));
+                continue;
+            }
+            // too many: one unknown URL (a callSites entry) instead, and none of the partly unknown {*} values
+            Found first = site.stream().min(java.util.Comparator.comparingInt(f -> f.via().size())).orElseThrow();
+            OutboundCall c = first.call();
+            String verb = site.stream().map(f -> f.call().verb()).distinct().count() == 1 ? c.verb() : "ANY";
+            String eg = site.stream().filter(f -> f.call().baseUrl() != null).findFirst().orElse(first).call().source();
+            add(out, new Found(new OutboundCall(c.client(), verb, null, "{*}", null,
+                    "one of " + site.size() + " combinations, e.g. " + eg, c.label()), first.via(), first.file(),
+                    first.line(), first.lowConfidence(), first.sites()));
+        }
+        return List.copyOf(out.values());
     }
 
     /**
@@ -126,7 +153,7 @@ public final class FlowTracer {
                     // an abstract method is named as the caller sees it: ItemClient.get, not the inherited ItemApi.get
                     String label = o.label() != null ? o.label() : receiver.isEmpty() || callee.getBody().isPresent()
                             ? label(callee) : receiver.get(0).getNameAsString() + "." + callee.getNameAsString();
-                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low()));
+                    add(found, new Found(o, List.of(label), types.relPath(call), line(call), c.low(), List.of(site(call))));
                 }
                 classified |= !out.isEmpty();
             }
@@ -139,14 +166,19 @@ public final class FlowTracer {
                     backTo = Math.min(backTo, at); // recursion: skip only this back edge
                     continue;
                 }
-                Map<String, ArgValue> calleeArgs = call instanceof MethodCallExpr mc
-                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : Map.of();
-                Result r = walk(callee, calleeArgs, service, config, stack, partial);
-                backTo = Math.min(backTo, r.backTo());
-                for (Found f : r.found()) {
-                    List<String> via = new ArrayList<>(List.of(label(callee)));
-                    via.addAll(f.via());
-                    add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low()));
+                List<Map<String, ArgValue>> bound = call instanceof MethodCallExpr mc
+                        ? binder.bind(callee, mc, new CallSite(call, c.methods(), receiver, service, config, m, args)) : List.of(Map.of());
+                for (Map<String, ArgValue> calleeArgs : bound) {
+                    Result r = walk(callee, calleeArgs, service, config, stack, partial);
+                    backTo = Math.min(backTo, r.backTo());
+                    for (Found f : r.found()) {
+                        List<String> via = new ArrayList<>(List.of(label(callee)));
+                        via.addAll(f.via());
+                        List<String> sites = new ArrayList<>(List.of(site(call)));
+                        sites.addAll(f.sites());
+                        add(found, new Found(f.call(), List.copyOf(via), f.file(), f.line(), f.lowConfidence() || c.low(),
+                                List.copyOf(sites)));
+                    }
                 }
             }
         }
@@ -292,6 +324,11 @@ public final class FlowTracer {
 
     private static String label(MethodDeclaration m) {
         return m.findAncestor(TypeDeclaration.class).map(t -> t.getNameAsString() + ".").orElse("") + m.getNameAsString();
+    }
+
+    private String site(Expression call) {
+        Node at = call instanceof MethodCallExpr mc ? mc.getName() : call;
+        return types.relPath(call) + ":" + at.getBegin().map(p -> p.line + ":" + p.column).orElse("0");
     }
 
     private static int line(Expression call) {
